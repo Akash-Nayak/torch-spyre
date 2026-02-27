@@ -50,8 +50,12 @@ def spyre__linear(
             out += bias
         return out
 
-    compiled_linear = torch.compile(_linear, dynamic=False)
-    return compiled_linear(input, weight.to("spyre"), bias)
+    # Prevents double tracing
+    if not torch.compiler.is_compiling():
+        compiled_linear = torch.compile(_linear, dynamic=False)
+    else:
+        compiled_linear = _linear
+    return compiled_linear(input, weight, bias)
 
 
 @torch.library.register_kernel("aten::addmm", ["spyre"])  # type:ignore
