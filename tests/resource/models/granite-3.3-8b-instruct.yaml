@@ -1840,3 +1840,71 @@ cases:
     marks:
       - bf16operation
       - constant
+
+  # Issue 2: aten::all is not supported on Spyre.
+  # Granite HF uses position_ids == -1 checks that call aten::all.
+  - name: torch.all.1
+    op: torch.all
+    inputs:
+      - tensor:
+          shape: [1, 41]
+          dtype: torch.bool
+          init: rand
+    description: 'granite_issue.pdf issue 2: aten::all not supported on Spyre — triggered by position_ids == -1 check in modeling_granite.py'
+    marks:
+      - granite_issue
+      - constant
+
+  # Issue 8: SDPA with GQA shapes (32 query heads, 8 KV heads, no repeat_kv).
+  # Granite 3.3-8b uses GQA: 32 query heads / 8 KV heads.
+  # HF Granite calls scaled_dot_product_attention directly with mismatched
+  # head counts instead of repeating KV heads first (PyTorch 2.3+ supports
+  # this via grouped-query broadcast). Spyre's SDPA lowering does not support
+  # this broadcast, causing a shape mismatch error.
+  - name: torch.nn.functional.scaled_dot_product_attention.gqa.1
+    op: torch.nn.functional.scaled_dot_product_attention
+    inputs:
+      - tensor:
+          shape: [1, 32, 41, 128]
+          dtype: torch.bfloat16
+          init: rand
+      - tensor:
+          shape: [1, 8, 41, 128]
+          dtype: torch.bfloat16
+          init: rand
+      - tensor:
+          shape: [1, 8, 41, 128]
+          dtype: torch.bfloat16
+          init: rand
+    description: 'granite_issue.pdf issue 8: SDPA with GQA shapes — 32 query heads vs 8 KV heads. Spyre SDPA lowering does not support grouped-query broadcast (PyTorch >=2.3 native feature).'
+    marks:
+      - granite_issue
+      - bf16operation
+    kwmap:
+      dropout_p: 0.0
+      scale: 0.0883883476
+      is_causal: false
+
+  - name: torch.nn.functional.scaled_dot_product_attention.gqa.2
+    op: torch.nn.functional.scaled_dot_product_attention
+    inputs:
+      - tensor:
+          shape: [1, 32, 1, 128]
+          dtype: torch.bfloat16
+          init: rand
+      - tensor:
+          shape: [1, 8, 2048, 128]
+          dtype: torch.bfloat16
+          init: rand
+      - tensor:
+          shape: [1, 8, 2048, 128]
+          dtype: torch.bfloat16
+          init: rand
+    description: 'granite_issue.pdf issue 8: SDPA GQA decode step — 32 query heads, 8 KV heads, KV seq_len=2048 (KV cache). Spyre SDPA lowering does not support grouped-query broadcast.'
+    marks:
+      - granite_issue
+      - bf16operation
+    kwmap:
+      dropout_p: 0.0
+      scale: 0.0883883476
+      is_causal: false
