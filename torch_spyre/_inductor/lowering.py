@@ -23,7 +23,7 @@ import torch._inductor.lowering as lowering
 import torch._inductor.ir as ir
 from typing import Any, Callable, Union
 
-from .constants import BATCH_MATMUL_OP,BATCH_MATMUL_FP8_OP
+from .constants import BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP
 import torch_spyre._inductor.customops  # noqa: F401
 from torch_spyre.ops.fallbacks import fallback_ops
 from .ir import SpyreReduction, SpyreConstantFallback, SpyreEmptyFallback
@@ -230,9 +230,20 @@ def ensure_default_handler(op_name):
     if op_name not in cls.__dict__:
         method = cls._call_default(op_name)
         setattr(cls, op_name, method)
+
+
+# TODO:This is just place holder now; Real implementation will follow
 @register_spyre_lowering(torch.ops.aten._scaled_mm.default)
-def lower_scaled_mm(mat1, mat2, scale_a=None, scale_b=None, bias=None,
-                    scale_result=None, out_dtype=None, use_fast_accum=False):
+def lower_scaled_mm(
+    mat1,
+    mat2,
+    scale_a=None,
+    scale_b=None,
+    bias=None,
+    scale_result=None,
+    out_dtype=None,
+    use_fast_accum=False,
+):
     mat1.realize()
     mat2.realize()
     mat1_loader = mat1.make_loader()
@@ -252,7 +263,7 @@ def lower_scaled_mm(mat1, mat2, scale_a=None, scale_b=None, bias=None,
         raise ValueError(f"Expected FP8 input for mat2, got {mat2_dtype}")
 
     output_dtype = out_dtype if out_dtype is not None else torch.float16
-    reduction_numel = mat1_size[-1]  
+    reduction_numel = mat1_size[-1]
 
     if mat1_ndim == 2 and mat2_ndim == 2:
         # [M, K] × [K, N] → [M, N]
