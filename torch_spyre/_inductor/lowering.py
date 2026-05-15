@@ -802,6 +802,15 @@ def lower_quantscalepertokenfp8(x, dim=-1):
     output_shape = list(x.get_size())
     output_shape[dim] = 1
     
+    # Add op_info with constants required by deeptools quantscalepertokenfp8
+    op_info = {
+        "constants": {
+            "mulConst": 2.0,      # Multiplier for FP8 E4M3 range
+            "clipMin": 1e-6,      # Minimum scale value
+            "clipMax": 448.0,     # Maximum scale value (FP8 E4M3 range)
+        }
+    }
+    
     result = SpyreReduction.create(
         reduction_type="quantscalepertokenfp8",
         input_node=x,
@@ -811,6 +820,7 @@ def lower_quantscalepertokenfp8(x, dim=-1):
         inner_fn=kwargs["inner_fn"],
         ranges=output_shape,  # Use calculated output shape
         reduction_ranges=kwargs["reduction_ranges"],
+        op_info=op_info,  # Required constants for deeptools operation
     )
     result.realize()
     return result
