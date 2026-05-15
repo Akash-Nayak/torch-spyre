@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import torch
+
 BATCH_MATMUL_OP = "batchmatmul"
 IDENTITY_OP = "identity"
 RESTICKIFY_OP = "ReStickifyOpHBM"
@@ -70,3 +72,37 @@ MATMUL_LAYOUT_LABELS = ["INPUT", "KERNEL", "OUTPUT", "KERNEL_IDX"]
 INPUT_DIM_LABELS = ["mb", "x", "y", "i", "j", "ki", "kj"]
 OUTPUT_DIM_LABELS = ["out"]
 MATMUL_DIM_LABELS = ["ki", "kj", "y", "x", "mb", "out", "in"]
+
+# FP8 Support
+# Maps PyTorch FP8 dtype to deeptools SEN143_FP8 format
+SUPPORTED_DTYPES = {
+    torch.float16,
+    torch.bfloat16,
+    torch.float32,
+    torch.float8_e4m3fn,  # FP8 E4M3 format
+    torch.int8,
+    torch.int16,
+    torch.int32,
+    torch.int64,
+}
+
+# Map PyTorch dtypes to deeptools/sendnn dtypes
+TORCH_TO_SENDNN_DTYPE = {
+    torch.float16: "float16",
+    torch.bfloat16: "bfloat16",
+    torch.float32: "float32",
+    torch.float8_e4m3fn: "SEN143_FP8",  # FP8 format for deeptools
+    torch.int8: "int8",
+    torch.int16: "int16",
+    torch.int32: "int32",
+    torch.int64: "int64",
+}
+
+# FP8 quantization operations (map to deeptools ops)
+FP8_QUANTIZATION_OPS = {
+    "qfp8",           # Basic FP8 quantization
+    "qfp8ch",         # Channel-wise FP8 quantization (for matmul)
+    "qfp8mb",         # Mini-batch FP8 quantization
+    "qfp8wt",         # Weight FP8 quantization
+    "quantscalepertokenfp8",  # Compute FP8 scales per token
+}
