@@ -447,6 +447,14 @@ class SpyreKernel(Kernel[CSEVariable]):
                 or arg.device_dtype == DataFormats.SEN143_FP8
             ):
                 raise Unsupported(f"{op} on {arg.device_dtype}")
+            elif arg.device_dtype not in [
+                DataFormats.IEEE_FP32,
+                DataFormats.SEN169_FP16,
+                DataFormats.IEEE_INT32,
+                DataFormats.SEN143_FP8,
+                DataFormats.SEN152_FP8,
+            ]:
+                raise Unsupported(f"operation on {arg.device_dtype}")
 
         it_space = iteration_space(self.current_node)
 
