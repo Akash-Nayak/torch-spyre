@@ -1253,7 +1253,7 @@ def lower_qfp8(x):
     """
     x.realize()
     
-    fn = lowering.ops_wrapper(torch.ops.spyre.qfp8.__name__())
+    fn = lowering.ops_wrapper(torch.ops.spyre.qfp8.__name__)
     x_loader = x.make_loader()
     
     def inner_fn(index):
