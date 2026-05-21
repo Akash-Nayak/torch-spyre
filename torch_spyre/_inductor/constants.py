@@ -72,6 +72,7 @@ SPYRE_FP32_OPS = [
     "to_dtype",
     "maximum",
     "minimum",
+    "quantscalepertokenfp8",  # FP8 quantization scale computation (FP32 output)
 ]
 
 TOPK_OPS = {"topkvalue", "topkindex"}
