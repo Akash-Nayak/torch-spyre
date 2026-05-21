@@ -654,6 +654,34 @@ def _(input: torch.Tensor) -> torch.Tensor:
     return torch.empty(input.size(), dtype=torch.float8_e4m3fn, device=input.device)
 
 
+@torch.library.custom_op("spyre::qfp8chil", mutates_args=(), device_types="spyre")
+def qfp8chil(input: torch.Tensor) -> torch.Tensor:
+    """
+    Channel-wise interleaved FP8 format conversion (pointwise).
+
+    Converts input tensor to FP8 E4M3 format with channel-wise interleaved semantics.
+    This operation ONLY performs format conversion - scaling must be done separately.
+
+    Args:
+        input: Input tensor (FP16/FP32/BF16) to convert to FP8
+               Should already be scaled and clamped
+
+    Returns:
+        FP8 E4M3 tensor (same shape as input)
+
+    Maps to: deeptools Qfp8chil operation
+    """
+    pass
+
+
+@qfp8chil.register_fake
+def _(input: torch.Tensor) -> torch.Tensor:
+    # Output is FP8 with same shape as input
+    return torch.empty(input.size(), dtype=torch.float8_e4m3fn, device=input.device)
+
+
+
+
 @torch.library.custom_op("spyre::qfp8mb", mutates_args=(), device_types="spyre")
 def qfp8mb(input: torch.Tensor) -> torch.Tensor:
     """

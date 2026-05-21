@@ -251,6 +251,12 @@ class SpyreOpFuncs:
     def qfp8mb(x):
         return PointwiseOp("qfp8mb", [x])
 
+
+    @staticmethod
+    def qfp8chil(x):
+        return PointwiseOp("qfp8chil", [x])
+
+
     @staticmethod
     def qfp8wt(x):
         return PointwiseOp("qfp8wt", [x])
