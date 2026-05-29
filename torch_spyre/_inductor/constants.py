@@ -60,7 +60,6 @@ SPYRE_FP32_OPS = [
     "to_dtype",
     "maximum",
     "minimum",
-    "quantscalepertokenfp8",  # FP8 quantization scale computation (FP32 output)
 ]
 
 TOPK_OPS = {"topkvalue", "topkindex"}
@@ -101,9 +100,5 @@ TORCH_TO_SENDNN_DTYPE = {
 
 # FP8 quantization operations (map to deeptools ops)
 FP8_QUANTIZATION_OPS = {
-    "qfp8",           # Basic FP8 quantization
     "qfp8ch",         # Channel-wise FP8 quantization (for matmul)
-    "qfp8mb",         # Mini-batch FP8 quantization
-    "qfp8wt",         # Weight FP8 quantization
-    "quantscalepertokenfp8",  # Compute FP8 scales per token
 }

@@ -1047,51 +1047,23 @@ def lower_quantscalepertokenfp8(x, dim=-1):
 def lower_reciprocal(x):
     """
     Lower reciprocal as a POINTWISE operation.
-    
+
     Computes: 1 / x
-    
+
     Executed on sfp (special function processor) unit for hardware efficiency.
     Used to convert scale to inverse scale for multiplication.
     """
     x.realize()
-    
+
     fn = lowering.ops_wrapper(torch.ops.spyre.reciprocal.__name__)
     x_loader = x.make_loader()
-    
+
     def inner_fn(index):
         return fn(x_loader(index))
-    
+
     pw = Pointwise.create(
         device=x.get_device(),
         dtype=x.get_dtype(),  # Output has same dtype as input
-        inner_fn=inner_fn,
-        ranges=x.get_size(),
-        origin_node=x.get_origin_node(),
-        traceback=x.get_traceback(),
-    )
-    pw.realize()
-    return pw
-
-
-@register_spyre_lowering(torch.ops.spyre.qfp8)
-def lower_qfp8(x):
-    """
-    Lower qfp8 as a POINTWISE format conversion.
-    
-    Converts input from FP16/FP32/BF16 to FP8 E4M3 format.
-    Input should already be scaled and clamped to [-448, 448].
-    """
-    x.realize()
-    
-    fn = lowering.ops_wrapper(torch.ops.spyre.qfp8.__name__)
-    x_loader = x.make_loader()
-    
-    def inner_fn(index):
-        return fn(x_loader(index))
-    
-    pw = Pointwise.create(
-        device=x.get_device(),
-        dtype=torch.float8_e4m3fn,  # Output is FP8
         inner_fn=inner_fn,
         ranges=x.get_size(),
         origin_node=x.get_origin_node(),
@@ -1105,40 +1077,13 @@ def lower_qfp8(x):
 def lower_qfp8ch(x):
     """
     Lower qfp8ch operation - channel-wise FP8 format conversion.
-    
+
     Pointwise format conversion only (no scaling).
     """
     x.realize()
-    
+
     fn = lowering.ops_wrapper(torch.ops.spyre.qfp8ch.__name__)
     x_loader = x.make_loader()
-    
-    def inner_fn(index):
-        return fn(x_loader(index))
-    
-    pw = Pointwise.create(
-        device=x.get_device(),
-        dtype=torch.float8_e4m3fn,
-        inner_fn=inner_fn,
-        ranges=x.get_size(),
-        origin_node=x.get_origin_node(),
-        traceback=x.get_traceback(),
-    )
-    pw.realize()
-    return pw
-
-
-@register_spyre_lowering(torch.ops.spyre.qfp8chil)
-def lower_qfp8chil(x):
-    """
-    Lower qfp8chil operation - channel-wise interleaved FP8 format conversion.
-
-    Pointwise format conversion only (no scaling).
-    """
-    x.realize()
-
-    fn = lowering.ops_wrapper(torch.ops.spyre.qfp8chil.__name__)
-    x_loader = x.make_loader()
 
     def inner_fn(index):
         return fn(x_loader(index))
@@ -1153,18 +1098,13 @@ def lower_qfp8chil(x):
     )
     pw.realize()
     return pw
-
-
-
-
-@register_spyre_lowering(torch.ops.spyre.qfp8mb)
 
 
 @register_spyre_lowering(torch.ops.spyre.quantize_fp8_with_scale)
 def lower_quantize_fp8_with_scale(x, scale):
     """
     Lower quantize_fp8_with_scale operation.
-    
+
     Composes four operations:
     1. Compute inverse scale using reciprocal (POINTWISE, sfp unit)
     2. Multiply by inverse scale (POINTWISE)
@@ -1173,73 +1113,20 @@ def lower_quantize_fp8_with_scale(x, scale):
     """
     x.realize()
     scale.realize()
-    
+
     # Step 1: Compute inverse scale using hardware reciprocal (sfp unit)
     inv_scale = lower_reciprocal(scale)
     inv_scale.realize()  # Force realization to prevent fusion
-    
+
     # Step 2: Multiply by inverse scale
     x_scaled = lowering.mul(x, inv_scale)
     x_scaled.realize()  # Force realization to prevent fusion
-    
+
     # Step 3: Clamp to FP8 E4M3 range
     x_clamped = lower_clamp(x_scaled, -448.0, 448.0)
     x_clamped.realize()  # Force realization to prevent fusion
-    
+
     # Step 4: Convert to FP8 format
     x_fp8 = lower_qfp8ch(x_clamped)
-    
+
     return x_fp8
-
-
-def lower_qfp8mb(x):
-    """
-    Lower qfp8mb operation - mini-batch FP8 format conversion.
-    
-    Pointwise format conversion only (no scaling).
-    """
-    x.realize()
-    
-    fn = lowering.ops_wrapper(torch.ops.spyre.qfp8mb.__name__)
-    x_loader = x.make_loader()
-    
-    def inner_fn(index):
-        return fn(x_loader(index))
-    
-    pw = Pointwise.create(
-        device=x.get_device(),
-        dtype=torch.float8_e4m3fn,
-        inner_fn=inner_fn,
-        ranges=x.get_size(),
-        origin_node=x.get_origin_node(),
-        traceback=x.get_traceback(),
-    )
-    pw.realize()
-    return pw
-
-
-@register_spyre_lowering(torch.ops.spyre.qfp8wt)
-def lower_qfp8wt(x):
-    """
-    Lower qfp8wt operation - weight FP8 format conversion.
-    
-    Pointwise format conversion only (no scaling).
-    """
-    x.realize()
-    
-    fn = lowering.ops_wrapper(torch.ops.spyre.qfp8wt.__name__)
-    x_loader = x.make_loader()
-    
-    def inner_fn(index):
-        return fn(x_loader(index))
-    
-    pw = Pointwise.create(
-        device=x.get_device(),
-        dtype=torch.float8_e4m3fn,
-        inner_fn=inner_fn,
-        ranges=x.get_size(),
-        origin_node=x.get_origin_node(),
-        traceback=x.get_traceback(),
-    )
-    pw.realize()
-    return pw
