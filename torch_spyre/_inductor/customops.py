@@ -631,8 +631,7 @@ def quantize_fp8_with_scale(input: torch.Tensor, scale: torch.Tensor) -> torch.T
 
     Args:
         input: Input tensor (FP16) to quantize, shape [batch, seq, hidden]
-        scale: Quantization scale (FP16/FP32), shape [batch, seq, 1]
-               scale = max(abs(x)) * 2.0 (from quantscalepertokenfp8)
+        scale: Quantization scale (FP16), shape [batch, seq, 1]
 
     Returns:
         FP8 E4M3 tensor (same shape as input)
@@ -642,9 +641,7 @@ def quantize_fp8_with_scale(input: torch.Tensor, scale: torch.Tensor) -> torch.T
         >>> x_fp8 = torch.ops.spyre.quantize_fp8_with_scale(x, scale)
 
     Note:
-        - Works with torch.compile for hardware acceleration
         - Uses reciprocal operation (hardware sfp unit) for 1/scale computation
-        - Uses qfp8ch operation (has hidden_dim <= 8 limitation on current hardware)
     """
     pass
 
