@@ -459,105 +459,6 @@ def to_dtype_cpu(input: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
 def _(input: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     return torch.empty_like(input, dtype=dtype)
 
-# ============================================================================
-# FP8 Quantization Operations
-# ============================================================================
-# These operations map to deeptools FP8 operations for efficient quantization
-# on Spyre hardware.
-
-
-@torch.library.custom_op("spyre::quantize_fp8", mutates_args=(), device_types="spyre")
-def quantize_fp8(input: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    High-level FP8 quantization operation.
-    
-    Implements the 5-step quantization flow:
-    1. quantscalepertokenfp8 - Compute scale = max(abs(x)) / 448 (REDUCTION)
-    2. reciprocal - Compute inv_scale = 1 / scale (POINTWISE, sfp unit)
-    3. mul - x_scaled = x * inv_scale (POINTWISE)
-    4. clamp - x_clamped = clamp(x_scaled, -448, 448) (POINTWISE)
-    5. qfp8 - x_fp8 = qfp8(x_clamped) (POINTWISE format conversion)
-    
-    Args:
-        input: Input tensor (FP16/FP32/BF16) to quantize
-    
-    Returns:
-        tuple: (fp8_tensor, scale) where:
-            - fp8_tensor: FP8 E4M3 quantized tensor
-            - scale: Quantization scale (needed for dequantization)
-    
-    Example:
-        >>> x = torch.randn(4, 512, 4096, device="spyre")
-        >>> x_fp8, scale = torch.ops.spyre.quantize_fp8(x)
-        >>> # Later for dequantization:
-        >>> # x_dequant = x_fp8.to(fp16) * scale
-    
-    Note:
-        All operations map to deeptools hardware primitives for maximum efficiency.
-    """
-    pass
-
-
-@quantize_fp8.register_fake
-def _(input: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    # Return tuple: (FP8 tensor, scale tensor)
-    fp8_tensor = torch.empty(input.size(), dtype=torch.float8_e4m3fn, device=input.device)
-    # Scale has shape [..., 1] (reduced along last dimension)
-    scale_shape = list(input.size())
-    scale_shape[-1] = 1
-    scale_tensor = torch.empty(scale_shape, dtype=torch.float32, device=input.device)
-    return (fp8_tensor, scale_tensor)
-
-
-@torch.library.custom_op("spyre::quantscalepertokenfp8", mutates_args=(), device_types="spyre")
-def quantscalepertokenfp8(input: torch.Tensor, dim: int = -1) -> torch.Tensor:
-    """
-    Compute FP8 quantization scale per token (REDUCTION operation).
-    
-    Computes: scale = max(abs(x)) / 448
-    
-    This is a REDUCTION operation that reduces along the specified dimension (token dimension).
-    For every coordinate along the specified dimension, it finds the scale.
-    Similar to exx2 operation - uses hardware reduction, not pointwise.
-    
-    Args:
-        input: Input tensor (FP16/FP32/BF16) to compute scales for
-        dim: Dimension along which to compute scales (default: -1, last dimension)
-             This is the "token dimension" - the dimension that will be reduced.
-    
-    Returns:
-        Scale tensor (FP32) with the specified dimension reduced to size 1
-    
-    Maps to: deeptools QuantScalePerTokenFP8 (REDUCTION operation)
-    
-    Example:
-        >>> x = torch.randn(4, 512, 4096, device="spyre")
-        >>> # Reduce along last dimension (default, typical for tokens)
-        >>> scale = torch.ops.spyre.quantscalepertokenfp8(x)
-        >>> # scale.shape = [4, 512, 1]
-        >>>
-        >>> # Or specify dimension explicitly
-        >>> scale = torch.ops.spyre.quantscalepertokenfp8(x, dim=-1)
-        >>> # scale.shape = [4, 512, 1]
-    
-    Note:
-        The dim parameter specifies which dimension to reduce when computing scales.
-        For each coordinate along the specified dimension, a scale value is computed.
-    """
-    pass
-
-
-@quantscalepertokenfp8.register_fake
-def _(input: torch.Tensor, dim: int = -1) -> torch.Tensor:
-    # Normalize dimension to positive index
-    if dim < 0:
-        dim = input.ndim + dim
-    
-    # Scale tensor has the specified dimension reduced to 1
-    scale_shape = list(input.size())
-    scale_shape[dim] = 1
-    return torch.empty(scale_shape, dtype=torch.float32, device=input.device)
-
 
 @torch.library.custom_op("spyre::reciprocal", mutates_args=(), device_types="spyre")
 def reciprocal(input: torch.Tensor) -> torch.Tensor:
@@ -601,7 +502,7 @@ def qfp8ch(input: torch.Tensor) -> torch.Tensor:
     This operation ONLY performs format conversion - scaling must be done separately.
 
     Args:
-        input: Input tensor (FP16/FP32/BF16) to convert to FP8
+        input: Input tensor (FP16/BF16/FP32) to convert to FP8
                Should already be scaled and clamped
 
     Returns:
