@@ -1104,36 +1104,6 @@ def lower_maximum(x, y):
     return with_int64_fallback(lowering.maximum, x, y)
 
 
-@register_spyre_lowering(torch.ops.spyre.reciprocal)
-def lower_reciprocal(x):
-    """
-    Lower reciprocal as a POINTWISE operation.
-
-    Computes: 1 / x
-
-    Executed on sfp (special function processor) unit for hardware efficiency.
-    Used to convert scale to inverse scale for multiplication.
-    """
-    x.realize()
-
-    fn = lowering.ops_wrapper(torch.ops.spyre.reciprocal.__name__)
-    x_loader = x.make_loader()
-
-    def inner_fn(index):
-        return fn(x_loader(index))
-
-    pw = Pointwise.create(
-        device=x.get_device(),
-        dtype=x.get_dtype(),  # Output has same dtype as input
-        inner_fn=inner_fn,
-        ranges=x.get_size(),
-        origin_node=x.get_origin_node(),
-        traceback=x.get_traceback(),
-    )
-    pw.realize()
-    return pw
-
-
 @register_spyre_lowering(torch.ops.spyre.qfp8ch)
 def lower_qfp8ch(x):
     """
@@ -1175,8 +1145,8 @@ def lower_quantize_fp8_with_scale(x, scale):
     x.realize()
     scale.realize()
 
-    # Step 1: Compute inverse scale using hardware reciprocal (sfp unit)
-    inv_scale = lower_reciprocal(scale)
+    # Step 1: Compute inverse scale using reciprocal
+    inv_scale = lowering.reciprocal(scale)
     inv_scale.realize()  # Force realization to prevent fusion
 
     # Step 2: Multiply by inverse scale

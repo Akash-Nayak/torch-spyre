@@ -460,39 +460,6 @@ def _(input: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     return torch.empty_like(input, dtype=dtype)
 
 
-@torch.library.custom_op("spyre::reciprocal", mutates_args=(), device_types="spyre")
-def reciprocal(input: torch.Tensor) -> torch.Tensor:
-    """
-    Compute reciprocal: 1 / x (POINTWISE operation).
-
-    Hardware-optimized reciprocal operation executed on sfp (special function processor) unit.
-    Used to convert scale to inverse scale for efficient multiplication.
-
-    Args:
-        input: Input tensor to compute reciprocal of
-
-    Returns:
-        Reciprocal tensor (same shape and dtype as input)
-
-    Maps to: deeptools reciprocal (POINTWISE operation, sfp unit)
-
-    Example:
-        >>> scale = torch.tensor([2.0, 4.0, 8.0], device="spyre")
-        >>> inv_scale = torch.ops.spyre.reciprocal(scale)
-        >>> # inv_scale = [0.5, 0.25, 0.125]
-
-    Note:
-        Multiplication by reciprocal is faster than division on hardware.
-    """
-    pass
-
-
-@reciprocal.register_fake
-def _(input: torch.Tensor) -> torch.Tensor:
-    # Output has same shape and dtype as input
-    return torch.empty(input.size(), dtype=input.dtype, device=input.device)
-
-
 @torch.library.custom_op("spyre::qfp8ch", mutates_args=(), device_types="spyre")
 def qfp8ch(input: torch.Tensor) -> torch.Tensor:
     """
