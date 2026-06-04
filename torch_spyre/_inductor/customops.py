@@ -553,3 +553,66 @@ def quantize_fp8_with_scale(input: torch.Tensor, scale: torch.Tensor) -> torch.T
 def _(input: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     # Output is FP8 with same shape as input
     return torch.empty(input.size(), dtype=torch.float8_e4m3fn, device=input.device)
+
+
+
+@torch.library.custom_op("spyre::fp8todl16", mutates_args=(), device_types="spyre")
+def fp8todl16(input: torch.Tensor) -> torch.Tensor:
+    """
+    FP8 to FP16 format conversion (dequantization without scaling).
+
+    Converts FP8 E4M3 tensor to FP16 format.
+    This operation ONLY performs format conversion - scaling must be done separately.
+
+    Args:
+        input: Input tensor (FP8) to convert to FP16
+
+    Returns:
+        FP16 tensor (same shape as input)
+
+    Maps to: deeptools fp8todl16 operation
+    """
+    pass
+
+
+@fp8todl16.register_fake
+def _(input: torch.Tensor) -> torch.Tensor:
+    # Output is FP16 with same shape as input
+    return torch.empty(input.size(), dtype=torch.float16, device=input.device)
+
+
+@torch.library.custom_op(
+    "spyre::dequantize_fp8_with_scale", mutates_args=(), device_types="spyre"
+)
+def dequantize_fp8_with_scale(input: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:  # type: ignore[empty-body]
+    """
+    Dequantize FP8 tensor to FP16 using pre-computed scale.
+
+    Performs two steps:
+    1. Convert FP8 to FP16: x_fp16 = fp8todl16(x) (dtype conversion)
+    2. Scale the output: x_scaled = x_fp16 * scale (POINTWISE)
+
+    Args:
+        input: Input tensor (FP8) to dequantize, shape [batch, seq, hidden]
+        scale: Dequantization scale (FP16), shape [batch, seq, 1]
+
+    Returns:
+        FP16 tensor (same shape as input)
+
+    Example:
+        >>> @torch.compile(backend='inductor')
+        >>> def dequant(x_fp8, scale):
+        >>>     return torch.ops.spyre.dequantize_fp8_with_scale(x_fp8, scale)
+
+    Note:
+        - MUST use torch.compile(backend='inductor') - does not work in eager mode
+        - Uses fp8todl16 operation for FP8→FP16 conversion
+        - Scale must be FP16, NOT FP32
+    """
+    pass
+
+
+@dequantize_fp8_with_scale.register_fake
+def _(input: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    # Output is FP16 with same shape as input
+    return torch.empty(input.size(), dtype=torch.float16, device=input.device)

@@ -991,6 +991,34 @@ def lower_qfp8ch(x):
     return pw
 
 
+
+
+@register_spyre_lowering(torch.ops.spyre.fp8todl16)
+def lower_fp8todl16(x):
+    """
+    Lower fp8todl16 operation - FP8 to FP16 format conversion.
+
+    Pointwise format conversion only (no scaling).
+    """
+    from .spyre_kernel import SpyreOpFuncs
+    
+    x.realize()
+    x_loader = x.make_loader()
+
+    def inner_fn(index):
+        return SpyreOpFuncs.fp8todl16(x_loader(index))
+
+    pw = Pointwise.create(
+        device=x.get_device(),
+        dtype=torch.float16,
+        inner_fn=inner_fn,
+        ranges=x.get_size(),
+        origin_node=x.get_origin_node(),
+        traceback=x.get_traceback(),
+    )
+    pw.realize()
+    return pw
+
 @register_spyre_lowering(torch.ops.spyre.quantize_fp8_with_scale)
 def lower_quantize_fp8_with_scale(x, scale):
     """
