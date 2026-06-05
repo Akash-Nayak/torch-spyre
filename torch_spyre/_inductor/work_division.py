@@ -821,6 +821,11 @@ def _cost_model_matmul_planner(
     n_divs = [int(d) for d in divisors(n_sticks)]
     k_divs = [int(d) for d in divisors(k_sticks)]
 
+    # For fp8 bmm the kernel is 2D [K, N]: each core must see at most 128
+    # elements on both the K (in) and N (out) dims to fit one 2D stick group.
+    is_fp8_bmm = op.data.reduction_type == BATCH_MATMUL_FP8_OP
+    _FP8_KERNEL_MAX_ELEMS = 128
+
     best = None
     best_cost = float("inf")
     for b_combo in b_combos:
@@ -829,6 +834,11 @@ def _cost_model_matmul_planner(
             for nn in n_divs:
                 for kk in k_divs:
                     if b_prod * mm * nn * kk > max_cores:
+                        continue
+                    if is_fp8_bmm and (
+                        K_e // kk > _FP8_KERNEL_MAX_ELEMS
+                        or N_e // nn > _FP8_KERNEL_MAX_ELEMS
+                    ):
                         continue
                     c = _matmul_split_cost(
                         (B_total, b_prod), (M_e, mm), (N_e, nn), (K_e, kk), max_cores
