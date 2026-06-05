@@ -19,7 +19,7 @@ from abc import ABC
 import torch
 import sympy
 
-from torch_spyre._C import DataFormats
+from torch_spyre._C import DataFormats, ElementArrangement
 
 from torch._inductor.codegen.common import (
     CSEVariable,
@@ -780,6 +780,10 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
                                 buf.writeline(f"stride_map={arg.stride_map!r},")
                             if arg.per_tile_fixed:
                                 buf.writeline("per_tile_fixed=True,")
+                            if arg.element_arrangement != ElementArrangement.STANDARD:
+                                buf.writeline(
+                                    f"element_arrangement={arg.element_arrangement!r},"
+                                )
                         buf.writeline("),")
                 buf.writeline("]")
             buf.writeline("),")
