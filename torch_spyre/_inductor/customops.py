@@ -17,6 +17,7 @@ import torch
 import torch._dynamo
 from torch._inductor.fx_passes.reinplace import inplaceable_ops, InplaceableOp
 from torch_spyre.ops.eager import compile_once
+from torch_spyre.ops.fallbacks import warn_fallback
 
 from .errors import Unsupported
 
@@ -611,3 +612,14 @@ def quantize_weight_fp8_with_scale(
 def _(input: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     # Output is FP8 with same shape as input
     return torch.empty(input.size(), dtype=torch.float8_e4m3fn, device=input.device)
+
+
+@torch.library.custom_op("spyre::to_dtype_cpu", mutates_args=(), device_types="spyre")
+def to_dtype_cpu(input: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    warn_fallback(f"conversion from {input.dtype} to {dtype}")
+    return input.cpu().to(dtype=dtype).to(input.device)
+
+
+@to_dtype_cpu.register_fake
+def _(input: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    return torch.empty_like(input, dtype=dtype)

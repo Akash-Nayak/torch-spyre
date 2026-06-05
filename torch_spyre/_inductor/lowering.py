@@ -23,7 +23,7 @@ import torch._inductor.lowering as lowering
 import torch._inductor.ir as ir
 from typing import Any, Callable, Union
 
-from .constants import BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP
+from .constants import BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP, COPY_BACK_CANDIDATE_ATTR
 import torch_spyre._inductor.customops  # noqa: F401
 from torch_spyre.ops.fallbacks import fallback_ops
 from .ir import SpyreReduction, SpyreConstantFallback, SpyreEmptyFallback
@@ -230,6 +230,11 @@ def ensure_default_handler(op_name):
     if op_name not in cls.__dict__:
         method = cls._call_default(op_name)
         setattr(cls, op_name, method)
+
+
+def eager_fallback(op, *args, **kwargs):
+    handler = lowering.fallback_handler(op, add_to_fallback_set=False)
+    return handler(*args, **kwargs)
 
 
 # TODO:This is just place holder now; Real implementation will follow
@@ -925,6 +930,76 @@ def lower_quantize_fp8_with_scale(x, scale):
     return x_fp8
 
 
+def _peel(node):
+    """Unwrap TensorBox/StorageBox/MutableBox layers to reach the underlying Buffer."""
+    while isinstance(node, ir.MutableBox):
+        node = node.data
+    while isinstance(node, ir.StorageBox):
+        node = node.data
+    return node
+
+
+def _copy_back_candidate(dst, src) -> bool:
+    """Whether ``copy_(dst, src)`` is worth checking after layout propagation.
+
+    Lowering only identifies the structural pattern.  Layout propagation later
+    proves the full safety condition and either removes the copy or leaves this
+    normal ``copy_`` mutation op intact.
+    """
+    dst_buf = _peel(dst)
+    if not isinstance(dst_buf, ir.InputBuffer):
+        return False
+    if dst_buf.get_name() not in V.graph.graph_input_names:
+        return False
+
+    if dst.get_device() != src.get_device():
+        return False
+    if dst.get_dtype() != src.get_dtype():
+        return False
+    if tuple(dst.get_size()) != tuple(src.get_size()):
+        return False
+
+    src_buf = _peel(src)
+    if not isinstance(src_buf, ir.ComputedBuffer):
+        return False
+    if not isinstance(src_buf.layout, ir.FlexibleLayout):
+        return False
+    return tuple(dst_buf.layout.stride) == tuple(src_buf.layout.stride)
+
+
+def _mark_copy_back_candidate(first_new_op: int, dst) -> None:
+    dst_name = _peel(dst).get_name()
+    for op in V.graph.operations[first_new_op:]:
+        layout = getattr(op, "layout", None)
+        if not isinstance(layout, ir.MutationLayoutSHOULDREMOVE):
+            continue
+        if layout.get_buffer().get_name() == dst_name:
+            setattr(op, COPY_BACK_CANDIDATE_ATTR, True)
+
+
+@register_spyre_lowering(torch.ops.aten.copy_.default, type_promotion_kind=None)
+def spyre_copy_(dst, src, non_blocking=False):
+    """Lower ``copy_`` and mark graph-input copy-back candidates.
+
+    Do not alias at lowering time.  Candidate marking keeps the structural
+    connection to ``copy_`` while letting layout propagation make the final,
+    feasibility-aware decision after producer layouts are known.
+    """
+    if dst is src:
+        return dst
+
+    candidate = _copy_back_candidate(dst, src)
+    src = lowering.to_device(src, dst.get_device())
+    src = lowering.to_dtype(src, dst.get_dtype())
+    src = lowering.expand(src, dst.get_size())
+
+    first_new_op = len(V.graph.operations)
+    result = lowering.mutate_to(dst, src)
+    if candidate:
+        _mark_copy_back_candidate(first_new_op, dst)
+    return result
+
+
 @register_spyre_lowering(torch.ops.aten.cat.default, type_promotion_kind=None)
 def lower_cat(inputs, dim=0):
     output_size = list(inputs[0].get_size())
@@ -1032,7 +1107,7 @@ def lower_constant_pad_nd(input, pad, value=0, align_to_stick=False):
 @register_spyre_lowering(torch.ops.spyre.qfp8wt)
 def lower_qfp8wt(x):
     """
-    Lower qfp8ch operation - channel-wise FP8 format conversion.
+    Lower qfp8wt operation - weight FP8 format conversion with 2D stick layout.
 
     Pointwise format conversion only (no scaling).
     """
@@ -1059,13 +1134,13 @@ def lower_qfp8wt(x):
 @register_spyre_lowering(torch.ops.spyre.quantize_weight_fp8_with_scale)
 def lower_quantize_weight_fp8_with_scale(x, scale):
     """
-    Lower quantize_fp8_with_scale operation.
+    Lower quantize_weight_fp8_with_scale operation.
 
     Composes four operations:
     1. Compute inverse scale using reciprocal (POINTWISE, sfp unit)
     2. Multiply by inverse scale (POINTWISE)
     3. Clamp to FP8 range [-448, 448] (POINTWISE)
-    4. Convert to FP8 format using qfp8ch (POINTWISE format conversion)
+    4. Convert to FP8 weight format using qfp8wt (POINTWISE format conversion)
     """
     x.realize()
     scale.realize()
@@ -1082,7 +1157,90 @@ def lower_quantize_weight_fp8_with_scale(x, scale):
     x_clamped = lower_clamp(x_scaled, -448.0, 448.0)
     x_clamped.realize()  # Force realization to prevent fusion
 
-    # Step 4: Convert to FP8 format
+    # Step 4: Convert to FP8 weight format
     x_fp8 = lower_qfp8wt(x_clamped)
 
     return x_fp8
+
+
+@register_spyre_lowering(
+    torch.ops.prims.convert_element_type.default,
+    type_promotion_kind=None,
+)
+def to_dtype(x, dst_dtype):
+    from torch_spyre._inductor.dtype_ops import DtypeOpTable
+
+    src_dtype = x.get_dtype()
+
+    if src_dtype == dst_dtype:
+        return clone(x)
+
+    # Check if conversion is supported by backend
+    if DtypeOpTable.get_operator(src_dtype, dst_dtype) is None:
+        # Unsupported conversion - fall back to CPU
+        op = torch.ops.spyre.to_dtype_cpu.default
+        return eager_fallback(op, x, dst_dtype)
+
+    return lowering.to_dtype(x, dst_dtype, copy=True)
+
+
+def with_int64_fallback(fn, *args, convert_output=True):
+    """
+    Helper to handle int64 operations by converting to fp32.
+
+    Args:
+        fn: The lowering function to call
+        *args: Arguments to pass to fn
+        convert_output: If True, convert output back to int64.
+                       Set to False for operations like div that should return float.
+    """
+    if not any(x.get_dtype() == torch.int64 for x in args):
+        return fn(*args)
+
+    args = [to_dtype(x, torch.float32) for x in args]
+    output = fn(*args)
+
+    if convert_output:
+        return to_dtype(output, torch.int64)
+
+    return output
+
+
+@register_spyre_lowering(
+    torch.ops.aten.add.Tensor,
+    type_promotion_kind=None,
+)
+def lower_add(x, y):
+    return with_int64_fallback(lowering.add, x, y)
+
+
+@register_spyre_lowering(
+    torch.ops.aten.mul.Tensor,
+    type_promotion_kind=None,
+)
+def lower_mul(x, y):
+    return with_int64_fallback(lowering.mul, x, y)
+
+
+@register_spyre_lowering(
+    torch.ops.aten.sub.Tensor,
+    type_promotion_kind=None,
+)
+def lower_sub(x, y):
+    return with_int64_fallback(lowering.sub, x, y)
+
+
+@register_spyre_lowering(
+    torch.ops.aten.minimum.default,
+    type_promotion_kind=None,
+)
+def lower_minimum(x, y):
+    return with_int64_fallback(lowering.minimum, x, y)
+
+
+@register_spyre_lowering(
+    torch.ops.aten.maximum.default,
+    type_promotion_kind=None,
+)
+def lower_maximum(x, y):
+    return with_int64_fallback(lowering.maximum, x, y)
