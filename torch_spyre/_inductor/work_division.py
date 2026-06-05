@@ -35,6 +35,7 @@ from torch._inductor.dependencies import MemoryDep
 
 from .errors import Unsupported
 from .constants import BATCH_MATMUL_OP, TOPK_OPS
+from torch_spyre._C import ElementArrangement
 from .ir import FixedTiledLayout
 from .pass_utils import (
     SchedNodeArg,
@@ -200,6 +201,10 @@ def adjust_it_space_for_sticks(
         if stick_var not in adjusted_space:
             continue
         elems_per_stick = td.layout.device_layout.elems_per_stick()
+        # QFP8WT uses a 2D stick [2, 64]; device_coords[-1] indexes the inner
+        # 64-element dimension, so the effective unit per stick variable is 64.
+        if td.layout.device_layout.element_arrangement == ElementArrangement.QFP8WT:
+            elems_per_stick //= 2
         if stick_var not in max_elems or elems_per_stick > max_elems[stick_var]:
             max_elems[stick_var] = elems_per_stick
 
