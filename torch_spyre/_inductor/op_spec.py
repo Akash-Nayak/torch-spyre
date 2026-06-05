@@ -19,7 +19,7 @@ import dataclasses
 from typing import Any, Sequence
 
 from sympy import Symbol, Expr
-from torch_spyre._C import DataFormats
+from torch_spyre._C import DataFormats, ElementArrangement
 import torch
 
 
@@ -46,6 +46,9 @@ class TensorArg:
     allocation: Any
     stride_map: list[int] | None = None
     per_tile_fixed: bool = False
+    element_arrangement: ElementArrangement = dataclasses.field(
+        default_factory=lambda: ElementArrangement.STANDARD
+    )
 
 
 @dataclasses.dataclass

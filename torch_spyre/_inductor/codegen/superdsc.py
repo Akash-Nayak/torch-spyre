@@ -19,7 +19,7 @@ from collections import Counter
 from sympy import Integer, Symbol, Expr, Mod, floor
 
 from torch._inductor.virtualized import V
-from torch_spyre._C import DataFormats
+from torch_spyre._C import DataFormats, ElementArrangement
 from torch_spyre._inductor.constants import (
     IDENTITY_OP,
     INPUT_DIM_LABELS,
@@ -214,6 +214,31 @@ def _calculate_device_stride(dev_dim_idx: int, device_size: list) -> int:
     return math.prod(device_size[-dev_dim_idx - 2 :])
 
 
+def _qfp8wt_expanded_device_size(device_size: list) -> list:
+    """Return the 4D device size for a QFP8WT tensor by making the 2D stick explicit.
+
+    QFP8WT device_size is 3D: [outer_stick, non_stick_dims..., inner_stick].
+    The outer stick dim (size 2) is at index 0 and the inner stick (size 64) is
+    at index -1. Expanding to 4D inserts the outer stick adjacent to the inner:
+    [non_stick_dims..., outer_stick, inner_stick].
+    This matches the DCI order (reversed): [inner_stick, outer_stick, non_stick...].
+    """
+    outer_stick = device_size[0]
+    non_stick = device_size[1:-1]
+    inner_stick = device_size[-1]
+    return non_stick + [outer_stick, inner_stick]
+
+
+def _qfp8wt_stick_stride(device_size: list) -> int:
+    """Return the stride for the inner stick iteration variable of a QFP8WT tensor.
+
+    In the expanded 4D layout [non_stick..., outer_stick, inner_stick], the inner
+    stick sits at DCI position 0 (last in device_size). Its stride in DCI terms is
+    the product of all DCI dims before it, which is just outer_stick = device_size[0].
+    """
+    return device_size[0]
+
+
 def _get_device_dim_order(
     arg: TensorArg, symbol_mapping: dict
 ) -> tuple[list[Symbol], Symbol | None]:
@@ -358,6 +383,7 @@ def _create_sdsc_tensors(
         ] + reduced_dims
         is_fp8_matmul = op_spec.op in (BATCH_MATMUL_FP8_OP)
         is_fp8_quant = op_spec.op in ("qfp8ch")
+        is_2d_stick_kernel = arg.element_arrangement == ElementArrangement.QFP8WT
         for dim in dim_order:
             stride_idx = stride_dim_order.index(dim)
             if dim in reduced_dims and op_spec.op != "layernormscale":
@@ -366,7 +392,10 @@ def _create_sdsc_tensors(
                 scales[dim] = -2 if (dim is stick_dim) else -1
             else:
                 scales[dim] = 1
-            strides[dim] = _calculate_device_stride(stride_idx, arg.device_size)
+            if dim == stick_dim and is_2d_stick_kernel:
+                strides[dim] = _qfp8wt_stick_stride(arg.device_size)
+            else:
+                strides[dim] = _calculate_device_stride(stride_idx, arg.device_size)
             offsets[dim] = 0
             dim_device_stride = math.prod(arg.device_size[-stride_idx - 1 :])
 
@@ -378,6 +407,10 @@ def _create_sdsc_tensors(
                 it_dim_size = it_dim_size // work_slices[dim]
             if dim == stick_dim:
                 stick_size = arg.device_dtype.elems_per_stick()
+                # 2D-stick: device_size=[outer_stick, non_stick..., inner_stick];
+                # the iteration variable indexes the inner dim only (size = 64).
+                if is_2d_stick_kernel:
+                    stick_size = stick_size // 2
                 dev_dim_size *= stick_size
                 it_dim_size = ((it_dim_size - 1) // stick_size + 1) * stick_size
 
@@ -395,18 +428,10 @@ def _create_sdsc_tensors(
 
         effective_stick = [op_stick_dim if stick_dim is None else stick_dim]
 
-        # Special handling for FP8 matmul KERNEL tensor
-        is_fp8_matmul = op_spec.op == BATCH_MATMUL_FP8_OP
-        if is_fp8_matmul and len(sdsc_args) == 0:
-            scales[dim]
-        is_kernel_tensor = (is_fp8_matmul or op_spec.op == "qfp8wt") and len(
-            sdsc_args
-        ) == 1
         base_stick_size = arg.device_dtype.elems_per_stick()
-        if is_kernel_tensor:
-            # FP8 KERNEL needs 2D stick: [2, stick_size/2]
+        if is_2d_stick_kernel:
+            # 2D stick layout: [outer=2, inner=stick_size/2]
             layout_stick_size = [2, base_stick_size // 2]
-            # Use the last two dimensions from dim_order for 2D stick
             effective_stick = dim_order[-2:]
         else:
             layout_stick_size = [base_stick_size]
