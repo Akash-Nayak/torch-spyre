@@ -733,11 +733,11 @@ def _cost_model_matmul_planner(
     # Classify the output coord dims: the stickified one is N, the rest index
     # rows. Of those row dims, M is the one appearing in a single input (the
     # LHS); batch dims appear in both.
-    output_coord_vars = {
-        v for e in output_td.device_coords[:-1] for v in e.free_symbols
-    }
-    n_dims = [d for d in output_coord_vars if d in stick_vars]
-    row_dims = [d for d in output_coord_vars if d not in stick_vars]
+    # N (the stick dim) lives in device_coords[-1]; row dims live in [:-1].
+    row_coord_vars = {v for e in output_td.device_coords[:-1] for v in e.free_symbols}
+    stick_coord_vars = {v for v in output_td.device_coords[-1].free_symbols}
+    n_dims = [d for d in stick_coord_vars if d in stick_vars]
+    row_dims = [d for d in row_coord_vars if d not in stick_vars]
     if len(n_dims) != 1 or not row_dims:
         return splits
     n_dim = n_dims[0]
@@ -782,7 +782,8 @@ def _cost_model_matmul_planner(
     m_dim = m_candidates[0] if m_candidates else None
 
     # K is the lone reduction dim (anything else this planner does not model).
-    reduction = [d for d in it_space_adjusted if d not in output_coord_vars]
+    all_output_vars = row_coord_vars | stick_coord_vars
+    reduction = [d for d in it_space_adjusted if d not in all_output_vars]
     if len(reduction) != 1:
         return splits
     k_dim = reduction[0]
@@ -809,11 +810,13 @@ def _cost_model_matmul_planner(
     k_divs = [int(d) for d in divisors(k_sticks)]
 
     is_fp8_bmm = op.data.reduction_type == BATCH_MATMUL_FP8_OP
-    # For FP8 BMM the DSC requires each core's K and N slices to be at most 128
-    # elements (one outer-stick / inner-stick unit respectively). Enforce minimum
-    # splits so the planner only considers feasible configurations.
-    fp8_min_k_split = math.ceil(K_e / 128) if is_fp8_bmm else 1
-    fp8_min_n_split = math.ceil(N_e / 128) if is_fp8_bmm else 1
+    # For FP8 BMM the DSC requires each core's K slice to be at most 128 elements
+    # and each N slice to be at most 128 elements (one inner-stick unit = 64, but
+    # n_sticks is already in sticks so per-core sticks must be <= 2, i.e. 128 elems).
+    # k_sticks is in raw elements (not adjusted by adjust_it_space_for_sticks since
+    # K is not a stick dim), so the limit is 128 raw elements per core.
+    fp8_min_k_split = math.ceil(k_sticks / 128) if is_fp8_bmm else 1
+    fp8_min_n_split = math.ceil(n_sticks / 2) if is_fp8_bmm else 1
 
     best = None
     best_cost = float("inf")
