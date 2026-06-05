@@ -34,7 +34,7 @@ from torch._inductor.ir import (
 from torch._inductor.dependencies import MemoryDep
 
 from .errors import Unsupported
-from .constants import BATCH_MATMUL_OP, TOPK_OPS
+from .constants import BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP, TOPK_OPS
 from torch_spyre._C import ElementArrangement
 from .ir import FixedTiledLayout
 from .pass_utils import (
@@ -725,7 +725,7 @@ def _cost_model_matmul_planner(
     """
     if not isinstance(op.data, Reduction):
         return splits
-    if op.data.reduction_type != BATCH_MATMUL_OP:
+    if op.data.reduction_type not in (BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP):
         return splits
     if committed_splits:
         return splits
@@ -749,16 +749,50 @@ def _cost_model_matmul_planner(
         )
         return hits == 1
 
-    m_candidates = [d for d in row_dims if _appears_in_one_input(d)]
-    # A bmm with a SHARED 2D weight broadcasts it across the batch, so the batch
-    # dim "appears in one input" like M and m_candidates has two entries -> we
-    # decline here and the default distributor handles it. Engaging the planner
-    # for that case needs weight-rank awareness (which also fixes the B*K*N HBM
-    # term over-counting the shared weight); tracked as a follow-up.
+    if op.data.reduction_type == BATCH_MATMUL_FP8_OP:
+        # For fp8 bmm the weight (QFP8WT) is 2D [K, N] — it has no batch dim.
+        # Both mb and m appear only in the LHS, so _appears_in_one_input cannot
+        # distinguish them.  Identify the weight by element_arrangement and use
+        # the LHS device_coords order: in [B, M, K], M is the last non-K dim
+        # before the stick (i.e. the dim in the second-to-last non-stick coord).
+        weight_td = next(
+            (
+                td
+                for td in input_tds
+                if td.layout.device_layout.element_arrangement
+                == ElementArrangement.QFP8WT
+            ),
+            None,
+        )
+        if weight_td is None:
+            return splits
+        lhs_td = next(td for td in input_tds if td is not weight_td)
+        k_vars = {v for e in weight_td.device_coords[:-1] for v in e.free_symbols}
+        # In the LHS [B, M, K], device_coords are ordered [mb, m, in, stick].
+        # Walking backwards past the stick and K, the first free symbol is m.
+        lhs_non_stick = lhs_td.device_coords[:-1]
+        m_dim = None
+        for coord in reversed(lhs_non_stick):
+            syms = coord.free_symbols - k_vars
+            if syms:
+                m_dim = next(iter(syms))
+                break
+        if m_dim is None or m_dim not in row_dims:
+            return splits
+        m_candidates = [m_dim]
+        batch_dims = [d for d in row_dims if d is not m_dim]
+    else:
+        m_candidates = [d for d in row_dims if _appears_in_one_input(d)]
+        # A bmm with a SHARED 2D weight broadcasts it across the batch, so the
+        # batch dim "appears in one input" like M and m_candidates has two
+        # entries -> decline and let the default distributor handle it.
+        if len(m_candidates) != 1:
+            return splits
+        batch_dims = [d for d in row_dims if d is not m_candidates[0]]
+
     if len(m_candidates) != 1:
         return splits
     m_dim = m_candidates[0]
-    batch_dims = [d for d in row_dims if d is not m_dim]
 
     # K is the lone reduction dim (anything else this planner does not model).
     reduction = [d for d in it_space_adjusted if d not in output_coord_vars]
@@ -925,7 +959,7 @@ def _cost_model_divide_op(op: ComputedBuffer, max_cores: int) -> bool:
     """
     if not isinstance(op.data, Reduction):
         return False
-    if op.data.reduction_type != BATCH_MATMUL_OP:
+    if op.data.reduction_type not in (BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP):
         return False
 
     rw = op.get_read_writes()
