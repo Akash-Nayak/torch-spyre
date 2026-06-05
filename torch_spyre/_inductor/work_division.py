@@ -809,6 +809,11 @@ def _cost_model_matmul_planner(
     k_divs = [int(d) for d in divisors(k_sticks)]
 
     is_fp8_bmm = op.data.reduction_type == BATCH_MATMUL_FP8_OP
+    # For FP8 BMM the DSC requires each core's K and N slices to be at most 128
+    # elements (one outer-stick / inner-stick unit respectively). Enforce minimum
+    # splits so the planner only considers feasible configurations.
+    fp8_min_k_split = math.ceil(K_e / 128) if is_fp8_bmm else 1
+    fp8_min_n_split = math.ceil(N_e / 128) if is_fp8_bmm else 1
 
     best = None
     best_cost = float("inf")
@@ -816,7 +821,11 @@ def _cost_model_matmul_planner(
         b_prod = math.prod(b_combo)
         for mm in m_divs:
             for nn in n_divs:
+                if nn < fp8_min_n_split:
+                    continue
                 for kk in k_divs:
+                    if kk < fp8_min_k_split:
+                        continue
                     if b_prod * mm * nn * kk > max_cores:
                         continue
                     c = _matmul_split_cost(
