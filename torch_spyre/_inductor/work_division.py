@@ -751,10 +751,9 @@ def _cost_model_matmul_planner(
 
     if op.data.reduction_type == BATCH_MATMUL_FP8_OP:
         # For fp8 bmm the weight (QFP8WT) is 2D [K, N] — it has no batch dim.
-        # Both mb and m appear only in the LHS, so _appears_in_one_input cannot
-        # distinguish them.  Identify the weight by element_arrangement and use
-        # the LHS device_coords order: in [B, M, K], M is the last non-K dim
-        # before the stick (i.e. the dim in the second-to-last non-stick coord).
+        # Any row dim absent from the weight's coords is a batch dim (it indexes
+        # activation rows that the kernel doesn't vary over).  Row dims present
+        # in the weight's coords are true M dims.
         weight_td = next(
             (
                 td
@@ -766,21 +765,9 @@ def _cost_model_matmul_planner(
         )
         if weight_td is None:
             return splits
-        lhs_td = next(td for td in input_tds if td is not weight_td)
-        k_vars = {v for e in weight_td.device_coords[:-1] for v in e.free_symbols}
-        # In the LHS [B, M, K], device_coords are ordered [mb, m, in, stick].
-        # Walking backwards past the stick and K, the first free symbol is m.
-        lhs_non_stick = lhs_td.device_coords[:-1]
-        m_dim = None
-        for coord in reversed(lhs_non_stick):
-            syms = coord.free_symbols - k_vars
-            if syms:
-                m_dim = next(iter(syms))
-                break
-        if m_dim is None or m_dim not in row_dims:
-            return splits
-        m_candidates = [m_dim]
-        batch_dims = [d for d in row_dims if d is not m_dim]
+        weight_coord_vars = {v for e in weight_td.device_coords for v in e.free_symbols}
+        m_candidates = [d for d in row_dims if d in weight_coord_vars]
+        batch_dims = [d for d in row_dims if d not in weight_coord_vars]
     else:
         m_candidates = [d for d in row_dims if _appears_in_one_input(d)]
         # A bmm with a SHARED 2D weight broadcasts it across the batch, so the
@@ -790,9 +777,9 @@ def _cost_model_matmul_planner(
             return splits
         batch_dims = [d for d in row_dims if d is not m_candidates[0]]
 
-    if len(m_candidates) != 1:
+    if len(m_candidates) > 1:
         return splits
-    m_dim = m_candidates[0]
+    m_dim = m_candidates[0] if m_candidates else None
 
     # K is the lone reduction dim (anything else this planner does not model).
     reduction = [d for d in it_space_adjusted if d not in output_coord_vars]
@@ -803,7 +790,7 @@ def _cost_model_matmul_planner(
     # The iteration space measures N and K in sticks; the cost model wants real
     # elements so its byte and MAC counts are physical.
     elems_per_stick = output_td.layout.device_layout.device_dtype.elems_per_stick()
-    M_e = concretize_expr(it_space_adjusted[m_dim])
+    M_e = concretize_expr(it_space_adjusted[m_dim]) if m_dim is not None else 1
     n_sticks = concretize_expr(it_space_adjusted[n_dim])
     k_sticks = concretize_expr(it_space_adjusted[k_dim])
     N_e = n_sticks * elems_per_stick
@@ -821,10 +808,7 @@ def _cost_model_matmul_planner(
     n_divs = [int(d) for d in divisors(n_sticks)]
     k_divs = [int(d) for d in divisors(k_sticks)]
 
-    # For fp8 bmm the kernel is 2D [K, N]: each core must see at most 128
-    # elements on both the K (in) and N (out) dims to fit one 2D stick group.
     is_fp8_bmm = op.data.reduction_type == BATCH_MATMUL_FP8_OP
-    _FP8_KERNEL_MAX_ELEMS = 128
 
     best = None
     best_cost = float("inf")
@@ -834,11 +818,6 @@ def _cost_model_matmul_planner(
             for nn in n_divs:
                 for kk in k_divs:
                     if b_prod * mm * nn * kk > max_cores:
-                        continue
-                    if is_fp8_bmm and (
-                        K_e // kk > _FP8_KERNEL_MAX_ELEMS
-                        or N_e // nn > _FP8_KERNEL_MAX_ELEMS
-                    ):
                         continue
                     c = _matmul_split_cost(
                         (B_total, b_prod), (M_e, mm), (N_e, nn), (K_e, kk), max_cores
@@ -854,12 +833,15 @@ def _cost_model_matmul_planner(
     new_splits = dict(splits)
     for bd, bs in zip(batch_dims, b_combo):
         new_splits[bd] = int(bs)
-    new_splits[m_dim] = m_s
+    if m_dim is not None:
+        new_splits[m_dim] = m_s
     new_splits[n_dim] = n_s
     new_splits[k_dim] = k_s
 
-    # Never trade down to fewer cores than the default distributor already found.
-    if math.prod(new_splits.values()) < math.prod(splits.values()):
+    # Never trade down to fewer cores than the default distributor already found,
+    # unless this is fp8 bmm where batch splits are invalid (the kernel has no
+    # batch coord and the DSC cannot loop over it).
+    if not is_fp8_bmm and math.prod(new_splits.values()) < math.prod(splits.values()):
         return splits
 
     logger.debug(
