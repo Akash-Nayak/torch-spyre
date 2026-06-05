@@ -215,8 +215,7 @@ def _single_arg_op_layout(
                 c_stride,
                 output.dtype,
                 list(range(len(c_size))),
-                ElementArrangement.QFP8CH,
-            )
+            ).with_element_arrangement(ElementArrangement.QFP8CH)
 
         case spyreop.qfp8wt:
             # fp16 -> fp8 weight quantization with 2D-stick layout [2, 64].
@@ -237,8 +236,7 @@ def _single_arg_op_layout(
                 c_stride,
                 output.dtype,
                 list(range(len(c_size))),
-                ElementArrangement.QFP8WT,
-            )
+            ).with_element_arrangement(ElementArrangement.QFP8WT)
 
         case _:
             in_coords = host_coordinates(in_layout, dep)
