@@ -196,7 +196,7 @@ def _single_arg_op_layout(
                 list(range(len(c_size))),
             )
 
-        case spyreop.qfp8ch:
+        case spyreop.qfp8ch.default:
             # fp16 (64 elems/stick) -> fp8 (128 elems/stick) channel quantization.
             in_elems_per_stick = get_elem_in_stick(in_layout.dtype)
             stick_dim_size = in_layout.size[-1]
@@ -215,9 +215,10 @@ def _single_arg_op_layout(
                 c_stride,
                 output.dtype,
                 list(range(len(c_size))),
-            ).with_element_arrangement(ElementArrangement.QFP8CH)
+                ElementArrangement.QFP8CH,
+            )
 
-        case spyreop.qfp8wt:
+        case spyreop.qfp8wt.default:
             # fp16 -> fp8 weight quantization with 2D-stick layout [2, 64].
             in_elems_per_stick = get_elem_in_stick(in_layout.dtype)
             stick_dim_size = in_layout.size[-1]
@@ -236,7 +237,8 @@ def _single_arg_op_layout(
                 c_stride,
                 output.dtype,
                 list(range(len(c_size))),
-            ).with_element_arrangement(ElementArrangement.QFP8WT)
+                ElementArrangement.QFP8WT,
+            )
 
         case _:
             in_coords = host_coordinates(in_layout, dep)

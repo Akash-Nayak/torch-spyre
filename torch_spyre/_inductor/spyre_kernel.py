@@ -782,7 +782,7 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
                                 buf.writeline("per_tile_fixed=True,")
                             if arg.element_arrangement != ElementArrangement.STANDARD:
                                 buf.writeline(
-                                    f"element_arrangement={arg.element_arrangement!r},"
+                                    f"element_arrangement={arg.element_arrangement},"
                                 )
                         buf.writeline("),")
                 buf.writeline("]")
