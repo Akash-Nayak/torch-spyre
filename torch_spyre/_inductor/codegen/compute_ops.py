@@ -481,10 +481,14 @@ def generate_sdsc(
                                     "coordinates_": {
                                         "coordInfo": {
                                             str(dim): gen_coord_info_value(
-                                                size=sdsc_spec.iteration_space[dim]
-                                                // sdsc_spec.work_slices[dim]
-                                                if (tensor.scales[dim] == 1)
-                                                else 1,
+                                                size=tensor.coord_size_overrides[dim]
+                                                if dim in tensor.coord_size_overrides
+                                                else (
+                                                    sdsc_spec.iteration_space[dim]
+                                                    // sdsc_spec.work_slices[dim]
+                                                    if (tensor.scales[dim] == 1)
+                                                    else 1
+                                                ),
                                                 nsplits=sdsc_spec.work_slices[dim]
                                                 if (tensor.scales[dim] == 1)
                                                 else 1,

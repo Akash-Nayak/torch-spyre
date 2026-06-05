@@ -53,6 +53,7 @@ class SDSCArgs:
     allocation: dict[str, Any]
     start_address: int | Symbol
     backGap: dict[Symbol, int]
+    coord_size_overrides: dict[Symbol, int] = dataclasses.field(default_factory=dict)
 
     def __str__(self) -> str:
         scales = ", ".join(f"{k}={v}" for k, v in self.scales.items())
@@ -367,6 +368,7 @@ def _create_sdsc_tensors(
         offsets: dict = {}
         backGap: dict[Symbol, int] = {}
         max_dim_sizes: dict = {}
+        coord_size_overrides: dict = {}
         reduced_dims: list = []
         if use_op_dims and dim_order != dims and not _is_topk(op_spec.op):
             reduced_dims = [d for d in op_dim_order if d not in dim_order]
@@ -430,9 +432,16 @@ def _create_sdsc_tensors(
 
         base_stick_size = arg.device_dtype.elems_per_stick()
         if is_2d_stick_kernel:
-            # 2D stick layout: [outer=2, inner=stick_size/2]
+            # 2D stick layout: outer stick size=2 (the K/in dim), inner=base/2.
+            # stick_dim_order=[outer, inner] so stick_size[0]=2 maps to the K
+            # dim and stick_size[1]=base/2 maps to the N/out dim.
+            outer_stick_dim = next(d for d in dim_order if d is not stick_dim)
+            # [outer_stick_dim, inner_stick_dim] with matching sizes [2, base/2]
+            effective_stick = [outer_stick_dim, stick_dim]
             layout_stick_size = [2, base_stick_size // 2]
-            effective_stick = dim_order[-2:]
+            # The outer-stick dim (K) advances by one outer-stick unit (size 2)
+            # per step.  Override the coord size so alpha_=2 instead of K.
+            coord_size_overrides[outer_stick_dim] = 2
         else:
             layout_stick_size = [base_stick_size]
 
@@ -467,6 +476,7 @@ def _create_sdsc_tensors(
                 backGap=backGap
                 if "lx" not in arg.allocation
                 else {},  # TODO: handle lx backgaps
+                coord_size_overrides=coord_size_overrides,
             )
         )
 
