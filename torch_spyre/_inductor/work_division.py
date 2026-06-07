@@ -810,13 +810,12 @@ def _cost_model_matmul_planner(
     k_divs = [int(d) for d in divisors(k_sticks)]
 
     is_fp8_bmm = op.data.reduction_type == BATCH_MATMUL_FP8_OP
-    # For FP8 BMM the DSC requires each core's K slice to be at most 128 elements
-    # and each N slice to be at most 128 elements (one inner-stick unit = 64, but
-    # n_sticks is already in sticks so per-core sticks must be <= 2, i.e. 128 elems).
-    # k_sticks is in raw elements (not adjusted by adjust_it_space_for_sticks since
-    # K is not a stick dim), so the limit is 128 raw elements per core.
-    fp8_min_k_split = math.ceil(k_sticks / 128) if is_fp8_bmm else 1
-    fp8_min_n_split = math.ceil(n_sticks / 2) if is_fp8_bmm else 1
+
+    # FP8 BMM: each core must receive exactly 128 elements of K and N.
+    # k_sticks and n_sticks are already in stick units (128 elems each), so
+    # splitting by k_sticks/n_sticks gives each core exactly one stick.
+    fp8_k_split = k_sticks if is_fp8_bmm else None
+    fp8_n_split = n_sticks if is_fp8_bmm else None
 
     best = None
     best_cost = float("inf")
@@ -824,10 +823,10 @@ def _cost_model_matmul_planner(
         b_prod = math.prod(b_combo)
         for mm in m_divs:
             for nn in n_divs:
-                if nn < fp8_min_n_split:
+                if is_fp8_bmm and nn != fp8_n_split:
                     continue
                 for kk in k_divs:
-                    if kk < fp8_min_k_split:
+                    if is_fp8_bmm and kk != fp8_k_split:
                         continue
                     if b_prod * mm * nn * kk > max_cores:
                         continue
@@ -850,10 +849,7 @@ def _cost_model_matmul_planner(
     new_splits[n_dim] = n_s
     new_splits[k_dim] = k_s
 
-    # Never trade down to fewer cores than the default distributor already found,
-    # unless this is fp8 bmm where batch splits are invalid (the kernel has no
-    # batch coord and the DSC cannot loop over it).
-    if not is_fp8_bmm and math.prod(new_splits.values()) < math.prod(splits.values()):
+    if math.prod(new_splits.values()) < math.prod(splits.values()):
         return splits
 
     logger.debug(
