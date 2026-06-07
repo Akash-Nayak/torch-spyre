@@ -22,6 +22,7 @@ from utils_inductor import (
     cached_randn,
     cached_xavier,
     compare_with_cpu,
+    compare_with_pytorch,
     make_param_dict,
     unique_randn_along_dim,
     shapes2key,
@@ -3756,6 +3757,28 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "3d_8x6x4": (cached_randn((2, 3, 64), dtype=torch.float16), 8, 6, 4),
             },
         },
+        ("test_fp8_scaled_mm", "test_fp8_scaled_mm_cpu"): {
+            "param_sets": {
+                "128x128x128": (
+                    cached_randn((128, 128), dtype=torch.float16, scale=0.01),
+                    cached_randn((128, 128), dtype=torch.float16, scale=0.01),
+                    torch.tensor([1.0], dtype=torch.float16),
+                    torch.tensor([1.0], dtype=torch.float16),
+                ),
+                "128x256x128": (
+                    cached_randn((128, 256), dtype=torch.float16, scale=0.01),
+                    cached_randn((256, 128), dtype=torch.float16, scale=0.01),
+                    torch.tensor([1.0], dtype=torch.float16),
+                    torch.tensor([1.0], dtype=torch.float16),
+                ),
+                "2x128x128x128": (
+                    cached_randn((2, 128, 128), dtype=torch.float16, scale=0.01),
+                    cached_randn((128, 128), dtype=torch.float16, scale=0.01),
+                    torch.tensor([1.0], dtype=torch.float16),
+                    torch.tensor([1.0], dtype=torch.float16),
+                ),
+            },
+        },
     }
 
     def __init__(self, *args, **kwargs):
@@ -5195,6 +5218,23 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return a.repeat(*repeat_args)
 
         self.compare_with_cpu(fn, x, run_eager=False)
+
+    def test_fp8_scaled_mm_cpu(self, a, b, scale_a, scale_b):
+        def spyre_fn(a, b, scale_a, scale_b):
+            q_a = torch.ops.spyre.quantize_fp8_with_scale(a, scale_a)
+            q_b = torch.ops.spyre.quantize_weight_fp8_with_scale(b, scale_b)
+            return torch.ops.aten._scaled_mm(
+                q_a, q_b, scale_a, scale_b, bias=None, out_dtype=torch.float16
+            )
+
+        def pytorch_fn(a, b, scale_a, scale_b):
+            q_a = (a / scale_a).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+            q_b = (b / scale_b).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+            return (q_a.to(torch.float16) @ q_b.to(torch.float16)) * (scale_a * scale_b)
+
+        compare_with_pytorch(
+            spyre_fn, pytorch_fn, a, b, scale_a, scale_b, atol=0.1, rtol=0.1
+        )
 
 
 if __name__ == "__main__":
