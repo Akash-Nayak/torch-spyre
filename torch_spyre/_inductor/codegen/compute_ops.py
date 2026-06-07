@@ -506,9 +506,9 @@ def generate_sdsc(
                                                 else tensor.data_format.elems_per_stick(),
                                                 is_stick_dim=(
                                                     dim
-                                                    in sdsc_spec.layouts[tensor.layout][
+                                                    == sdsc_spec.layouts[tensor.layout][
                                                         "stick_dim_order"
-                                                    ]
+                                                    ][-1]
                                                 ),
                                                 is_stick_reduction=(
                                                     tensor.scales[dim] == -2
