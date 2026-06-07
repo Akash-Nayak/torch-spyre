@@ -201,10 +201,21 @@ def adjust_it_space_for_sticks(
         if stick_var not in adjusted_space:
             continue
         elems_per_stick = td.layout.device_layout.elems_per_stick()
-        # QFP8WT uses a 2D stick [2, 64]; device_coords[-1] indexes the inner
-        # 64-element dimension, so the effective unit per stick variable is 64.
         if td.layout.device_layout.element_arrangement == ElementArrangement.QFP8WT:
-            elems_per_stick //= 2
+            # QFP8WT has a 2D stick [2, 64] = 128 elements total. Both the outer
+            # stick variable (device_coords[-2]) and the inner stick variable
+            # (device_coords[-1]) must be treated as 128-element atomic units so
+            # neither dimension is split below one full 2D stick per core.
+            outer_stick_expr = td.device_coords[-2]
+            outer_syms = outer_stick_expr.free_symbols
+            if len(outer_syms) == 1:
+                outer_var = next(iter(outer_syms))
+                if outer_var in adjusted_space:
+                    if (
+                        outer_var not in max_elems
+                        or elems_per_stick > max_elems[outer_var]
+                    ):
+                        max_elems[outer_var] = elems_per_stick
         if stick_var not in max_elems or elems_per_stick > max_elems[stick_var]:
             max_elems[stick_var] = elems_per_stick
 
