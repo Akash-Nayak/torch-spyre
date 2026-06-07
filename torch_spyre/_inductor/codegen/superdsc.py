@@ -389,7 +389,14 @@ def _create_sdsc_tensors(
         for dim in dim_order:
             stride_idx = stride_dim_order.index(dim)
             if dim in reduced_dims and op_spec.op != "layernormscale":
-                scales[dim] = -2 if (stick_dim is None and dim is op_stick_dim) else -1
+                # For a 2D-stick kernel the outer stick dim (in/K) is a
+                # reduction for the output but the KERNEL itself iterates
+                # over all of K spatially — treat it as scale=1.
+                scales[dim] = (
+                    1
+                    if (is_2d_stick_kernel and dim is not stick_dim)
+                    else (-2 if (stick_dim is None and dim is op_stick_dim) else -1)
+                )
             elif dim in reduced_dims and op_spec.op == "layernormscale":
                 scales[dim] = -2 if (dim is stick_dim) else -1
             else:
@@ -432,16 +439,9 @@ def _create_sdsc_tensors(
 
         base_stick_size = arg.device_dtype.elems_per_stick()
         if is_2d_stick_kernel:
-            # 2D stick layout: outer stick size=2 (the K/in dim), inner=base/2.
-            # stick_dim_order=[outer, inner] so stick_size[0]=2 maps to the K
-            # dim and stick_size[1]=base/2 maps to the N/out dim.
             outer_stick_dim = next(d for d in dim_order if d is not stick_dim)
-            # [outer_stick_dim, inner_stick_dim] with matching sizes [2, base/2]
             effective_stick = [outer_stick_dim, stick_dim]
             layout_stick_size = [2, base_stick_size // 2]
-            # The outer-stick dim (K) advances by one outer-stick unit (size 2)
-            # per step.  Override the coord size so alpha_=2 instead of K.
-            coord_size_overrides[outer_stick_dim] = 2
         else:
             layout_stick_size = [base_stick_size]
 

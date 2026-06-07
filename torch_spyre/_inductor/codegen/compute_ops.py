@@ -83,6 +83,7 @@ def gen_coord_info_value(
     elems_per_stick: int,
     is_stick_dim: bool,
     is_stick_reduction: bool = False,
+    is_fp8_stick: bool = False,
 ):
     return (
         {
@@ -138,6 +139,31 @@ def gen_coord_info_value(
             },
         }
         if not is_stick_dim
+        else {
+            "spatial": 3,
+            "temporal": 0,
+            "elemArr": 3,
+            "padding": "nopad",
+            "folds": {
+                "dim_prop_func": [
+                    {"Affine": {"alpha_": size, "beta_": 0}},
+                    {"Affine": {"alpha_": 0, "beta_": 0}},
+                    {"Affine": {"alpha_": 0, "beta_": 0}},
+                    {"Affine": {"alpha_": 64, "beta_": 0}},
+                    {"Affine": {"alpha_": 8, "beta_": 0}},
+                    {"Affine": {"alpha_": 1, "beta_": 0}},
+                ],
+                "dim_prop_attr": [
+                    {"factor_": nsplits, "label_": "core_fold"},
+                    {"factor_": 1, "label_": "corelet_fold"},
+                    {"factor_": 1, "label_": "row_fold"},
+                    {"factor_": size // 64, "label_": "elem_arr_2"},
+                    {"factor_": 8, "label_": "elem_arr_1"},
+                    {"factor_": 8, "label_": "elem_arr_0"},
+                ],
+            },
+        }
+        if is_fp8_stick
         else {
             "spatial": 3,
             "temporal": 0,
@@ -506,12 +532,28 @@ def generate_sdsc(
                                                 else tensor.data_format.elems_per_stick(),
                                                 is_stick_dim=(
                                                     dim
-                                                    == sdsc_spec.layouts[tensor.layout][
+                                                    in sdsc_spec.layouts[tensor.layout][
                                                         "stick_dim_order"
-                                                    ][-1]
+                                                    ]
                                                 ),
                                                 is_stick_reduction=(
                                                     tensor.scales[dim] == -2
+                                                ),
+                                                is_fp8_stick=(
+                                                    dim
+                                                    in sdsc_spec.layouts[tensor.layout][
+                                                        "stick_dim_order"
+                                                    ]
+                                                    and tensor.data_format
+                                                    == DataFormats.SEN143_FP8
+                                                    and sdsc_spec.layouts[
+                                                        tensor.layout
+                                                    ]["stick_size"][
+                                                        sdsc_spec.layouts[
+                                                            tensor.layout
+                                                        ]["stick_dim_order"].index(dim)
+                                                    ]
+                                                    >= 64
                                                 ),
                                             )
                                             for dim in sdsc_spec.layouts[tensor.layout][
