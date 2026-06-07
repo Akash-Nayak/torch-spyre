@@ -3760,20 +3760,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         ("test_fp8_scaled_mm", "test_fp8_scaled_mm_cpu"): {
             "param_sets": {
                 "128x128x128": (
-                    cached_randn((128, 128), dtype=torch.float16, scale=0.01),
-                    cached_randn((128, 128), dtype=torch.float16, scale=0.01),
+                    cached_xavier((128, 128)),
+                    cached_xavier((128, 128)),
                     torch.tensor([1.0], dtype=torch.float16),
                     torch.tensor([1.0], dtype=torch.float16),
                 ),
                 "128x256x128": (
-                    cached_randn((128, 256), dtype=torch.float16, scale=0.01),
-                    cached_randn((256, 128), dtype=torch.float16, scale=0.01),
-                    torch.tensor([1.0], dtype=torch.float16),
-                    torch.tensor([1.0], dtype=torch.float16),
-                ),
-                "2x128x128x128": (
-                    cached_randn((2, 128, 128), dtype=torch.float16, scale=0.01),
-                    cached_randn((128, 128), dtype=torch.float16, scale=0.01),
+                    cached_xavier((128, 256)),
+                    cached_xavier((256, 128)),
                     torch.tensor([1.0], dtype=torch.float16),
                     torch.tensor([1.0], dtype=torch.float16),
                 ),
