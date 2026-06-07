@@ -832,6 +832,8 @@ def _cost_model_matmul_planner(
     best_cost = float("inf")
     for b_combo in b_combos:
         b_prod = math.prod(b_combo)
+        if is_fp8_bmm and b_prod != 1:
+            continue
         for mm in m_divs:
             for nn in n_divs:
                 if is_fp8_bmm and nn != fp8_n_split:
@@ -860,7 +862,7 @@ def _cost_model_matmul_planner(
     new_splits[n_dim] = n_s
     new_splits[k_dim] = k_s
 
-    if math.prod(new_splits.values()) < math.prod(splits.values()):
+    if not is_fp8_bmm and math.prod(new_splits.values()) < math.prod(splits.values()):
         return splits
 
     logger.debug(
