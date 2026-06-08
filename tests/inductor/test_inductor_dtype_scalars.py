@@ -364,6 +364,57 @@ class TestDatatypeScalarOperations:
         # For large numbers, atol must be large, but rtol is the real gate
         _compare_modes(execution_mode, large_scalar_mul, x, atol=1e25, rtol=1e-3)
 
+    def test_dtype_conversion_with_symbolic_dimensions(self, execution_mode):
+        """
+        Test dtype conversion with symbolic dimensions (dynamic shapes).
+
+        Regression test for propagate_layouts.py line 167 bug where:
+        - Bug: unaligned = stick_dim_size % in_elems_per_stick
+               if unaligned > 0:  # TypeError: cannot determine truth value of Relational
+        - Fix: unaligned = concretize_expr(stick_dim_size % in_elems_per_stick)
+
+        Without the fix, this test fails with:
+        TypeError: cannot determine truth value of Relational: Mod(s53, 64) > 0
+        """
+        import torch._dynamo as dynamo
+
+        # Reset compilation cache
+        dynamo.reset()
+
+        # Force dynamic shapes to trigger symbolic dimension handling
+        original_config = torch._dynamo.config.assume_static_by_default
+        torch._dynamo.config.assume_static_by_default = False
+
+        try:
+
+            @torch.compile(backend="inductor", dynamic=True)
+            def convert_fp16_to_fp32(x):
+                """Dtype conversion with dynamic shapes forces symbolic dimensions"""
+                return x.to(torch.float32)
+
+            # Use large dimension (4096) to ensure symbolic handling during compilation
+            batch_size = 1
+            seq_len = 128
+            hidden_dim = 4096
+
+            # Create input tensor on Spyre device
+            x = cached_randn(
+                (batch_size, seq_len, hidden_dim),
+                dtype=torch.float16,
+                differentiation="symbolic_dim_fp16_to_fp32",
+            ).to(DEVICE)
+
+            # This triggers dtype conversion with symbolic dimensions
+            result = convert_fp16_to_fp32(x)
+
+            # Verify result
+            assert result.shape == x.shape
+            assert result.dtype == torch.float32
+            assert result.device.type == "spyre"
+        finally:
+            # Reset config
+            torch._dynamo.config.assume_static_by_default = original_config
+
 
 @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
 @pytest.mark.parametrize("execution_mode", ["eager", "compiled"])
