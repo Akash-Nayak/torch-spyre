@@ -5230,6 +5230,50 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             spyre_fn, pytorch_fn, a, b, scale_a, scale_b, atol=0.1, rtol=0.1
         )
 
+    def test_fp8_scaled_mm_qfp8wt(self):
+        """Test _scaled_mm with FP8 weight tensor using QFP8WT element arrangement.
+
+        This verifies that quantized weights are transferred to the device with the
+        2D stick format [2, 64] via ElementArrangement.QFP8WT for correct DCI generation.
+        """
+        from torch_spyre._C import ElementArrangement, DataFormats, SpyreTensorLayout
+
+        # Test case: 128×256 × 256×128
+        m, k, n = 128, 256, 128
+        a = torch.randn((m, k), dtype=torch.float16, device="cpu")
+        b = torch.randn((k, n), dtype=torch.float16, device="cpu")
+        scale_a = torch.tensor([1.0], dtype=torch.float16)
+        scale_b = torch.tensor([1.0], dtype=torch.float16)
+
+        # Quantize to FP8 using the same formula as PyTorch reference
+        q_a_fp8 = (a / scale_a).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+        q_b_fp8 = (b / scale_b).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+
+        a_dev = a.to("spyre")
+        stl_b = SpyreTensorLayout(
+            list(q_b_fp8.size()),
+            list(q_b_fp8.stride()),
+            DataFormats.SEN143_FP8,
+            list(range(len(q_b_fp8.shape))),
+            ElementArrangement.QFP8WT,
+        )
+        q_b_dev = q_b_fp8.to(device_layout=stl_b)
+
+        def scaled_mm(a, q_b_dev, scale_a, scale_b):
+            q_a = torch.ops.spyre.quantize_fp8_with_scale(a, scale_a)
+            result = torch.ops.aten._scaled_mm(
+                q_a, q_b_dev, scale_a, scale_b, bias=None, out_dtype=torch.float16
+            )
+            return result
+
+        # Compare with PyTorch reference using same quantization
+        q_a_ref = q_a_fp8
+        q_b_ref = q_b_fp8
+        expected = (q_a_ref @ q_b_ref).to(torch.float16) * (scale_a * scale_b)
+
+        result = scaled_mm(a_dev, q_b_dev, scale_a, scale_b)
+        torch.testing.assert_close(result.to("cpu"), expected, atol=1e-2, rtol=0.13)
+
 
 if __name__ == "__main__":
     unittest.main()
