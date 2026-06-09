@@ -439,9 +439,9 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
     const int64_t dim2 = K / si;
     const int64_t dim3 = N / so;
 
-    // K stride in 2D stick coordinates from stride_map
-    // stride_map[0] = host elements per device_size[0] step = K elements
-    const int64_t K_sm = stl.stride_map[0] * si;
+    // Host strides for the expanded layout
+    // stride_map[0] = K stride in host elements
+    const int64_t K_stride_host = stl.stride_map[0];
 
     const std::vector<int64_t> expanded_dev_shape = {si, so, dim2, dim3};
     const int64_t dst2 = si * so;     // = eps = 128
@@ -449,7 +449,7 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
 
     DataConversionStrideInfo dcsi;
     dcsi.size_ = {si, so, dim2, dim3};
-    dcsi.stride_src_ = {1, K_sm, si, dst3};
+    dcsi.stride_src_ = {1, K_stride_host, si, dst3};
     dcsi.stride_dst_ = {1, si, dst2, dst3};
     dcsi.offset_src_ = host2device ? cpu_offset : 0;
     dcsi.offset_dst_ = 0;
