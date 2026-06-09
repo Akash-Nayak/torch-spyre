@@ -449,7 +449,10 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
 
     DataConversionStrideInfo dcsi;
     dcsi.size_ = {si, so, dim2, dim3};
-    dcsi.stride_src_ = {1, K_stride_host, si, dst3};
+    // stride_src: [si_stride, so_stride, dim2_stride, dim3_stride]
+    // so_stride should be K (the full K dimension when stepping through so
+    // blocks)
+    dcsi.stride_src_ = {1, K, si, dst3};
     dcsi.stride_dst_ = {1, si, dst2, dst3};
     dcsi.offset_src_ = host2device ? cpu_offset : 0;
     dcsi.offset_dst_ = 0;
