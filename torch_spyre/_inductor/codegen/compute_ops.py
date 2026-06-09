@@ -144,49 +144,34 @@ def gen_coord_info_value(
         else {
             "spatial": 3,
             "temporal": 0,
-            "elemArr": (4 if is_2d_stick else 3),
+            "elemArr": 3,
             "padding": "nopad",
-            "folds": (
-                {
-                    "dim_prop_func": [
-                        {"Affine": {"alpha_": size, "beta_": 0}},
-                        {"Affine": {"alpha_": 0, "beta_": 0}},
-                        {"Affine": {"alpha_": 0, "beta_": 0}},
-                        {"Affine": {"alpha_": other_stick_size, "beta_": 0}},
-                        {"Affine": {"alpha_": 64, "beta_": 0}},
-                        {"Affine": {"alpha_": 8, "beta_": 0}},
-                        {"Affine": {"alpha_": 1, "beta_": 0}},
-                    ],
-                    "dim_prop_attr": [
-                        {"factor_": nsplits, "label_": "core_fold"},
-                        {"factor_": 1, "label_": "corelet_fold"},
-                        {"factor_": 1, "label_": "row_fold"},
-                        {"factor_": 1, "label_": "elem_arr_3"},
-                        {"factor_": 1, "label_": "elem_arr_2"},
-                        {"factor_": 8, "label_": "elem_arr_1"},
-                        {"factor_": 8, "label_": "elem_arr_0"},
-                    ],
-                }
-                if is_2d_stick
-                else {
-                    "dim_prop_func": [
-                        {"Affine": {"alpha_": size, "beta_": 0}},
-                        {"Affine": {"alpha_": 0, "beta_": 0}},
-                        {"Affine": {"alpha_": 0, "beta_": 0}},
-                        {"Affine": {"alpha_": 64, "beta_": 0}},
-                        {"Affine": {"alpha_": 8, "beta_": 0}},
-                        {"Affine": {"alpha_": 1, "beta_": 0}},
-                    ],
-                    "dim_prop_attr": [
-                        {"factor_": nsplits, "label_": "core_fold"},
-                        {"factor_": 1, "label_": "corelet_fold"},
-                        {"factor_": 1, "label_": "row_fold"},
-                        {"factor_": 1, "label_": "elem_arr_2"},
-                        {"factor_": 8, "label_": "elem_arr_1"},
-                        {"factor_": 8, "label_": "elem_arr_0"},
-                    ],
-                }
-            ),
+            "folds": {
+                "dim_prop_func": [
+                    {"Affine": {"alpha_": size, "beta_": 0}},
+                    {"Affine": {"alpha_": 0, "beta_": 0}},
+                    {"Affine": {"alpha_": 0, "beta_": 0}},
+                    {
+                        "Affine": {
+                            "alpha_": size,
+                            "beta_": 0,
+                        }
+                    },
+                    {"Affine": {"alpha_": 8, "beta_": 0}},
+                    {"Affine": {"alpha_": 1, "beta_": 0}},
+                ],
+                "dim_prop_attr": [
+                    {"factor_": nsplits, "label_": "core_fold"},
+                    {"factor_": 1, "label_": "corelet_fold"},
+                    {"factor_": 1, "label_": "row_fold"},
+                    {
+                        "factor_": 1,
+                        "label_": "elem_arr_2",
+                    },
+                    {"factor_": 8, "label_": "elem_arr_1"},
+                    {"factor_": 8, "label_": "elem_arr_0"},
+                ],
+            },
         }
         if is_fp8_stick
         else {
