@@ -439,18 +439,20 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
     const int64_t dim3 = K * N / eps / dim2;
 
     const std::vector<int64_t> expanded_dev_shape = {si, so, dim2, dim3};
-    dci.dcsi_ = {DataConversionStrideInfo{
-        .stride_src_ = {1, K_sm, si, dim2 * eps},
-        .stride_dst_ = {1, si, si * so, dim2 * eps},
-        .size_ = expanded_dev_shape,
-        .offset_src_ = host2device ? cpu_offset : 0,
-        .offset_dst_ = 0,
-    }};
+    const int64_t dst2 = si * so;     // = eps = 128
+    const int64_t dst3 = dim2 * eps;  // = dim2 * si * so
+
+    DataConversionStrideInfo dcsi;
+    dcsi.size_ = {si, so, dim2, dim3};
+    dcsi.stride_src_ = {1, K_sm, si, dst3};
+    dcsi.stride_dst_ = {1, si, dst2, dst3};
+    dcsi.offset_src_ = host2device ? cpu_offset : 0;
+    dcsi.offset_dst_ = 0;
+    dci.dcsi_ = {dcsi};
     dci.output_shape_ = host2device ? expanded_dev_shape : cpu_shape;
 
     // output_dimwise_ea_: one entry per host dimension (outermost-first).
     // cumOffset_[1] for N entry = dim2 * eps (= stride_dst[3])
-    const int64_t dst2 = si * so;  // = eps = 128
     const int64_t cum_offset_n = dim2 * eps;
 
     // K dimension (outermost host dim):
