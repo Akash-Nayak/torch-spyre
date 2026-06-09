@@ -153,7 +153,7 @@ def gen_coord_info_value(
                     {"Affine": {"alpha_": 0, "beta_": 0}},
                     {
                         "Affine": {
-                            "alpha_": 64,
+                            "alpha_": (other_stick_size if is_2d_stick else 64),
                             "beta_": 0,
                         }
                     },
@@ -165,7 +165,7 @@ def gen_coord_info_value(
                     {"factor_": 1, "label_": "corelet_fold"},
                     {"factor_": 1, "label_": "row_fold"},
                     {
-                        "factor_": 1,
+                        "factor_": (other_stick_size if is_2d_stick else (size // 64)),
                         "label_": "elem_arr_2",
                     },
                     {"factor_": 8, "label_": "elem_arr_1"},
@@ -263,7 +263,9 @@ def _gen_coord_for_dim(tensor, dim, sdsc_spec):
 
         iter_space = sdsc_spec.iteration_space[dim]
         base_size = (
-            iter_space // sdsc_spec.work_slices[dim] if (tensor.scales[dim] == 1) else 1
+            iter_space // sdsc_spec.work_slices[dim]
+            if (tensor.scales[dim] == 1)
+            else 1
         )
 
         # For is_fp8_stick dimensions, SIZE is divided by inner_stick
