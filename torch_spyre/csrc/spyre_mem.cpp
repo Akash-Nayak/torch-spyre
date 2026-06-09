@@ -432,11 +432,19 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
     const int64_t eps = stl.elems_per_stick();
     const int64_t si = 2;
     const int64_t so = eps / si;
-    const int64_t K = stl.device_size[0] * eps;
-    const int64_t N = stl.device_size[1];
-    const int64_t K_sm = stl.stride_map[1];
-    const int64_t dim2 = K_sm / si;
-    const int64_t dim3 = K * N / eps / dim2;
+    const int64_t K = cpu_shape[0];
+    const int64_t N = cpu_shape[1];
+
+    // Host strides in elements: (N, 1) for row-major 2D tensor
+    const int64_t K_stride_host = N;  // stride for K dimension in elements
+    const int64_t N_stride_host = 1;  // stride for N dimension in elements
+
+    const int64_t K_dev = stl.device_size[0];
+    const int64_t N_dev = stl.device_size[1];
+
+    // Expanded device shape: [si, so, K_dev, N_dev]
+    const int64_t dim2 = K_dev;
+    const int64_t dim3 = N_dev;
 
     const std::vector<int64_t> expanded_dev_shape = {si, so, dim2, dim3};
     const int64_t dst2 = si * so;     // = eps = 128
@@ -444,7 +452,8 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
 
     DataConversionStrideInfo dcsi;
     dcsi.size_ = {si, so, dim2, dim3};
-    dcsi.stride_src_ = {1, K_sm, si, dst3};
+    // stride_src: host strides in expanded layout (innermost-first)
+    dcsi.stride_src_ = {N_stride_host, si * K_dev, si, dst3};
     dcsi.stride_dst_ = {1, si, dst2, dst3};
     dcsi.offset_src_ = host2device ? cpu_offset : 0;
     dcsi.offset_dst_ = 0;
@@ -452,12 +461,9 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
     dci.output_shape_ = host2device ? expanded_dev_shape : cpu_shape;
 
     // output_dimwise_ea_: one entry per host dimension (outermost-first).
-    // cumOffset_[1] for N entry = dim2 * eps (= stride_dst[3])
     const int64_t cum_offset_n = dim2 * eps;
 
     // K dimension (outermost host dim):
-    //   dimShape_=K, subElems_=[K], subStride_=[1],
-    //   cumElemsBefore_=[1, si], cumOffset_=[1, dst2]
     perdim_element_arrangement ea_K;
     ea_K.dimShape_ = K;
     ea_K.subElems_ = {K};
@@ -466,8 +472,6 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
     ea_K.cumOffset_ = {1, dst2};
 
     // N dimension (innermost host dim):
-    //   dimShape_=N, subElems_=[so, si, N/eps], subStride_=[si, 1, dst2],
-    //   cumElemsBefore_=[1, so], cumOffset_=[si, cum_offset_n]
     perdim_element_arrangement ea_N;
     ea_N.dimShape_ = N;
     ea_N.subElems_ = {so, si, N / eps};
