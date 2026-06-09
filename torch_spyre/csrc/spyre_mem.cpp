@@ -435,10 +435,9 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
     const int64_t K = cpu_shape[0];
     const int64_t N = cpu_shape[1];
 
-    // Use stride_map[1] which contains the host stride for the middle device
-    // dimension This is the K stride in 2D stick coordinates
-    const int64_t K_sm =
-        stl.stride_map.size() > 1 ? stl.stride_map[1] : (K * si);
+    // K stride in 2D stick coordinates = device_size[0] * si
+    // device_size[0] represents the K dimension tiling blocks
+    const int64_t K_sm = stl.device_size[0] * si;
 
     const int64_t dim2 = K_sm / si;
     const int64_t dim3 = K * N / eps / dim2;
