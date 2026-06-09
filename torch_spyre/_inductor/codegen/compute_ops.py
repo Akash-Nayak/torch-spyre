@@ -84,34 +84,7 @@ def gen_coord_info_value(
     is_stick_dim: bool,
     is_stick_reduction: bool = False,
     is_fp8_stick: bool = False,
-    is_qfp8wt_stick: bool = False,
-    outer_stick: int = 0,
-    inner_stick: int = 0,
 ):
-    if is_qfp8wt_stick:
-        return {
-            "spatial": 3,
-            "temporal": 0,
-            "elemArr": 2,
-            "padding": "nopad",
-            "folds": {
-                "dim_prop_func": [
-                    {"Affine": {"alpha_": size, "beta_": 0}},
-                    {"Affine": {"alpha_": 0, "beta_": 0}},
-                    {"Affine": {"alpha_": 0, "beta_": 0}},
-                    {"Affine": {"alpha_": inner_stick, "beta_": 0}},
-                    {"Affine": {"alpha_": outer_stick, "beta_": 0}},
-                ],
-                "dim_prop_attr": [
-                    {"factor_": nsplits, "label_": "core_fold"},
-                    {"factor_": 1, "label_": "corelet_fold"},
-                    {"factor_": 1, "label_": "row_fold"},
-                    {"factor_": inner_stick, "label_": "elem_arr_1"},
-                    {"factor_": outer_stick, "label_": "elem_arr_0"},
-                ],
-            },
-        }
-
     return (
         {
             "spatial": 3,
@@ -259,10 +232,8 @@ def gen_coord_info_value(
 
 
 def _gen_coord_for_dim(tensor, dim, sdsc_spec):
-    """Generate coordinate info for a single dimension, handling QFP8WT specially."""
+    """Generate coordinate info for a single dimension."""
     is_stick_dim = dim in sdsc_spec.layouts[tensor.layout]["stick_dim_order"]
-    stick_sizes = sdsc_spec.layouts[tensor.layout]["stick_size"]
-    is_qfp8wt = len(stick_sizes) > 1
 
     size = (
         tensor.coord_size_overrides[dim]
@@ -292,29 +263,14 @@ def _gen_coord_for_dim(tensor, dim, sdsc_spec):
     )
     is_stick_reduction = tensor.scales[dim] == -2
 
-    if is_qfp8wt and is_stick_dim:
-        outer_stick = stick_sizes[0]
-        inner_stick = stick_sizes[1] if len(stick_sizes) > 1 else 64
-        return gen_coord_info_value(
-            size=size,
-            nsplits=nsplits,
-            elems_per_stick=elems_per_stick,
-            is_stick_dim=is_stick_dim,
-            is_stick_reduction=is_stick_reduction,
-            is_fp8_stick=False,
-            is_qfp8wt_stick=True,
-            outer_stick=outer_stick,
-            inner_stick=inner_stick,
-        )
-    else:
-        return gen_coord_info_value(
-            size=size,
-            nsplits=nsplits,
-            elems_per_stick=elems_per_stick,
-            is_stick_dim=is_stick_dim,
-            is_stick_reduction=is_stick_reduction,
-            is_fp8_stick=is_fp8_stick,
-        )
+    return gen_coord_info_value(
+        size=size,
+        nsplits=nsplits,
+        elems_per_stick=elems_per_stick,
+        is_stick_dim=is_stick_dim,
+        is_stick_reduction=is_stick_reduction,
+        is_fp8_stick=is_fp8_stick,
+    )
 
 
 def _tiled_byte_stride(tensor, tiled_sym, iteration_space) -> int:
