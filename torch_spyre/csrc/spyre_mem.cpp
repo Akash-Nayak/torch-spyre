@@ -435,16 +435,13 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
     const int64_t K = cpu_shape[0];
     const int64_t N = cpu_shape[1];
 
-    // Host strides in elements: (N, 1) for row-major 2D tensor
-    const int64_t K_stride_host = N;  // stride for K dimension in elements
-    const int64_t N_stride_host = 1;  // stride for N dimension in elements
+    // Use stride_map[1] which contains the host stride for the middle device
+    // dimension This is the K stride in 2D stick coordinates
+    const int64_t K_sm =
+        stl.stride_map.size() > 1 ? stl.stride_map[1] : (K * si);
 
-    const int64_t K_dev = stl.device_size[0];
-    const int64_t N_dev = stl.device_size[1];
-
-    // Expanded device shape: [si, so, K_dev, N_dev]
-    const int64_t dim2 = K_dev;
-    const int64_t dim3 = N_dev;
+    const int64_t dim2 = K_sm / si;
+    const int64_t dim3 = K * N / eps / dim2;
 
     const std::vector<int64_t> expanded_dev_shape = {si, so, dim2, dim3};
     const int64_t dst2 = si * so;     // = eps = 128
@@ -452,8 +449,7 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
 
     DataConversionStrideInfo dcsi;
     dcsi.size_ = {si, so, dim2, dim3};
-    // stride_src: host strides in expanded layout (innermost-first)
-    dcsi.stride_src_ = {N_stride_host, si * K_dev, si, dst3};
+    dcsi.stride_src_ = {1, K_sm, si, dst3};
     dcsi.stride_dst_ = {1, si, dst2, dst3};
     dcsi.offset_src_ = host2device ? cpu_offset : 0;
     dcsi.offset_dst_ = 0;
