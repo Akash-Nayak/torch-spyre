@@ -251,19 +251,29 @@ def _gen_coord_for_dim(tensor, dim, sdsc_spec):
     stick_size_list = sdsc_spec.layouts[tensor.layout]["stick_size"]
     has_2d_stick = len(stick_size_list) > 1
 
-    # For QFP8WT (2D stick), still use full iteration_space for SIZE
-    # but track the 2D stick structure for fold factor computation
+    # For QFP8WT (2D stick), SIZE computation depends on whether this is an is_fp8_stick dim
     if has_2d_stick and is_stick_dim:
         stick_idx = sdsc_spec.layouts[tensor.layout]["stick_dim_order"].index(dim)
         outer_stick = stick_size_list[0]
         inner_stick = stick_size_list[1]
 
-        # SIZE is still the full iteration space (not divided)
-        size = (
-            sdsc_spec.iteration_space[dim] // sdsc_spec.work_slices[dim]
+        # Check if this is an is_fp8_stick dimension (stick_size >= 64)
+        this_stick_size = stick_size_list[stick_idx]
+        is_this_fp8_stick = this_stick_size >= 64
+
+        iter_space = sdsc_spec.iteration_space[dim]
+        base_size = (
+            iter_space // sdsc_spec.work_slices[dim]
             if (tensor.scales[dim] == 1)
             else 1
         )
+
+        # For is_fp8_stick dimensions, SIZE is divided by inner_stick
+        # For regular stick dimensions, SIZE remains full iteration_space
+        if is_this_fp8_stick:
+            size = base_size // inner_stick
+        else:
+            size = base_size
 
         other_stick_idx = 1 - stick_idx
         other_stick_size = stick_size_list[other_stick_idx]
