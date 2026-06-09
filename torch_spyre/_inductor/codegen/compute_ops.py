@@ -13,7 +13,7 @@
 # limitations under the License.
 
 
-from torch_spyre._C import encode_constant, DataFormats
+from torch_spyre._C import encode_constant, DataFormats, ElementArrangement
 from sympy import Symbol
 
 
@@ -251,30 +251,52 @@ def _gen_coord_for_dim(tensor, dim, sdsc_spec):
     stick_size_list = sdsc_spec.layouts[tensor.layout]["stick_size"]
     has_2d_stick = len(stick_size_list) > 1
 
-    size = (
-        tensor.coord_size_overrides[dim]
-        if dim in tensor.coord_size_overrides
-        else (
-            sdsc_spec.iteration_space[dim] // sdsc_spec.work_slices[dim]
-            if (tensor.scales[dim] == 1)
-            else 1
+    # For QFP8WT, SIZE is based on expanded device dimensions
+    if (
+        has_2d_stick
+        and tensor.element_arrangement == ElementArrangement.QFP8WT
+        and is_stick_dim
+    ):
+        stick_idx = sdsc_spec.layouts[tensor.layout]["stick_dim_order"].index(dim)
+        # device_size [1, K, N] expands to [K/outer_stick, N/inner_stick] for that dimension
+        outer_stick = stick_size_list[0]
+        inner_stick = stick_size_list[1]
+
+        # Compute expanded dimensions
+        K_expanded = (
+            tensor.device_size[1] // outer_stick if len(tensor.device_size) > 1 else 1
         )
-    )
+        N_expanded = (
+            tensor.device_size[2] // inner_stick if len(tensor.device_size) > 2 else 1
+        )
+
+        # SIZE is based on which stick dimension this is
+        if stick_idx == 0:
+            size = K_expanded
+        else:
+            size = N_expanded
+
+        other_stick_idx = 1 - stick_idx
+        other_stick_size = stick_size_list[other_stick_idx]
+    else:
+        size = (
+            tensor.coord_size_overrides[dim]
+            if dim in tensor.coord_size_overrides
+            else (
+                sdsc_spec.iteration_space[dim] // sdsc_spec.work_slices[dim]
+                if (tensor.scales[dim] == 1)
+                else 1
+            )
+        )
+        other_stick_size = 1
 
     nsplits = sdsc_spec.work_slices[dim] if (tensor.scales[dim] == 1) else 1
 
     if is_stick_dim:
         stick_idx = sdsc_spec.layouts[tensor.layout]["stick_dim_order"].index(dim)
         elems_per_stick = stick_size_list[stick_idx]
-
-        # For QFP8WT with 2D sticks, pass info about both stick dimensions
-        other_stick_idx = 1 - stick_idx if has_2d_stick else None
-        other_stick_size = (
-            stick_size_list[other_stick_idx] if other_stick_idx is not None else 1
-        )
     else:
         elems_per_stick = tensor.data_format.elems_per_stick()
-        other_stick_size = 1
 
     is_fp8_stick = (
         is_stick_dim
