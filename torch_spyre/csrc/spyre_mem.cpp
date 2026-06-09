@@ -435,12 +435,13 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
     const int64_t K = cpu_shape[0];
     const int64_t N = cpu_shape[1];
 
+    // Expanded device shape: [si, so, K/si, N/so]
+    const int64_t dim2 = K / si;
+    const int64_t dim3 = N / so;
+
     // K stride in 2D stick coordinates from stride_map
     // stride_map[0] = host elements per device_size[0] step = K elements
     const int64_t K_sm = stl.stride_map[0] * si;
-
-    const int64_t dim2 = K_sm / si;
-    const int64_t dim3 = K * N / eps / dim2;
 
     const std::vector<int64_t> expanded_dev_shape = {si, so, dim2, dim3};
     const int64_t dst2 = si * so;     // = eps = 128
