@@ -13,7 +13,7 @@
 # limitations under the License.
 
 
-from torch_spyre._C import encode_constant, DataFormats, ElementArrangement
+from torch_spyre._C import encode_constant, DataFormats
 from sympy import Symbol
 
 
@@ -251,30 +251,21 @@ def _gen_coord_for_dim(tensor, dim, sdsc_spec):
     stick_size_list = sdsc_spec.layouts[tensor.layout]["stick_size"]
     has_2d_stick = len(stick_size_list) > 1
 
-    # For QFP8WT, SIZE is based on expanded device dimensions
-    if (
-        has_2d_stick
-        and tensor.element_arrangement == ElementArrangement.QFP8WT
-        and is_stick_dim
-    ):
+    # For QFP8WT (2D stick), SIZE is based on expanded device dimensions
+    if has_2d_stick and is_stick_dim:
         stick_idx = sdsc_spec.layouts[tensor.layout]["stick_dim_order"].index(dim)
-        # device_size [1, K, N] expands to [K/outer_stick, N/inner_stick] for that dimension
+        # For 2D stick, SIZE = iteration_space[dim] / stick_size[stick_idx]
         outer_stick = stick_size_list[0]
         inner_stick = stick_size_list[1]
 
-        # Compute expanded dimensions
-        K_expanded = (
-            tensor.device_size[1] // outer_stick if len(tensor.device_size) > 1 else 1
-        )
-        N_expanded = (
-            tensor.device_size[2] // inner_stick if len(tensor.device_size) > 2 else 1
-        )
+        # Get iteration space size for this dimension
+        iter_space_size = sdsc_spec.iteration_space[dim]
 
-        # SIZE is based on which stick dimension this is
+        # SIZE is iteration_space divided by the corresponding stick size
         if stick_idx == 0:
-            size = K_expanded
+            size = iter_space_size // outer_stick
         else:
-            size = N_expanded
+            size = iter_space_size // inner_stick
 
         other_stick_idx = 1 - stick_idx
         other_stick_size = stick_size_list[other_stick_idx]
