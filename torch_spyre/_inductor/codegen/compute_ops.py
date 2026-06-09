@@ -84,6 +84,8 @@ def gen_coord_info_value(
     is_stick_dim: bool,
     is_stick_reduction: bool = False,
     is_fp8_stick: bool = False,
+    is_2d_stick: bool = False,
+    other_stick_size: int = 1,
 ):
     return (
         {
@@ -149,7 +151,12 @@ def gen_coord_info_value(
                     {"Affine": {"alpha_": size, "beta_": 0}},
                     {"Affine": {"alpha_": 0, "beta_": 0}},
                     {"Affine": {"alpha_": 0, "beta_": 0}},
-                    {"Affine": {"alpha_": 64, "beta_": 0}},
+                    {
+                        "Affine": {
+                            "alpha_": (other_stick_size if is_2d_stick else 64),
+                            "beta_": 0,
+                        }
+                    },
                     {"Affine": {"alpha_": 8, "beta_": 0}},
                     {"Affine": {"alpha_": 1, "beta_": 0}},
                 ],
@@ -157,7 +164,10 @@ def gen_coord_info_value(
                     {"factor_": nsplits, "label_": "core_fold"},
                     {"factor_": 1, "label_": "corelet_fold"},
                     {"factor_": 1, "label_": "row_fold"},
-                    {"factor_": size // 64, "label_": "elem_arr_2"},
+                    {
+                        "factor_": (other_stick_size if is_2d_stick else (size // 64)),
+                        "label_": "elem_arr_2",
+                    },
                     {"factor_": 8, "label_": "elem_arr_1"},
                     {"factor_": 8, "label_": "elem_arr_0"},
                 ],
@@ -232,8 +242,14 @@ def gen_coord_info_value(
 
 
 def _gen_coord_for_dim(tensor, dim, sdsc_spec):
-    """Generate coordinate info for a single dimension."""
+    """Generate coordinate info for a single dimension.
+
+    For QFP8WT tensors, SIZE is computed from the expanded device layout
+    to properly reflect the multi-dimensional stick structure.
+    """
     is_stick_dim = dim in sdsc_spec.layouts[tensor.layout]["stick_dim_order"]
+    stick_size_list = sdsc_spec.layouts[tensor.layout]["stick_size"]
+    has_2d_stick = len(stick_size_list) > 1
 
     size = (
         tensor.coord_size_overrides[dim]
@@ -244,19 +260,26 @@ def _gen_coord_for_dim(tensor, dim, sdsc_spec):
             else 1
         )
     )
+
     nsplits = sdsc_spec.work_slices[dim] if (tensor.scales[dim] == 1) else 1
 
     if is_stick_dim:
-        stick_size_list = sdsc_spec.layouts[tensor.layout]["stick_size"]
         stick_idx = sdsc_spec.layouts[tensor.layout]["stick_dim_order"].index(dim)
         elems_per_stick = stick_size_list[stick_idx]
+
+        # For QFP8WT with 2D sticks, pass info about both stick dimensions
+        other_stick_idx = 1 - stick_idx if has_2d_stick else None
+        other_stick_size = (
+            stick_size_list[other_stick_idx] if other_stick_idx is not None else 1
+        )
     else:
         elems_per_stick = tensor.data_format.elems_per_stick()
+        other_stick_size = 1
 
     is_fp8_stick = (
         is_stick_dim
         and tensor.data_format == DataFormats.SEN143_FP8
-        and sdsc_spec.layouts[tensor.layout]["stick_size"][
+        and stick_size_list[
             sdsc_spec.layouts[tensor.layout]["stick_dim_order"].index(dim)
         ]
         >= 64
@@ -270,6 +293,8 @@ def _gen_coord_for_dim(tensor, dim, sdsc_spec):
         is_stick_dim=is_stick_dim,
         is_stick_reduction=is_stick_reduction,
         is_fp8_stick=is_fp8_stick,
+        is_2d_stick=has_2d_stick,
+        other_stick_size=other_stick_size if is_stick_dim else 1,
     )
 
 
