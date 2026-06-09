@@ -440,13 +440,40 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
 
     const std::vector<int64_t> expanded_dev_shape = {si, so, dim2, dim3};
     dci.dcsi_ = {DataConversionStrideInfo{
-        .size_ = expanded_dev_shape,
         .stride_src_ = {1, K_sm, si, dim2 * eps},
         .stride_dst_ = {1, si, si * so, dim2 * eps},
+        .size_ = expanded_dev_shape,
         .offset_src_ = host2device ? cpu_offset : 0,
         .offset_dst_ = 0,
     }};
     dci.output_shape_ = host2device ? expanded_dev_shape : cpu_shape;
+
+    // output_dimwise_ea_: one entry per host dimension (outermost-first).
+    // cumOffset_[1] for N entry = dim2 * eps (= stride_dst[3])
+    const int64_t dst2 = si * so;  // = eps = 128
+    const int64_t cum_offset_n = dim2 * eps;
+
+    // K dimension (outermost host dim):
+    //   dimShape_=K, subElems_=[K], subStride_=[1],
+    //   cumElemsBefore_=[1, si], cumOffset_=[1, dst2]
+    perdim_element_arrangement ea_K;
+    ea_K.dimShape_ = K;
+    ea_K.subElems_ = {K};
+    ea_K.subStride_ = {1};
+    ea_K.cumElemsBefore_ = {1, si};
+    ea_K.cumOffset_ = {1, dst2};
+
+    // N dimension (innermost host dim):
+    //   dimShape_=N, subElems_=[so, si, N/eps], subStride_=[si, 1, dst2],
+    //   cumElemsBefore_=[1, so], cumOffset_=[si, cum_offset_n]
+    perdim_element_arrangement ea_N;
+    ea_N.dimShape_ = N;
+    ea_N.subElems_ = {so, si, N / eps};
+    ea_N.subStride_ = {si, 1, dst2};
+    ea_N.cumElemsBefore_ = {1, so};
+    ea_N.cumOffset_ = {si, cum_offset_n};
+
+    dci.output_dimwise_ea_ = {ea_K, ea_N};
   } else {
     dci.dcsi_ = get_device_stride_infos(t_sizes, t_dev_strides, cpu_offset, stl,
                                         host2device, t_cpu_strides);
