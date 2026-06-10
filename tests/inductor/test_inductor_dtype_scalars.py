@@ -404,11 +404,15 @@ class TestDatatypeScalarOperations:
         # Test that compilation succeeds without TypeError
         # (the bug we're fixing would cause: TypeError: cannot determine truth value of Relational)
         result = _run_spyre(execution_mode, convert_fp16_to_fp32, x)
-        
+
         # Verify basic properties (shape, dtype, device)
         assert result.shape == x.shape, f"Shape mismatch: {result.shape} != {x.shape}"
-        assert result.dtype == torch.float32, f"Dtype mismatch: {result.dtype} != torch.float32"
-        assert result.device.type == "spyre", f"Device mismatch: {result.device.type} != spyre"
+        assert result.dtype == torch.float32, (
+            f"Dtype mismatch: {result.dtype} != torch.float32"
+        )
+        assert result.device.type == "spyre", (
+            f"Device mismatch: {result.device.type} != spyre"
+        )
 
 
 @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
