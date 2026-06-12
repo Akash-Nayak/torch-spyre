@@ -153,7 +153,7 @@ def gen_coord_info_value(
                     {"Affine": {"alpha_": 0, "beta_": 0}},
                     {
                         "Affine": {
-                            "alpha_": (other_stick_size if is_2d_stick else 64),
+                            "alpha_": (elems_per_stick if is_2d_stick else 64),
                             "beta_": 0,
                         }
                     },
@@ -165,7 +165,7 @@ def gen_coord_info_value(
                     {"factor_": 1, "label_": "corelet_fold"},
                     {"factor_": 1, "label_": "row_fold"},
                     {
-                        "factor_": (other_stick_size if is_2d_stick else (size // 64)),
+                        "factor_": (elems_per_stick // 8 if (is_2d_stick and is_fp8_stick) else (other_stick_size if is_2d_stick else (size // 64))),
                         "label_": "elem_arr_2",
                     },
                     {"factor_": 8, "label_": "elem_arr_1"},
@@ -294,17 +294,16 @@ def _gen_coord_for_dim(tensor, dim, sdsc_spec):
     if is_stick_dim:
         stick_idx = sdsc_spec.layouts[tensor.layout]["stick_dim_order"].index(dim)
         elems_per_stick = stick_size_list[stick_idx]
+        # Check if THIS specific stick dimension is FP8 (size >= 64)
+        # This works for both 1D and 2D sticks
+        is_fp8_stick = (
+            tensor.data_format == DataFormats.SEN143_FP8
+            and stick_size_list[stick_idx] >= 64
+        )
     else:
         elems_per_stick = tensor.data_format.elems_per_stick()
-
-    is_fp8_stick = (
-        is_stick_dim
-        and tensor.data_format == DataFormats.SEN143_FP8
-        and stick_size_list[
-            sdsc_spec.layouts[tensor.layout]["stick_dim_order"].index(dim)
-        ]
-        >= 64
-    )
+        is_fp8_stick = False
+    
     is_stick_reduction = tensor.scales[dim] == -2
 
     return gen_coord_info_value(
