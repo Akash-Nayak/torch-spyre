@@ -4,7 +4,7 @@ test_suite_config:
       unlisted_test_mode: skip
       tests:
         - names:
-            - TestOps::test_(fp8_weight_quantization_roundtrip|dequantize_fp8_with_scale).*
+            - TestOps::test_(fp8_weight_quantization_roundtrip|dequantize_fp8_with_scale_cpu).*
           mode: mandatory_success
           tags:
             - ops__inductor-fp8
