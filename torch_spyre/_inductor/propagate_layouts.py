@@ -35,6 +35,7 @@ from torch._inductor.ir import (
     TensorBox,
 )
 from torch._inductor.dependencies import MemoryDep
+from torch._inductor.graph import GraphLowering
 from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.virtualized import V
 
@@ -165,7 +166,7 @@ def _single_arg_op_layout(
 
             in_elems_per_stick = get_elem_in_stick(in_layout.dtype)
             stick_dim_size = in_layout.size[-1]
-            unaligned = stick_dim_size % in_elems_per_stick
+            unaligned = concretize_expr(stick_dim_size % in_elems_per_stick)
 
             if unaligned > 0:
                 outer_sizes = [concretize_expr(s) for s in output.size[:-1]]
@@ -790,11 +791,12 @@ def _resolve_copy_back_candidates(operations: list[Operation]) -> None:
 
 
 def propagate_spyre_tensor_layouts(
-    operations: list[Operation],
+    graph: GraphLowering,
 ) -> None:
+    operations = graph.operations
     # Convert InputBuffers from FixedLayout to SpyreTensorLayouts
-    if len(V.graph.graph_input_names) > 0:
-        for name, real_input in zip(V.graph.graph_input_names, V.get_real_inputs()):
+    if len(graph.graph_input_names) > 0:
+        for name, real_input in zip(graph.graph_input_names, V.get_real_inputs()):
             if isinstance(real_input, torch.Tensor):
                 stl = real_input.device_tensor_layout()
                 if stl is None:
@@ -803,7 +805,7 @@ def propagate_spyre_tensor_layouts(
                     raise Unsupported(
                         f"missing device_tensor_layout on graph input {name}"
                     )
-                tb = V.graph.graph_inputs[name]
+                tb = graph.graph_inputs[name]
                 if (
                     not isinstance(tb, TensorBox)
                     or not isinstance(tb.data, StorageBox)
