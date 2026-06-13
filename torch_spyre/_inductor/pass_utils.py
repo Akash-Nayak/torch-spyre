@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import math
+import warnings
 from dataclasses import dataclass
 from typing import Callable, NamedTuple, Optional, TypeVar, Union
 
@@ -35,6 +36,7 @@ from torch._inductor.virtualized import V
 from torch_spyre._C import SpyreTensorLayout, get_elem_in_stick
 from torch_spyre._inductor.errors import Unsupported
 
+from . import config
 from .codegen.superdsc import (
     _get_core_to_slice_mapping,
     _k_fast_core_to_slice_mapping,
@@ -42,7 +44,13 @@ from .codegen.superdsc import (
 )
 from .constants import BATCH_MATMUL_OP, ELIDED_COPY_BACK_ATTR
 from .ir import FixedTiledLayout, SpyreConstantFallback
+from .logging_utils import get_inductor_logger
+from .loop_info import copy_op_metadata
 from .views import compute_coordinates, matching_dim
+
+# PyTorch's default lower bound for size symbols (sizes 0/1 are specialised).
+_SHAPE_ENV_DEFAULT_LOWER = 2
+logger = get_inductor_logger("pass_utils")
 
 
 class SchedNodeArg(NamedTuple):
@@ -92,6 +100,125 @@ def concretize_expr(expr: Union[Expr, int]) -> int:
     return int(expr)
 
 
+def _user_min_or_none(expr: Expr) -> Optional[int]:
+    """Return the user-supplied ``mark_dynamic(min=...)``, or ``None``.
+
+    PyTorch initialises the lower bound for size symbols to 2 (sizes 0
+    and 1 are specialised), so a recorded lower bound of 2 is
+    indistinguishable from "user did not pass min". We treat
+    ``lower == 2`` as "no min provided".
+
+    Known limitation: a user who legitimately passes
+    ``mark_dynamic(min=2, max=...)`` will be silently treated as if
+    they had not passed min at all. The call site in
+    ``compute_granularity`` will then take the default-divisor branch
+    (and emit the "defaulting granularity to ..." warning) instead of
+    honouring the user value. There is no way to disambiguate the two
+    cases from the ShapeEnv alone -- resolving this needs PyTorch to
+    expose the user-provided min separately from the bound. See #2284
+    for the design discussion.
+    """
+    vr = V.graph.sizevars.shape_env.bound_sympy(expr)
+    if not isinstance(vr.lower, sympy.Integer):
+        return None
+    lower = int(vr.lower)
+    # min=2 collides with PyTorch's default lower bound and is treated
+    # as "unset" here
+    return None if lower == _SHAPE_ENV_DEFAULT_LOWER else lower
+
+
+def _finite_upper_or_none(expr: Expr) -> Optional[int]:
+    """Return the ShapeEnv finite upper bound for ``expr``, or ``None``.
+    A bound is usable iff it is a positive concrete
+    ``sympy.Integer``; ``sympy.oo``, non-integers, and non-positive
+    values all return ``None``.
+    """
+    vr = V.graph.sizevars.shape_env.bound_sympy(expr)
+    if isinstance(vr.upper, sympy.Integer) and vr.upper.is_finite and int(vr.upper) > 0:
+        return int(vr.upper)
+    return None
+
+
+def compute_granularity(expr: Expr, max_size: int) -> int:
+    """Return the granularity for a symbolic dimension.
+
+    Admissible runtime values are ``{G, 2G, ..., max_size}``. If the
+    user passed ``mark_dynamic(min=...)`` we honour it after validation;
+    otherwise we pick the smallest divisor of ``max_size`` that
+    satisfies ``config.max_buckets`` and ``config.min_default_granularity``.
+
+    Callers must only invoke this for symbolic ``expr``. See #2284,
+    #2287, #2288, #2289 for the full design.
+
+    Wiring: this helper has no call sites yet. The pointwise
+    work-division PR (#2499) will plug it into the ``size_hint`` call
+    sites in ``work_division.py`` and ``codegen/superdsc.py``,
+    alongside ``compute_max_size``.
+
+    Deferred: when the symbolic dim is the stick dim of its tensor the
+    granularity also needs to be a multiple of ``elems_per_stick(dtype)``.
+    Handled in a follow-up once the stick-dim symbolic path is enabled.
+    """
+    assert hasattr(expr, "free_symbols") and expr.free_symbols, (
+        f"compute_granularity called on non-symbolic expr={expr!r}"
+    )
+
+    max_buckets = config.max_buckets
+    min_default_g = config.min_default_granularity
+
+    # When ShapeEnv has no finite upper bound, max_size came from
+    # size_hint (via compute_max_size below, merged in #2003), not from
+    # mark_dynamic(max=...). The granularity is then only as trustworthy
+    # as that hint -- warn the user so they can pin it explicitly with
+    # mark_dynamic(max=...).
+    if _finite_upper_or_none(expr) is None:
+        warnings.warn(
+            f"max for symbolic dim {expr} came from size_hint, not from "
+            f"mark_dynamic(max=...). Proceeding with max={max_size} as a "
+            f"best-effort estimate. Set max explicitly via mark_dynamic to "
+            f"lock the bucket structure.",
+            stacklevel=2,
+        )
+
+    user_min = _user_min_or_none(expr)
+    if user_min is not None:
+        if max_size % user_min != 0:
+            raise Unsupported(
+                f"mark_dynamic(min={user_min}) must divide max={max_size}; "
+                f"got {max_size} % {user_min} = {max_size % user_min}"
+            )
+        if max_size // user_min > max_buckets:
+            raise Unsupported(
+                f"mark_dynamic(min={user_min}) produces {max_size // user_min} "
+                f"buckets, exceeds max_buckets={max_buckets}. Increase min "
+                f"to reduce the bucket count, or raise config.max_buckets."
+            )
+        return user_min
+
+    # No user min: pick the smallest divisor d of max_size where
+    # d >= min_default_g and max_size / d <= max_buckets.
+    for divisor in sorted(sympy.divisors(max_size)):
+        if divisor < min_default_g:
+            continue
+        if max_size // divisor <= max_buckets:
+            warnings.warn(
+                f"mark_dynamic(min=...) not provided for symbolic dim "
+                f"{expr}; defaulting granularity to {divisor} "
+                f"(max={max_size}, {max_size // divisor} buckets). "
+                f"Set min explicitly to override.",
+                stacklevel=2,
+            )
+            return divisor
+
+    # Unreachable for sane inputs: max_size is always a divisor of
+    # itself and gives 1 bucket, so the loop above always finds a hit.
+    # Kept as a defensive raise.
+    raise Unsupported(
+        f"No valid granularity for max={max_size} under "
+        f"max_buckets={max_buckets}, min_default_granularity={min_default_g}"
+    )
+
+
 def concretize_index(index: sympy.Expr, loop_vars: set) -> sympy.Expr:
     """Replace non-loop symbolic variables in an index expression with concrete values.
 
@@ -121,6 +248,30 @@ def concretize_index(index: sympy.Expr, loop_vars: set) -> sympy.Expr:
     return result
 
 
+def compute_max_size(expr: Union[Expr, int]) -> int:
+    """Return the maximum value a symbolic size expression can take.
+
+    Uses the ShapeEnv upper bound when one is recorded (i.e. the symbol was
+    created with an explicit ``max=`` constraint using mark_dynamic API). Falls
+    back to ``size_hint`` when no finite upper bound exists.
+
+    Needed for dynamic shape support.
+
+    # TODO: To be used in size_hint call-sites in superdsc.py and work_division.py
+    #       to get the maxSize in SDSC and work planning respectively
+    """
+    if isinstance(expr, int):
+        return expr
+    if isinstance(expr, sympy.Integer):
+        return int(expr)
+    if not (hasattr(expr, "free_symbols") and expr.free_symbols):
+        return int(expr)
+    bound = _finite_upper_or_none(expr)
+    if bound is not None:
+        return bound
+    return V.graph.sizevars.size_hint(expr)
+
+
 def get_mem_deps_from_rw(read_writes: ReadWrites) -> list[SchedNodeArg]:
     res: list[SchedNodeArg] = []
     for arg in read_writes.reads:
@@ -128,6 +279,12 @@ def get_mem_deps_from_rw(read_writes: ReadWrites) -> list[SchedNodeArg]:
             buf = V.graph.get_buffer(arg.name)
             res.append(SchedNodeArg(arg, _fixed_read_layout(buf)))
     return res
+
+
+def op_out_coords(op: ComputedBuffer) -> list[sympy.Expr]:
+    """Return host coordinates for the output dep of a ComputedBuffer."""
+    output_dep = next(iter(op.get_read_writes().writes))
+    return host_coordinates(op.get_layout(), output_dep)
 
 
 def host_coordinates(layout: FixedLayout, dep: MemoryDep) -> list[sympy.Expr]:
@@ -142,8 +299,14 @@ def host_coordinates(layout: FixedLayout, dep: MemoryDep) -> list[sympy.Expr]:
     return compute_coordinates(concrete_size, concrete_stride, dep.ranges, index)
 
 
-def _check_stick_expr_supported(stick_expr: sympy.Expr, elems_per_stick: int) -> None:
-    """Raise Unsupported for stick expressions may be valid but are not yet supported."""
+def is_stick_expr_offset_free(stick_expr: sympy.Expr, elems_per_stick: int) -> bool:
+    """Check if a stick expression is free of constant offsets.
+
+    Returns True for stick expressions with no additive offset:
+    - Mod(var, elems_per_stick) where var is a single symbol
+    - A bare variable (symbol)
+    - Zero
+    """
     is_supported_mod = (
         isinstance(stick_expr, sympy.Mod)
         and len(stick_expr.args[0].free_symbols) == 1
@@ -151,10 +314,28 @@ def _check_stick_expr_supported(stick_expr: sympy.Expr, elems_per_stick: int) ->
     )
     is_bare_var = stick_expr.is_symbol
     is_zero = stick_expr == sympy.S.Zero
-    if not (is_supported_mod or is_bare_var or is_zero):
+    return is_supported_mod or is_bare_var or is_zero
+
+
+def _is_stick_expr_with_offset(stick_expr: sympy.Expr, elems_per_stick: int) -> bool:
+    """Return True if stick_expr is an offset variant: Mod(var, N) + c or var + c."""
+    if not isinstance(stick_expr, sympy.Add):
+        return False
+    free_args = [a for a in stick_expr.args if a.free_symbols]
+    return len(free_args) == 1 and is_stick_expr_offset_free(
+        free_args[0], elems_per_stick
+    )
+
+
+def _check_stick_expr_supported(stick_expr: sympy.Expr, elems_per_stick: int) -> None:
+    """Raise Unsupported for stick expressions may be valid but are not yet supported."""
+    offset_free = is_stick_expr_offset_free(stick_expr, elems_per_stick)
+    has_offset = _is_stick_expr_with_offset(stick_expr, elems_per_stick)
+    if not (offset_free or has_offset):
         raise Unsupported(
             f"Unexpected stick expression {stick_expr!r}: expected "
-            f"Mod(var, {elems_per_stick}), a bare variable, or 0"
+            f"Mod(var, {elems_per_stick}), a bare variable, 0, or any of those "
+            f"with a constant offset"
         )
 
 
@@ -438,10 +619,24 @@ def compute_restickify_needed(
     out_idc = device_coordinates(out_stl, out_dep)
     assert idc, "device_coordinates returned empty list for input"
     assert out_idc, "device_coordinates returned empty list for output"
-    if stick_compatible([idc, out_idc]):
+    # Input stick with an offset always needs restickify to remove the offset.
+    in_stick_offset_free = is_stick_expr_offset_free(idc[-1], in_stl.elems_per_stick())
+    if in_stick_offset_free and stick_compatible([idc, out_idc]):
         return False, None
     ic = host_coordinates(in_host, in_dep)
-    return True, compute_restickify_target_layout(in_stl, in_host, out_idc[-1], ic, idc)
+    target_stick = out_idc[-1]
+
+    if target_stick == sympy.S.Zero and not in_stick_offset_free:
+        # No output dim carries the input's stick var, so compute_restickify_target_layout
+        # would fail to match. Promote the reduction var to the stick dimension so the
+        # restickify removes the offset.
+        reduction_vars = in_dep.index.free_symbols - out_dep.index.free_symbols
+        if reduction_vars:
+            red_var = next(iter(reduction_vars))
+            target_stick = sympy.Mod(red_var, in_stl.elems_per_stick())
+    return True, compute_restickify_target_layout(
+        in_stl, in_host, target_stick, ic, idc
+    )
 
 
 def copy_fx_custom_meta(src: "torch.fx.Node", dst: "torch.fx.Node") -> None:
@@ -452,25 +647,6 @@ def copy_fx_custom_meta(src: "torch.fx.Node", dst: "torch.fx.Node") -> None:
     """
     if "custom" in src.meta:
         dst.meta["custom"] = src.meta["custom"]
-
-
-_SPYRE_METADATA_ATTRS = (
-    "dim_hints",
-    "loop_group_id",
-    "loop_count",
-    "loop_tiled_dims",
-)
-
-
-def copy_op_metadata(src: ComputedBuffer, dst: ComputedBuffer) -> None:
-    """Copy all Spyre pass metadata from src to dst.
-
-    Call this whenever a pass reconstructs a ComputedBuffer to ensure
-    dim_hints and coarse-tiling attrs are not silently dropped.
-    """
-    for attr in _SPYRE_METADATA_ATTRS:
-        if hasattr(src, attr):
-            setattr(dst, attr, getattr(src, attr))
 
 
 def replace_computed_buffer_body(
@@ -798,8 +974,9 @@ def _per_core_view_on_buf(
     # writes / reads, not necessarily buf_name) bridge stride-keyed
     # coeff_splits back to scheduler symbols.
     rw = op.get_read_writes()
+    empty_view = (PerCoreView(work_slice_dims=(), core_to_slot=()), False)
     if not any(n > 1 for d in coeff_splits for n in d.values()):
-        result = (PerCoreView(work_slice_dims=(), core_to_slot=()), False)
+        result = empty_view
         if cache is not None:
             cache[key] = result
         return result
@@ -820,45 +997,98 @@ def _per_core_view_on_buf(
     has_partial_reduction = any(n > 1 for n in coeff_splits[1].values())
     splits_by_stride: dict[int, tuple[int, "sympy.Symbol"]] = {}
     for sym, split in per_sym.items():
-        host_stride = int(dep.index.coeff(sym))
+        host_stride = concretize_expr(dep.index.coeff(sym))
         if split <= 1 or host_stride == 0:
             continue
         splits_by_stride[host_stride] = (int(split), sym)
 
-    buf_layout = V.graph.get_buffer(buf_name).layout.device_layout
-    device_size = buf_layout.device_size
-    stride_map = buf_layout.stride_map
-    elems_per_stick = buf_layout.device_dtype.elems_per_stick()
+    buf_layout = V.graph.get_buffer(buf_name).layout
+    if not isinstance(buf_layout, FixedTiledLayout):
+        return empty_view
+    dev_layout = buf_layout.device_layout
+    device_size = dev_layout.device_size
+    stride_map = dev_layout.stride_map
+    elems_per_stick = dev_layout.device_dtype.elems_per_stick()
 
-    # Step 3: place each split on a device dim via stride lookup. h=1
-    # maps to elems_per_stick when present (sticks are atomic, so a
-    # host-stride-1 split lands on the outer-stick dim, not on stick
-    # contents); otherwise it falls back to a literal stride-1 dim, as
-    # in sticked [N, 1] layouts where the mb axis itself has stride 1.
-    # Skip stride_map entries < 0 — those are sentinels for collapsed
-    # or broadcast dims and can't host a split.
+    # Step 3: place each split on a device dim via stride lookup.
+    #
+    # stride_map[i] is a device-dim → host-stride mapping. The stickified
+    # host dim decomposes into two device dims (per dim_map_to_stride_map in C++):
+    #   - within-stick dim: always at position n-1, with
+    #     stride_map[-1] = host_stride[stick_dim] and dev_size = elems_per_stick.
+    #   - outer-stick (num_stick) dim: stride = stride_map[-1] * elems_per_stick,
+    #     dev_size = ceil(host_size[stick_dim] / elems_per_stick).
+    # A split whose host stride h equals stick_host_stride lands on the
+    # stickified host dim; sticks are atomic, so it must use the outer-stick
+    # dim. Skip stride_map entries <= 0 — sentinels for collapsed or
+    # broadcast dims.
     #
     # Example: host [64, 128] sticked to device [2, 64, 64] with
-    # stride_map=[64, 128, 1] and elems_per_stick=64. With M-split×4
-    # (h=128) and N-split×2 (h=1), N's h=1 → outer-stick dim 0;
-    # M's h=128 → dim 1. Result: work_slice_dims={0: 2, 1: 4}.
-    device_stride_to_dim = {s: i for i, s in enumerate(stride_map) if s > 0}
+    # stride_map=[64, 128, 1] and elems_per_stick=64. stick_host_stride=1,
+    # num_stick_dim=dim 0 (stride 64). With M-split×4 (h=128) and N-split×2
+    # (h=1), N's h matches stick_host_stride → outer-stick dim 0; M's h=128
+    # → dim 1. Result: work_slice_dims={0: 2, 1: 4}.
+    device_stride_to_dim: dict[int, int] = {}
+    for i, s in enumerate(stride_map):
+        if s <= 0:
+            continue
+        prev = device_stride_to_dim.get(s)
+        if prev is None or device_size[i] != 1:
+            device_stride_to_dim[s] = i
+
+    stick_host_stride, num_stick_dim, num_stick, num_stick_stride = None, None, 0, 0
+    if stride_map[-1] > 0:
+        stick_host_stride = stride_map[-1]
+        num_stick_dim = device_stride_to_dim.get(stick_host_stride * elems_per_stick)
+        if num_stick_dim is not None:
+            num_stick = device_size[num_stick_dim]
+            num_stick_stride = stride_map[num_stick_dim]
 
     work_slice_dims: dict[int, int] = {}
     sym_to_device_dim: dict["sympy.Symbol", int] = {}
     for h, (split, sym) in sorted(splits_by_stride.items()):
-        if h == 1 and elems_per_stick in device_stride_to_dim:
-            dev_dim = device_stride_to_dim.get(elems_per_stick)
-        else:
-            dev_dim = device_stride_to_dim.get(h)
-        assert (
-            dev_dim is not None
-            and dev_dim not in work_slice_dims
-            and device_size[dev_dim] % split == 0
-        ), (
-            f"could not place split h={h} factor={split} on "
-            f"stride_map={stride_map} device_size={device_size}"
-        )
+        dev_dim = device_stride_to_dim.get(h)
+        if h == stick_host_stride:
+            dev_dim = num_stick_dim
+        # Multi-stick-stride rescue: a consumer view subdivides the stickified
+        # axis at k sticks per step (h = k * num_stick_stride). Only safe when
+        # split*k fully covers num_stick_dim — partial coverage would
+        # misreport the per-dim factor. Example (test_view_unsqueeze_add):
+        # device_size=[2, 6, 1, 64], num_stick_dim=1 (stride 64); split=3,
+        # h=128, k=2, split*k=6 == device_size[1] → place on dim 1, factor 6.
+        if dev_dim is None and num_stick_stride > 0 and h % num_stick_stride == 0:
+            k = h // num_stick_stride
+            if split * k == num_stick:
+                dev_dim = num_stick_dim
+                split *= k
+        # TODO: two known unhandled failure modes fall through to the
+        # empty_view fallback (cases catalogued in
+        # per_core_view_failing_cases.md):
+        #   (A) Collapsed-axis info loss — device_layout built from a
+        #       higher-rank host tensor while dep is indexed via a lower-rank
+        #       reshape view; the work-split factor spans multiple device
+        #       dims but reaches us as a single (h, factor) (e.g.
+        #       test_matmul_tiled_y, test_qkv_attn_paths_fms_*_gqa).
+        #   (B) Multi-stick stride with partial coverage —
+        #       h = k * stride_map[num_stick_dim], k > 1, but
+        #       split * k < num_stick (rescue above only
+        #       handles the full-coverage case where they are equal).
+        # In both cases no single (dev_dim, factor) placement faithfully
+        # represents the per-core slicing; empty_view keeps the buffer on
+        # HBM via the caller's mismatch logic. Future work: extend the
+        # PerCoreView schema to express multi-dim or strided splits, or
+        # refuse the buffer earlier in scratchpad planning.
+        if (
+            dev_dim is None
+            or dev_dim in work_slice_dims
+            or device_size[dev_dim] % split != 0
+        ):
+            logger.debug(
+                f"could not place split h={h} factor={split} on "
+                f"stride_map={stride_map} device_size={device_size}; "
+                f"returning empty_view"
+            )
+            return empty_view
         work_slice_dims[dev_dim] = split
         sym_to_device_dim[sym] = dev_dim
 
