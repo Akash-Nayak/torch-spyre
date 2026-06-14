@@ -51,15 +51,6 @@ _lowerings_nesting = 0
 spyre_lowerings: dict[Union[Callable[..., Any], str], Callable[..., Any]] = {}
 
 
-def _current_fx_custom_meta() -> dict[str, Any]:
-    node = V.get_current_node()
-    meta = getattr(node, "meta", None)
-    if not isinstance(meta, dict):
-        return {}
-    custom = meta.get("custom")
-    return custom if isinstance(custom, dict) else {}
-
-
 def register_spyre_lowering(
     op,
     name=None,
@@ -264,16 +255,6 @@ def lower_scaled_mm(
     out_dtype=None,
     use_fast_accum=False,
 ):
-    if scale_a is not None:
-        raise Unsupported("scale_a parameter in _scaled_mm is not yet supported")
-    if scale_b is not None:
-        raise Unsupported("scale_b parameter in _scaled_mm is not yet supported")
-    if bias is not None:
-        raise Unsupported("bias parameter in _scaled_mm is not yet supported")
-    if scale_result is not None:
-        raise Unsupported("scale_result parameter in _scaled_mm is not yet supported")
-    if use_fast_accum:
-        raise Unsupported("use_fast_accum parameter in _scaled_mm is not yet supported")
 
     mat1.realize()
     mat2.realize()
@@ -340,6 +321,11 @@ def lower_scaled_mm(
     )
 
     result.realize()
+
+    if bias is not None:
+        logger.warning("bias parameter in _scaled_mm is not yet supported")
+    if scale_result is not None:
+        logger.warning("scale_result parameter in _scaled_mm is not yet supported")
 
     if logger.isEnabledFor(logging.DEBUG):
         result_buf = V.graph.get_buffer(result.get_name())
@@ -459,18 +445,12 @@ def lower_bmm(x, y):
     else:
         raise Unsupported(f"BMM with input shapes {x.get_size()} and {y.get_size()}")
 
-    custom_meta = _current_fx_custom_meta()
-    op_info = {}
-    if SHARED_WEIGHT_UNIT_BMM_CUSTOM_META_KEY in custom_meta:
-        op_info[SHARED_WEIGHT_UNIT_BMM_INFO_KEY] = custom_meta[
-            SHARED_WEIGHT_UNIT_BMM_CUSTOM_META_KEY
-        ]
 
     if reduction_numel == 1:
         # Reduction degenerates to a pointwise mul
         result = lowering.mul(x, y)
     else:
-        reduction_kwargs = dict(
+        result = Reduction.create(
             reduction_type=BATCH_MATMUL_OP,
             input_node=[x, y],
             device=x.get_device(),
@@ -480,10 +460,6 @@ def lower_bmm(x, y):
             ranges=ranges,
             reduction_ranges=[reduction_numel],
         )
-        if op_info:
-            result = SpyreReduction.create(op_info=op_info, **reduction_kwargs)
-        else:
-            result = Reduction.create(**reduction_kwargs)
 
     result.realize()
 
@@ -1094,17 +1070,7 @@ def with_int64_fallback(fn, *args, convert_output=True):
     torch.ops.aten.add.Tensor,
     type_promotion_kind=None,
 )
-def lower_add(x, y, *, alpha=1):
-    if alpha != 1:
-        alpha_tensor = lower_full(
-            y.get_size(),
-            float(alpha),
-            dtype=y.get_dtype(),
-            device=y.get_device(),
-        )
-        alpha_tensor.realize()
-        y = with_int64_fallback(lowering.mul, y, alpha_tensor)
-        y.realize()
+def lower_add(x, y):
     return with_int64_fallback(lowering.add, x, y)
 
 
@@ -1120,17 +1086,7 @@ def lower_mul(x, y):
     torch.ops.aten.sub.Tensor,
     type_promotion_kind=None,
 )
-def lower_sub(x, y, *, alpha=1):
-    if alpha != 1:
-        alpha_tensor = lower_full(
-            y.get_size(),
-            float(alpha),
-            dtype=y.get_dtype(),
-            device=y.get_device(),
-        )
-        alpha_tensor.realize()
-        y = with_int64_fallback(lowering.mul, y, alpha_tensor)
-        y.realize()
+def lower_sub(x, y):
     return with_int64_fallback(lowering.sub, x, y)
 
 

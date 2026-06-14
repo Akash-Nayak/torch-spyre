@@ -35,6 +35,7 @@ from torch._inductor.graph import GraphLowering
 
 from .errors import Unsupported
 from .constants import BATCH_MATMUL_OP, TOPK_OPS
+from torch_spyre._C import ElementArrangement
 from .ir import FixedTiledLayout
 from .pass_utils import (
     SchedNodeArg,
@@ -198,6 +199,21 @@ def adjust_it_space_for_sticks(
         if stick_var not in adjusted_space:
             continue
         elems_per_stick = td.layout.device_layout.elems_per_stick()
+        if td.layout.device_layout.element_arrangement == ElementArrangement.QFP8WT:
+            # QFP8WT has a 2D stick [2, 64] = 128 elements total. Both the outer
+            # stick variable (device_coords[-2]) and the inner stick variable
+            # (device_coords[-1]) must be treated as 128-element atomic units so
+            # neither dimension is split below one full 2D stick per core.
+            outer_stick_expr = td.device_coords[-2]
+            outer_syms = outer_stick_expr.free_symbols
+            if len(outer_syms) == 1:
+                outer_var = next(iter(outer_syms))
+                if outer_var in adjusted_space:
+                    if (
+                        outer_var not in max_elems
+                        or elems_per_stick > max_elems[outer_var]
+                    ):
+                        max_elems[outer_var] = elems_per_stick
         if stick_var not in max_elems or elems_per_stick > max_elems[stick_var]:
             max_elems[stick_var] = elems_per_stick
 
@@ -862,11 +878,11 @@ def _cost_model_matmul_planner(
     # Classify the output coord dims: the stickified one is N, the rest index
     # rows. Of those row dims, M is the one appearing in a single input (the
     # LHS); batch dims appear in both.
-    output_coord_vars = {
-        v for e in output_td.device_coords[:-1] for v in e.free_symbols
-    }
-    n_dims = [d for d in output_coord_vars if d in stick_vars]
-    row_dims = [d for d in output_coord_vars if d not in stick_vars]
+    # N (the stick dim) lives in device_coords[-1]; row dims live in [:-1].
+    row_coord_vars = {v for e in output_td.device_coords[:-1] for v in e.free_symbols}
+    stick_coord_vars = {v for v in output_td.device_coords[-1].free_symbols}
+    n_dims = [d for d in stick_coord_vars if d in stick_vars]
+    row_dims = [d for d in row_coord_vars if d not in stick_vars]
     if len(n_dims) != 1 or not row_dims:
         return splits
     n_dim = n_dims[0]
@@ -886,11 +902,12 @@ def _cost_model_matmul_planner(
     # term over-counting the shared weight); tracked as a follow-up.
     if len(m_candidates) != 1:
         return splits
-    m_dim = m_candidates[0]
+    m_dim = m_candidates[0] if m_candidates else None
     batch_dims = [d for d in row_dims if d is not m_dim]
 
     # K is the lone reduction dim (anything else this planner does not model).
-    reduction = [d for d in it_space_adjusted if d not in output_coord_vars]
+    all_output_vars = row_coord_vars | stick_coord_vars
+    reduction = [d for d in it_space_adjusted if d not in all_output_vars]
     if len(reduction) != 1:
         return splits
     k_dim = reduction[0]
@@ -898,7 +915,7 @@ def _cost_model_matmul_planner(
     # The iteration space measures N and K in sticks; the cost model wants real
     # elements so its byte and MAC counts are physical.
     elems_per_stick = output_td.layout.device_layout.device_dtype.elems_per_stick()
-    M_e = concretize_expr(it_space_adjusted[m_dim])
+    M_e = concretize_expr(it_space_adjusted[m_dim]) if m_dim is not None else 1
     n_sticks = concretize_expr(it_space_adjusted[n_dim])
     k_sticks = concretize_expr(it_space_adjusted[k_dim])
     N_e = n_sticks * elems_per_stick
@@ -939,7 +956,8 @@ def _cost_model_matmul_planner(
     new_splits = dict(splits)
     for bd, bs in zip(batch_dims, b_combo):
         new_splits[bd] = int(bs)
-    new_splits[m_dim] = m_s
+    if m_dim is not None:
+        new_splits[m_dim] = m_s
     new_splits[n_dim] = n_s
     new_splits[k_dim] = k_s
 

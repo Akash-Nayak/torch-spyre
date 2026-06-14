@@ -19,7 +19,7 @@ from collections import Counter
 from sympy import Integer, Symbol, Expr, Mod, floor
 
 from torch._inductor.virtualized import V
-from torch_spyre._C import DataFormats
+from torch_spyre._C import DataFormats, ElementArrangement
 from torch_spyre._inductor.constants import (
     IDENTITY_OP,
     INPUT_DIM_LABELS,
@@ -35,7 +35,7 @@ from torch_spyre._inductor.op_spec import OpSpec
 from torch_spyre._inductor.op_spec import TensorArg
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
 
-from .compute_ops import SymbolKind, generate_sdsc
+from .compute_ops import generate_sdsc
 
 logger = get_inductor_logger("codegen.superdsc")
 
@@ -52,7 +52,7 @@ class SDSCArgs:
     allocation: dict[str, Any]
     start_address: int | Symbol
     backGap: dict[Symbol, int]
-    arg_index: int = -1
+    coord_size_overrides: dict[Symbol, int] = dataclasses.field(default_factory=dict)
 
     def __str__(self) -> str:
         scales = ", ".join(f"{k}={v}" for k, v in self.scales.items())
@@ -214,6 +214,29 @@ def _calculate_device_stride(dev_dim_idx: int, device_size: list) -> int:
     return math.prod(device_size[-dev_dim_idx - 2 :])
 
 
+def _qfp8wt_expanded_device_size(device_size: list) -> list:
+    """Return the 4D device size for a QFP8WT tensor by making the 2D stick explicit.
+    QFP8WT device_size is 3D: [outer_stick, non_stick_dims..., inner_stick].
+    The outer stick dim (size 2) is at index 0 and the inner stick (size 64) is
+    at index -1. Expanding to 4D inserts the outer stick adjacent to the inner:
+    [non_stick_dims..., outer_stick, inner_stick].
+    This matches the DCI order (reversed): [inner_stick, outer_stick, non_stick...].
+    """
+    outer_stick = device_size[0]
+    non_stick = device_size[1:-1]
+    inner_stick = device_size[-1]
+    return non_stick + [outer_stick, inner_stick]
+
+
+def _qfp8wt_stick_stride(device_size: list) -> int:
+    """Return the stride for the inner stick iteration variable of a QFP8WT tensor.
+    In the expanded 4D layout [non_stick..., outer_stick, inner_stick], the inner
+    stick sits at DCI position 0 (last in device_size). Its stride in DCI terms is
+    the product of all DCI dims before it, which is just outer_stick = device_size[0].
+    """
+    return device_size[0]
+
+
 def _get_device_dim_order(
     arg: TensorArg, symbol_mapping: dict
 ) -> tuple[list[Symbol], Symbol | None]:
@@ -236,8 +259,8 @@ def _get_device_dim_order(
 def _get_layout_label(
     layouts: dict,
     dim_order: list,
-    stick_dim_order: Symbol | None,
-    stick_size: int,
+    stick_dim_order: list,
+    stick_size: list,
     layout_labels: list[str],
 ) -> str:
     for label, layout in layouts.items():
@@ -272,14 +295,18 @@ def _get_padded_iteration_space(
     padding: dict = {}
     for sdsc_arg, op_spec_arg, dim_order in zip(sdsc_args, op_spec_args, dim_order):
         layout = layouts[sdsc_arg.layout]
-        stick_dim = layout["stick_dim_order"]
+        stick_dim_order = layout["stick_dim_order"]
+        stick_size = layout["stick_size"]
         dev_size = op_spec_arg.device_size[-2::-1]
         for idx, dim in enumerate(dim_order):
-            if idx >= len(dev_size) or dim != stick_dim:
+            if idx >= len(dev_size) or dim not in stick_dim_order:
                 continue
-            unaligned = sdsc_iteration_space[dim] % layout["stick_size"]
+            effective_stick_size = (
+                stick_size[0] if len(stick_size) == 1 else stick_size[0] * stick_size[1]
+            )
+            unaligned = sdsc_iteration_space[dim] % effective_stick_size
             if unaligned > 0:
-                padding[dim] = layout["stick_size"] - unaligned
+                padding[dim] = effective_stick_size - unaligned
                 sdsc_iteration_space[dim] += padding[dim]
     return padding
 
@@ -323,7 +350,7 @@ def _create_sdsc_tensors(
     iteration_space: dict,
     op_dim_order: list[Symbol],
     op_stick_dim: Symbol | None,
-    mb_sym: Symbol | None = None,
+    work_slices: dict | None = None,
 ) -> tuple[list[SDSCArgs], dict, Symbol | None]:
     dims = list(iteration_space.keys())
     layouts: dict = {}
@@ -338,11 +365,10 @@ def _create_sdsc_tensors(
         offsets: dict = {}
         backGap: dict[Symbol, int] = {}
         max_dim_sizes: dict = {}
+        coord_size_overrides: dict = {}
         reduced_dims: list = []
         if use_op_dims and dim_order != dims and not _is_topk(op_spec.op):
-            reduced_dims = [
-                d for d in op_dim_order if d not in dim_order and d is not mb_sym
-            ]
+            reduced_dims = [d for d in op_dim_order if d not in dim_order]
             dim_order = dim_order + reduced_dims
 
         if op_stick_dim is None:
@@ -354,22 +380,42 @@ def _create_sdsc_tensors(
         stride_dim_order = [
             d for d in dim_order if d not in reduced_dims
         ] + reduced_dims
+        is_fp8_quant = op_spec.op in ("qfp8ch")
+        is_2d_stick_kernel = arg.element_arrangement == ElementArrangement.QFP8WT
         for dim in dim_order:
             stride_idx = stride_dim_order.index(dim)
             if dim in reduced_dims and op_spec.op != "layernormscale":
-                scales[dim] = -2 if (stick_dim is None and dim is op_stick_dim) else -1
+                # For a 2D-stick kernel the outer stick dim (in/K) is a
+                # reduction for the output but the KERNEL itself iterates
+                # over all of K spatially — treat it as scale=1.
+                scales[dim] = (
+                    1
+                    if (is_2d_stick_kernel and dim is not stick_dim)
+                    else (-2 if (stick_dim is None and dim is op_stick_dim) else -1)
+                )
             elif dim in reduced_dims and op_spec.op == "layernormscale":
                 scales[dim] = -2 if (dim is stick_dim) else -1
             else:
                 scales[dim] = 1
-            strides[dim] = _calculate_device_stride(stride_idx, arg.device_size)
+            if dim == stick_dim and is_2d_stick_kernel:
+                strides[dim] = _qfp8wt_stick_stride(arg.device_size)
+            else:
+                strides[dim] = _calculate_device_stride(stride_idx, arg.device_size)
             offsets[dim] = 0
             dim_device_stride = math.prod(arg.device_size[-stride_idx - 1 :])
 
             dev_dim_size = arg.device_size[-stride_idx - 2]
             it_dim_size = iteration_space[dim]
+            # LX buffers are per-core: compare against the per-core slice size.
+            is_lx = "lx" in arg.allocation
+            if is_lx and work_slices and dim in work_slices and work_slices[dim] > 1:
+                it_dim_size = it_dim_size // work_slices[dim]
             if dim == stick_dim:
                 stick_size = arg.device_dtype.elems_per_stick()
+                # 2D-stick: device_size=[outer_stick, non_stick..., inner_stick];
+                # the iteration variable indexes the inner dim only (size = 64).
+                if is_2d_stick_kernel:
+                    stick_size = stick_size // 2
                 dev_dim_size *= stick_size
                 it_dim_size = ((it_dim_size - 1) // stick_size + 1) * stick_size
 
@@ -379,23 +425,25 @@ def _create_sdsc_tensors(
                 offsets[dim] = dim_offset * dim_device_stride
                 backGap[dim] = dev_dim_size - it_dim_size
                 strides[dim] = strides[dim] // dev_dim_size * it_dim_size
-
+            if is_fp8_quant and dim is not stick_dim and len(sdsc_args) == 0:
+                scales[dim] = -1
             max_dim_sizes[dim] = -1
 
-        if mb_sym is not None:
-            # Virtual dim with no physical device dimension; stride = full 1-D allocation size.
-            dim_order = [mb_sym] + dim_order
-            scales[mb_sym] = 1
-            strides[mb_sym] = _calculate_device_stride(0, arg.device_size)
-            offsets[mb_sym] = 0
-            max_dim_sizes[mb_sym] = -1
 
-        effective_stick = op_stick_dim if stick_dim is None else stick_dim
+        effective_stick = [op_stick_dim if stick_dim is None else stick_dim]
+
+        base_stick_size = arg.device_dtype.elems_per_stick()
+        if is_2d_stick_kernel:
+            outer_stick_dim = next(d for d in dim_order if d is not stick_dim)
+            effective_stick = [outer_stick_dim, stick_dim]
+            layout_stick_size = [2, base_stick_size // 2]
+        else:
+            layout_stick_size = [base_stick_size]
         label = _get_layout_label(
             layouts,
             dim_order,
             effective_stick,
-            arg.device_dtype.elems_per_stick(),
+            layout_stick_size,
             MATMUL_LAYOUT_LABELS if not use_op_dims else LAYOUT_LABELS,
         )
         # Change dataFormat_ value if needed.
@@ -409,7 +457,9 @@ def _create_sdsc_tensors(
                 data_format=arg_data_format,
                 scales=scales,
                 strides=strides,
-                offsets=offsets,
+                offsets=offsets
+                if "lx" not in arg.allocation
+                else {},  # TODO: handle lx offsets
                 max_dim_sizes=max_dim_sizes,
                 allocation=arg.allocation,
                 start_address=arg.allocation.get("pool")
@@ -417,8 +467,10 @@ def _create_sdsc_tensors(
                 else arg.allocation.get("lx")
                 if "lx" in arg.allocation
                 else arg.allocation.get("hbm"),
-                backGap=backGap,
-                arg_index=arg.arg_index,
+                backGap=backGap
+                if "lx" not in arg.allocation
+                else {},  # TODO: handle lx backgaps
+                coord_size_overrides=coord_size_overrides,
             )
         )
 
@@ -570,22 +622,6 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     ref_arg = _ref_arg(op_spec)
     op_dim_order, op_stick_dim = _get_device_dim_order(ref_arg, symbol_mapping)
 
-    # On-device type-conversion ops (DL16TOFP32/FP32TODL16, not identity)
-    # require at least one outer spatial dim beyond the stick; inject a
-    # virtual mb=1 row when the op's tensor has only the stick dim.
-    mb_sym: Symbol | None = None
-    if (
-        DtypeOpTable.is_dtype_op(op_spec.op)
-        and op_spec.op != IDENTITY_OP
-        and op_stick_dim is not None
-        and all(d is op_stick_dim for d in op_dim_order)
-    ):
-        mb_sym = Symbol(INPUT_DIM_LABELS[0])
-        sdsc_iteration_space = {mb_sym: 1, **sdsc_iteration_space}
-        dim_splits = {mb_sym: 1, **dim_splits}
-        work_slices = {mb_sym: 1, **work_slices}
-        op_dim_order = [mb_sym] + op_dim_order
-
     if op_stick_dim is None:
         stick_sym = Symbol(INPUT_DIM_LABELS[ndim])
         sdsc_iteration_space[stick_sym] = op_spec.args[0].device_dtype.elems_per_stick()
@@ -601,7 +637,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         sdsc_iteration_space,
         op_dim_order,
         op_stick_dim,
-        mb_sym,
+        work_slices=work_slices,
     )
     if missing_dim is not None:
         # A dimension was added to the iteration space, update splits and work slices
@@ -679,7 +715,7 @@ def compile_op_spec(
     symbols: list[int],
     symbol_id_offset: int = 0,
     use_symbols: bool = False,
-) -> tuple[Any, list[int], list[dict], list[SymbolKind]]:
+) -> tuple[Any, list[int], list[dict]]:
     sdsc_spec, symbol_mapping = parse_op_spec(op_spec)
     logger.debug("%s", sdsc_spec)
     # Translate tiled_symbols from OpSpec's inductor symbols to the renamed
