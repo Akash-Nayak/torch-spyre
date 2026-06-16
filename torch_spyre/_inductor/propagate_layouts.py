@@ -290,23 +290,43 @@ def _single_arg_op_layout(
 
         case spyreop.qfp8ch.default:
             # fp16 (64 elems/stick) -> fp8 (128 elems/stick) channel quantization.
-            in_elems_per_stick = get_elem_in_stick(in_layout.dtype)
-            stick_dim_size = in_layout.size[-1]
-            unaligned = stick_dim_size % in_elems_per_stick
-            outer_sizes = [concretize_expr(s) for s in output.size[:-1]]
-            outer_strides = [concretize_expr(s) for s in output.stride[:-1]]
-            last_dim = (
-                in_elems_per_stick
-                if unaligned > 0
-                else concretize_expr(output.size[-1])
-            )
-            c_size = outer_sizes + [last_dim]
-            c_stride = outer_strides + [1]
+            # in_elems_per_stick = get_elem_in_stick(in_layout.dtype)
+            # stick_dim_size = in_layout.size[-1]
+            # unaligned = stick_dim_size % in_elems_per_stick
+            # outer_sizes = [concretize_expr(s) for s in output.size[:-1]]
+            # outer_strides = [concretize_expr(s) for s in output.stride[:-1]]
+            # last_dim = (
+            #     in_elems_per_stick
+            #     if unaligned > 0
+            #     else concretize_expr(output.size[-1])
+            # )
+            # c_size = outer_sizes + [last_dim]
+            # c_stride = outer_strides + [1]
+            # return [SpyreTensorLayout(
+            #     c_size,
+            #     c_stride,
+            #     output.dtype,
+            #     list(range(len(c_size))),
+            #     ElementArrangement.QFP8CH,
+            # )]
+            in_eps = get_elem_in_stick(in_layout.dtype)
+            out_eps = get_elem_in_stick(output.dtype)
+            # Use output.size to get correct number of dimensions
+            out_device_size = [concretize_expr(s) for s in output.size]
+            out_stride_map = [concretize_expr(s) for s in output.stride]
+            # Adjust last dimension for stick size
+            out_device_size[-1] = out_eps
+            # Find and adjust the dimension that matches input stick size
+            for i, s in enumerate(out_stride_map):
+                if s == in_eps:
+                    out_device_size[i] = out_device_size[i] * in_eps // out_eps
+                    out_stride_map[i] = out_eps
+                    break
             return [SpyreTensorLayout(
-                c_size,
-                c_stride,
-                output.dtype,
-                list(range(len(c_size))),
+                out_device_size,
+                out_stride_map,
+                get_device_dtype(output.dtype),
+                list(range(len(out_device_size))),
                 ElementArrangement.QFP8CH,
             )]
 
