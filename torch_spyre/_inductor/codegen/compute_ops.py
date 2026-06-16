@@ -300,7 +300,7 @@ def _gen_coord_for_dim(tensor, dim, sdsc_spec):
     """
     is_stick_dim = dim in sdsc_spec.layouts[tensor.layout]["stick_dim_order"]
     stick_size_list = sdsc_spec.layouts[tensor.layout]["stick_size"]
-    has_2d_stick = False
+    has_2d_stick = len(stick_size_list) > 1
 
     # # For QFP8WT (2D stick), SIZE computation depends on whether this is an is_fp8_stick dim
     # if has_2d_stick and is_stick_dim:
@@ -341,8 +341,15 @@ def _gen_coord_for_dim(tensor, dim, sdsc_spec):
     if is_stick_dim:
         stick_idx = sdsc_spec.layouts[tensor.layout]["stick_dim_order"].index(dim)
         elems_per_stick = stick_size_list[stick_idx]
+        # For 2D sticks, compute other_stick_size from the other dimension
+        if has_2d_stick:
+            other_stick_idx = 1 - stick_idx
+            other_stick_size = stick_size_list[other_stick_idx]
+        else:
+            other_stick_size = 1
     else:
         elems_per_stick = tensor.data_format.elems_per_stick()
+        other_stick_size = 1
 
     is_fp8_stick = False
     is_stick_reduction = tensor.scales[dim] == -2
@@ -616,7 +623,7 @@ def generate_sdsc(
                                         str(dim)
                                         for dim in layout_info["stick_dim_order"]
                                     ],
-                                    "stickSize_": [layout_info["stick_size"]],
+                                    "stickSize_": layout_info["stick_size"] if isinstance(layout_info["stick_size"], list) else [layout_info["stick_size"]],
                                 }
                                 for label, layout_info in sdsc_spec.layouts.items()
                             },
