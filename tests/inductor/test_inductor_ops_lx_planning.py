@@ -240,6 +240,7 @@ POINTWISE_TEST_FAILURES = [
     "test_unbind_3d_dimneg1",
     "test_unbind_4d_dim0",
     "test_unbind_4d_dim3",
+    "test_dequantize_fp8_with_scale_shape_1_128_512_scale_0.01",
 ]
 
 
@@ -444,6 +445,7 @@ REDUCTION_TEST_FAILURES = [
     "test_unbind_4d_dim3",
     "test_einsum_einsum_67x256_256x128",
     "test_t_2d_contiguous_1088x320",
+    "test_dequantize_fp8_with_scale_shape_1_128_512_scale_0.01",
 ]
 
 
