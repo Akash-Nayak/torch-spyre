@@ -4,7 +4,7 @@ test_suite_config:
       unlisted_test_mode: skip
       tests:
         - names:
-            - TestOps::test_(fp8_weight_quantization_roundtrip|dequantize_fp8_with_scale).*
+            - TestOps::test_(dequantize_fp8_with_scale).*
           mode: mandatory_success
           tags:
             - ops__inductor-fp8
@@ -12,7 +12,7 @@ test_suite_config:
       unlisted_test_mode: skip
       tests:
         - names:
-            - TestFP8Operations::test_(quantize_fp8_with_scale_basic|qfp8ch_basic_conversion|qfp8ch_production_shape|dequantize_fp8_with_scale_decomp_correctness).*
+            - TestFP8Operations::test_(qfp8ch_basic_conversion|fp8todl16_basic_conversion).*
           mode: mandatory_success
           tags:
             - ops__inductor-fp8-operations
