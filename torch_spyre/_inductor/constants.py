@@ -89,6 +89,8 @@ SPYRE_FP32_OPS = [
 SPYRE_FP8_OPS = {
     "qfp8ch",  # Channel-wise FP8 quantization (output: FP8)
     "fp8todl16",  # FP8 to FP16 conversion (input: FP8)
+    "batchmatmulfp8",  # FP8 bmm (inputs: FP8)
+    "qfp8wt",  # FP8 quantization (output: FP8)
 }
 
 TOPK_OPS = {"topkvalue", "topkindex"}

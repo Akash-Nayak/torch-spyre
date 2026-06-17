@@ -336,8 +336,8 @@ def _make_sdsc_spec(
         layouts={
             "A": {
                 "dim_order": [s],
-                "stick_dim_order": s,
-                "stick_size": 64,
+                "stick_dim_order": [s],
+                "stick_size": [64],
             }
         },
         args=[tensor],

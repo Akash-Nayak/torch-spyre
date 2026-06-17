@@ -129,6 +129,8 @@ class ElementArrangement:
       QFP8CH
 
       EXX2
+
+      QFP8WT
     """
 
     DL16_TO_FP32: typing.ClassVar[
@@ -138,12 +140,15 @@ class ElementArrangement:
         ElementArrangement
     ]  # value = <ElementArrangement.QFP8CH: 2>
     EXX2: typing.ClassVar[ElementArrangement]  # value = <ElementArrangement.EXX2: 3>
+    QFP8WT: typing.ClassVar[
+        ElementArrangement
+    ]  # value = <ElementArrangement.QFP8WT: 4>
     STANDARD: typing.ClassVar[
         ElementArrangement
     ]  # value = <ElementArrangement.STANDARD: 0>
     __members__: typing.ClassVar[
         dict[str, ElementArrangement]
-    ]  # value = {'STANDARD': <ElementArrangement.STANDARD: 0>, 'DL16_TO_FP32': <ElementArrangement.DL16_TO_FP32: 1>, 'QFP8CH': <ElementArrangement.QFP8CH: 2>, 'EXX2': <ElementArrangement.EXX2: 3>}
+    ]  # value = {'STANDARD': <ElementArrangement.STANDARD: 0>, 'DL16_TO_FP32': <ElementArrangement.DL16_TO_FP32: 1>, 'QFP8CH': <ElementArrangement.QFP8CH: 2>, 'EXX2': <ElementArrangement.EXX2: 3>, 'QFP8WT': <ElementArrangement.QFP8WT: 4>}
     @property
     def name(self) -> str: ...
     @property
