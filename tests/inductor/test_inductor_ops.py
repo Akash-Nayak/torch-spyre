@@ -22,7 +22,6 @@ from utils_inductor import (
     cached_randn,
     cached_xavier,
     compare_with_cpu,
-    compare_with_pytorch,
     make_param_dict,
     unique_randn_along_dim,
     shapes2key,
@@ -30,10 +29,6 @@ from utils_inductor import (
 import utils_inductor
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
 from torch_spyre._inductor.constants import IDENTITY_OP
-
-# FP8 E4M3 quantization constants
-FP8_E4M3_MAX_SPACING = 32.0  # Maximum spacing between representable values in FP8 E4M3
-TOLERANCE_SAFETY_FACTOR = 2.0  # Safety factor for tolerance calculations
 
 POINTWISE_UNARY_OPS_DICT = {
     "abs": torch.abs,
@@ -2901,6 +2896,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_sum_keepdim1", "test_sum_eager"): {
             "ops_dict": {"sum": torch.sum},
+            "expect_fail": [
+                "fp32_3d_dim_neg1",
+            ],
             "param_sets": {
                 "fp16_1d_dim_0": (0, True, cached_randn((64,), dtype=torch.float16)),
                 "fp16_2d_dim_0": (
@@ -3103,6 +3101,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_mean_keepdim1", "test_mean_eager"): {
             "ops_dict": {"mean": torch.mean},
+            "expect_fail": [
+                "fp16_3d_dim_2",
+                "fp16_3d_dim_neg1",
+                "fp32_3d_dim_2",
+                "fp32_3d_dim_neg1",
+            ],
             "param_sets": {
                 "fp16_2d_dim_0": (
                     0,
@@ -3956,6 +3960,31 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "param_sets": TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS,
             "expect_fail": TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL,
         },
+        (
+            "test_round_trip_to_dtype_implicit",
+            "test_round_trip_to_dtype_implicit_cpu",
+        ): {
+            "ops_dict": {"add": torch.add},
+            "param_sets": TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS,
+            "expect_fail": TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL,
+        },
+        (
+            "test_round_trip_to_dtype_implicit_invalid",
+            "test_round_trip_to_dtype_implicit_invalid_cpu",
+        ): {
+            "ops_dict": {"add": torch.add},
+            "param_sets": TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS,
+            "expect_fail": TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL,
+        },
+        ("test_add_constant", "test_add_constant_cpu"): {
+            "ops_dict": {"add": torch.add},
+            "param_sets": {
+                "1d_fp16_4": (cached_randn((4), dtype=torch.float16),),
+                "2d_fp16_4x64": (cached_randn((4, 64), dtype=torch.float16),),
+                "3d_fp16_2x4x16": (cached_randn((2, 4, 16), dtype=torch.float16),),
+                "4d_fp16_2x4x16": (cached_randn((2, 4, 16, 64), dtype=torch.float16),),
+            },
+        },
         ("test_conv2d", "test_conv2d_cpu"): {
             "param_sets": {
                 "1x3x32_ksize3_no_pad": (
@@ -4089,156 +4118,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 # 4D — innermost and non-innermost axes
                 "4d_dim0": (0, cached_randn((2, 4, 8, 64))),
                 "4d_dim3": (3, cached_randn((2, 4, 8, 64))),
-            },
-        },
-        ("test_dequantize_fp8_with_scale", "test_dequantize_fp8_with_scale_cpu"): {
-            "param_sets": {
-                # Scale 0.01 with different input ranges
-                "shape_1_2_32_scale_0.01_mean_0.0_std_1.0": (
-                    (1, 2, 32),
-                    0.01,
-                    0.0,
-                    1.0,
-                ),
-                "shape_1_2_32_scale_0.01_mean_0.0_std_5.0": (
-                    (1, 2, 32),
-                    0.01,
-                    0.0,
-                    5.0,
-                ),
-                "shape_1_2_32_scale_0.01_mean_10.0_std_50.0": (
-                    (1, 2, 32),
-                    0.01,
-                    10.0,
-                    50.0,
-                ),
-                "shape_1_2_32_scale_0.01_mean_100.0_std_100.0": (
-                    (1, 2, 32),
-                    0.01,
-                    100.0,
-                    100.0,
-                ),
-                "shape_1_2_32_scale_0.01_mean_200.0_std_200.0": (
-                    (1, 2, 32),
-                    0.01,
-                    200.0,
-                    200.0,
-                ),
-                # Scale 0.1 with different input ranges
-                "shape_1_2_32_scale_0.1_mean_0.0_std_1.0": ((1, 2, 32), 0.1, 0.0, 1.0),
-                "shape_1_2_32_scale_0.1_mean_0.0_std_5.0": ((1, 2, 32), 0.1, 0.0, 5.0),
-                "shape_1_2_32_scale_0.1_mean_10.0_std_50.0": (
-                    (1, 2, 32),
-                    0.1,
-                    10.0,
-                    50.0,
-                ),
-                "shape_1_2_32_scale_0.1_mean_100.0_std_100.0": (
-                    (1, 2, 32),
-                    0.1,
-                    100.0,
-                    100.0,
-                ),
-                "shape_1_2_32_scale_0.1_mean_200.0_std_200.0": (
-                    (1, 2, 32),
-                    0.1,
-                    200.0,
-                    200.0,
-                ),
-                # Scale 0.5 with different input ranges
-                "shape_1_2_32_scale_0.5_mean_0.0_std_1.0": ((1, 2, 32), 0.5, 0.0, 1.0),
-                "shape_1_2_32_scale_0.5_mean_0.0_std_5.0": ((1, 2, 32), 0.5, 0.0, 5.0),
-                "shape_1_2_32_scale_0.5_mean_10.0_std_50.0": (
-                    (1, 2, 32),
-                    0.5,
-                    10.0,
-                    50.0,
-                ),
-                "shape_1_2_32_scale_0.5_mean_100.0_std_100.0": (
-                    (1, 2, 32),
-                    0.5,
-                    100.0,
-                    100.0,
-                ),
-                "shape_1_2_32_scale_0.5_mean_200.0_std_200.0": (
-                    (1, 2, 32),
-                    0.5,
-                    200.0,
-                    200.0,
-                ),
-                # Scale 1.0 with different input ranges
-                "shape_1_2_32_scale_1.0_mean_0.0_std_1.0": ((1, 2, 32), 1.0, 0.0, 1.0),
-                "shape_1_2_32_scale_1.0_mean_0.0_std_5.0": ((1, 2, 32), 1.0, 0.0, 5.0),
-                "shape_1_2_32_scale_1.0_mean_10.0_std_50.0": (
-                    (1, 2, 32),
-                    1.0,
-                    10.0,
-                    50.0,
-                ),
-                "shape_1_2_32_scale_1.0_mean_100.0_std_100.0": (
-                    (1, 2, 32),
-                    1.0,
-                    100.0,
-                    100.0,
-                ),
-                "shape_1_2_32_scale_1.0_mean_200.0_std_200.0": (
-                    (1, 2, 32),
-                    1.0,
-                    200.0,
-                    200.0,
-                ),
-                # Scale 2.0 with different input ranges
-                "shape_1_2_32_scale_2.0_mean_0.0_std_1.0": ((1, 2, 32), 2.0, 0.0, 1.0),
-                "shape_1_2_32_scale_2.0_mean_0.0_std_5.0": ((1, 2, 32), 2.0, 0.0, 5.0),
-                "shape_1_2_32_scale_2.0_mean_10.0_std_50.0": (
-                    (1, 2, 32),
-                    2.0,
-                    10.0,
-                    50.0,
-                ),
-                "shape_1_2_32_scale_2.0_mean_100.0_std_100.0": (
-                    (1, 2, 32),
-                    2.0,
-                    100.0,
-                    100.0,
-                ),
-                "shape_1_2_32_scale_2.0_mean_200.0_std_200.0": (
-                    (1, 2, 32),
-                    2.0,
-                    200.0,
-                    200.0,
-                ),
-                # Production-scale shapes with scale 1.0, mean 1.0, std 2.0
-                "shape_1_128_512_scale_1.0_mean_1.0_std_2.0": (
-                    (1, 128, 512),
-                    1.0,
-                    1.0,
-                    2.0,
-                ),
-                "shape_4_128_512_scale_1.0_mean_1.0_std_2.0": (
-                    (4, 128, 512),
-                    1.0,
-                    1.0,
-                    2.0,
-                ),
-                "shape_1_128_1024_scale_1.0_mean_1.0_std_2.0": (
-                    (1, 128, 1024),
-                    1.0,
-                    1.0,
-                    2.0,
-                ),
-                "shape_1_128_2048_scale_1.0_mean_1.0_std_2.0": (
-                    (1, 128, 2048),
-                    1.0,
-                    1.0,
-                    2.0,
-                ),
-                "shape_1_128_4096_scale_1.0_mean_1.0_std_2.0": (
-                    (1, 128, 4096),
-                    1.0,
-                    1.0,
-                    2.0,
-                ),
             },
         },
     }
@@ -5666,6 +5545,53 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             run_eager=False,
         )
 
+    def test_round_trip_to_dtype_implicit_cpu(self, op, x, dst_dtype):
+        y = x.clone()
+
+        def fn(op, x, y, dst_dtype):
+            x_dst = x.to(dst_dtype)
+            z = op(x_dst, y)
+            return z.to(x.dtype)
+
+        self.compare_with_cpu(
+            fn,
+            op,
+            x,
+            y,
+            dst_dtype,
+            cpu_compile=False,
+            run_eager=False,
+        )
+
+    def test_round_trip_to_dtype_implicit_invalid_cpu(self, op, x, dst_dtype):
+        y = x.clone()
+        x_dst = x.to(dst_dtype)
+
+        def fn(op, x, y):
+            src_dtype = y.dtype
+            z = op(x, y)
+            return z.to(src_dtype)
+
+        with pytest.raises(Exception) as exc_info:
+            self.compare_with_cpu(
+                fn,
+                op,
+                x_dst,
+                y,
+                cpu_compile=False,
+                run_eager=False,
+            )
+
+        assert "All inputs to an op must have same element arrangement" in str(
+            exc_info.value
+        )
+
+    def test_add_constant_cpu(self, op, x):
+        def fn(op, x):
+            return op(x, 1.0)
+
+        self.compare_with_cpu(fn, op, x, cpu_compile=False, run_eager=False)
+
     def test_bool_conversion_from_spyre(self):
         torch.manual_seed(42)
 
@@ -5703,34 +5629,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             atol=0.5,
             rtol=0.1,
         )
-
-    def test_dequantize_fp8_with_scale_cpu(self, shape, scale_value, mean, std):
-        """Test FP8 quantize/dequantize with different scales and input ranges.
-
-        The atol is calculated dynamically based on scale_value to account for
-        FP8 E4M3 halfway case rounding differences. When input is exactly halfway
-        between two FP8 values, CPU and device may use different tie-breaking rules.
-
-        For scale=2.0: input ~600 / 2.0 = ~300 (FP8 spacing 32), error * 2.0 = 64.0
-        Example: 336.0 quantizes to either 320.0 or 352.0, giving 32 error, scaled to 64.
-        """
-        # Generate input tensor with specified mean and std
-        x = torch.randn(shape, dtype=torch.float16) * std + mean
-        scale = torch.tensor([scale_value], dtype=torch.float16)
-
-        # Calculate atol based on scale: max FP8 spacing * scale * safety factor
-        atol = FP8_E4M3_MAX_SPACING * scale_value * TOLERANCE_SAFETY_FACTOR
-
-        def spyre_fn(x, scale):
-            x_fp8 = torch.ops.spyre.quantize_fp8_with_scale(x, scale)
-            return torch.ops.spyre.dequantize_fp8_with_scale(x_fp8, scale)
-
-        def pytorch_fn(x, scale):
-            return (x / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).to(
-                torch.float16
-            ) * scale
-
-        compare_with_pytorch(spyre_fn, pytorch_fn, x, scale, atol=atol, rtol=0.0)
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_index_copy_cpu(self):

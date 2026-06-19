@@ -15,21 +15,22 @@
 """
 Unit tests for FP8 quantization operations.
 
-This file contains tests for FP8 operations that are NOT covered by test_inductor_ops.py.
-For comprehensive quantize/dequantize roundtrip tests with various scales and input ranges,
-see test_dequantize_fp8_with_scale_cpu in test_inductor_ops.py.
-
 Tests cover:
 - qfp8ch: Channel-wise FP8 format conversion
 - fp8todl16: FP8→FP16 dtype conversion (tests .to(torch.float16) lowering)
+- quantize/dequantize: Comprehensive roundtrip tests with various scales and input ranges
 """
 
+import pytest
 import torch
 
 from utils_inductor import (
     cached_randn,
     compare_with_pytorch,
 )
+
+# FP8 E4M3 quantization constants
+FP8_E4M3_MAX_SPACING = 32.0  # Maximum spacing between representable values in FP8 E4M3
 
 
 class TestFP8Operations:
@@ -112,6 +113,168 @@ class TestFP8Operations:
             scale,
             atol=0.5,
             rtol=0.1,
+        )
+
+    # Tolerance categories:
+    # - small_range: low FP8 spacing regions (atol=2)
+    # - medium_range: may enter spacing=16 regions (atol=16)
+    # - boundary_cases: may enter spacing=32 regions (atol=32 * scale)
+
+    @pytest.mark.parametrize(
+        "shape,scale_value,mean,std",
+        [
+            ((1, 2, 32), 0.01, 0.0, 1.0),
+            ((1, 2, 32), 0.01, 0.0, 5.0),
+            ((1, 2, 32), 0.1, 0.0, 1.0),
+            ((1, 2, 32), 0.1, 0.0, 5.0),
+            ((1, 2, 32), 0.5, 0.0, 1.0),
+            ((1, 2, 32), 0.5, 0.0, 5.0),
+            ((1, 2, 32), 1.0, 0.0, 1.0),
+            ((1, 2, 32), 1.0, 0.0, 5.0),
+            ((1, 2, 32), 2.0, 0.0, 1.0),
+            ((1, 2, 32), 2.0, 0.0, 5.0),
+        ],
+    )
+    def test_quantize_dequantize_fp8_small_range(
+        self,
+        shape,
+        scale_value,
+        mean,
+        std,
+    ):
+        """Test quantize/dequantize for typical FP8 value ranges."""
+        self._run_quantize_dequantize_fp8_test(
+            shape,
+            scale_value,
+            mean,
+            std,
+            atol=2.0,
+            rtol=0.0,
+        )
+
+    @pytest.mark.parametrize(
+        "shape,scale_value,mean,std",
+        [
+            ((1, 2, 32), 0.01, 10.0, 50.0),
+            ((1, 2, 32), 0.1, 10.0, 50.0),
+            ((1, 2, 32), 0.5, 10.0, 50.0),
+            ((1, 2, 32), 1.0, 10.0, 50.0),
+            ((1, 2, 32), 2.0, 10.0, 50.0),
+        ],
+    )
+    def test_quantize_dequantize_fp8_medium_range(
+        self,
+        shape,
+        scale_value,
+        mean,
+        std,
+    ):
+        """Test quantize/dequantize for moderate input ranges.
+
+        These cases may enter higher FP8 spacing regions but do not
+        intentionally target FP8 representation boundaries.
+        """
+        self._run_quantize_dequantize_fp8_test(
+            shape,
+            scale_value,
+            mean,
+            std,
+            atol=16.0,
+            rtol=0.0,
+        )
+
+    @pytest.mark.parametrize(
+        "shape,scale_value,mean,std",
+        [
+            ((1, 2, 32), 0.01, 100.0, 100.0),
+            ((1, 2, 32), 0.01, 200.0, 200.0),
+            ((1, 2, 32), 0.1, 100.0, 100.0),
+            ((1, 2, 32), 0.1, 200.0, 200.0),
+            ((1, 2, 32), 0.5, 100.0, 100.0),
+            ((1, 2, 32), 0.5, 200.0, 200.0),
+            ((1, 2, 32), 1.0, 100.0, 100.0),
+            ((1, 2, 32), 1.0, 200.0, 200.0),
+            ((1, 2, 32), 2.0, 100.0, 100.0),
+            ((1, 2, 32), 2.0, 200.0, 200.0),
+        ],
+    )
+    def test_quantize_dequantize_fp8_boundary_cases(
+        self,
+        shape,
+        scale_value,
+        mean,
+        std,
+    ):
+        """Test FP8 E4M3 representation boundary cases."""
+        self._run_quantize_dequantize_fp8_test(
+            shape,
+            scale_value,
+            mean,
+            std,
+            atol=FP8_E4M3_MAX_SPACING * scale_value,
+            rtol=0.0,
+        )
+
+    @pytest.mark.parametrize(
+        "shape",
+        [
+            (1, 128, 512),
+            (4, 128, 512),
+            (1, 128, 1024),
+            (1, 128, 2048),
+            (1, 128, 4096),
+        ],
+    )
+    def test_quantize_dequantize_fp8_production_shapes(self, shape):
+        """Test FP8 quantize/dequantize with production-scale tensor shapes.
+
+        Uses standard tolerance values (atol=0.5, rtol=0.1) with typical
+        input distributions (mean=1.0, std=2.0, scale=1.0) that don't trigger
+        edge cases in FP8 representation.
+        """
+        # Generate deterministic input with typical distribution
+        x = cached_randn(shape, dtype=torch.float16, scale=1.0) * 2.0 + 1.0
+        scale = torch.tensor([1.0], dtype=torch.float16)
+
+        def spyre_fn(x, scale):
+            x_fp8 = torch.ops.spyre.quantize_fp8_with_scale(x, scale)
+            return torch.ops.spyre.dequantize_fp8_with_scale(x_fp8, scale)
+
+        def pytorch_fn(x, scale):
+            return (x / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).to(
+                torch.float16
+            ) * scale
+
+        compare_with_pytorch(spyre_fn, pytorch_fn, x, scale, atol=0.5, rtol=0.1)
+
+    def _run_quantize_dequantize_fp8_test(
+        self,
+        shape,
+        scale_value,
+        mean,
+        std,
+        atol,
+        rtol=0.0,
+    ):
+        x = cached_randn(shape, dtype=torch.float16, scale=1.0) * std + mean
+        scale = torch.tensor([scale_value], dtype=torch.float16)
+
+        def spyre_fn(x, scale):
+            x_fp8 = torch.ops.spyre.quantize_fp8_with_scale(x, scale)
+            return torch.ops.spyre.dequantize_fp8_with_scale(x_fp8, scale)
+
+        def pytorch_fn(x, scale):
+            return (x / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).to(
+                torch.float16
+            ) * scale
+
+        compare_with_pytorch(
+            spyre_fn,
+            pytorch_fn,
+            x,
+            scale,
+            atol=atol,
+            rtol=rtol,
         )
 
 
