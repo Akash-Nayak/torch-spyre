@@ -21,7 +21,7 @@ import torch
 from torch.utils import _pytree as pytree
 import torch._decomp as decomp
 
-from .constants import DEVICE_NAME
+from .constants import DEVICE_NAME, FP8_E4M3_MAX
 from .errors import Unsupported
 from . import customops  # noqa: F401
 
@@ -817,7 +817,7 @@ def spyre_quantize_fp8_with_scale(
 ) -> torch.Tensor:
     inv_scale = torch.reciprocal(scale)
     x_scaled = input * inv_scale
-    x_clamped = torch.ops.spyre.clamp(x_scaled, -448.0, 448.0)
+    x_clamped = torch.ops.spyre.clamp(x_scaled, -FP8_E4M3_MAX, FP8_E4M3_MAX)
     return torch.ops.spyre.qfp8ch(x_clamped)
 
 

@@ -1,4 +1,4 @@
-# Copyright 2024 IBM Corp.
+# Copyright 2025 The Torch-Spyre Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -24,13 +24,14 @@ Tests cover:
 import pytest
 import torch
 
+from torch_spyre._inductor.constants import FP8_E4M3_MAX
 from utils_inductor import (
     cached_randn,
     compare_with_pytorch,
 )
 
-# FP8 E4M3 quantization constants
-FP8_E4M3_MAX_SPACING = 32.0  # Maximum spacing between representable values in FP8 E4M3
+# Maximum spacing between adjacent representable values in FP8 E4M3
+FP8_E4M3_MAX_SPACING = 32.0
 
 
 class TestFP8Operations:
@@ -60,7 +61,7 @@ class TestFP8Operations:
 
         def pytorch_fn(x, scale):
             # CPU reference: direct format conversion with identity scale
-            x_fp8 = x.clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+            x_fp8 = x.clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX).to(torch.float8_e4m3fn)
             return x_fp8.to(torch.float16) * scale
 
         compare_with_pytorch(
@@ -68,8 +69,8 @@ class TestFP8Operations:
             pytorch_fn,
             x,
             scale,
-            atol=0.5,
-            rtol=0.1,
+            atol=0.0,
+            rtol=0.0,
         )
 
     def test_fp8todl16_basic_conversion(self):
@@ -103,7 +104,7 @@ class TestFP8Operations:
 
         def pytorch_fn(x, scale):
             # CPU reference: FP16 → FP8 → FP16 conversion with identity scale
-            x_fp8 = x.clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+            x_fp8 = x.clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX).to(torch.float8_e4m3fn)
             return x_fp8.to(torch.float16) * scale
 
         compare_with_pytorch(
@@ -241,9 +242,9 @@ class TestFP8Operations:
             return torch.ops.spyre.dequantize_fp8_with_scale(x_fp8, scale)
 
         def pytorch_fn(x, scale):
-            return (x / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).to(
-                torch.float16
-            ) * scale
+            return (x / scale).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX).to(
+                torch.float8_e4m3fn
+            ).to(torch.float16) * scale
 
         compare_with_pytorch(spyre_fn, pytorch_fn, x, scale, atol=0.5, rtol=0.1)
 
@@ -264,9 +265,9 @@ class TestFP8Operations:
             return torch.ops.spyre.dequantize_fp8_with_scale(x_fp8, scale)
 
         def pytorch_fn(x, scale):
-            return (x / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).to(
-                torch.float16
-            ) * scale
+            return (x / scale).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX).to(
+                torch.float8_e4m3fn
+            ).to(torch.float16) * scale
 
         compare_with_pytorch(
             spyre_fn,
