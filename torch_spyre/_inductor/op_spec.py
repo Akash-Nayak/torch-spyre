@@ -23,14 +23,13 @@ from torch_spyre._C import DataFormats, ElementArrangement
 import torch
 
 
-class IndexLoad(Function):
-    """Sympy function representing a gather: IndexLoad(tensor_name).
+class IndirectAccess(Function):
+    """Sympy function: IndirectAccess(tensor_name) — runtime index read from that tensor at the current iteration point.
 
-    Used in TensorArg.device_coordinates to encode indirect (gather) access.
-    The argument is a Symbol whose name is the source tensor's name.
-    Means: "the value loaded from that tensor at the current iteration point".
-    Survives sympify round-trips when IndexLoad is in the local namespace.
-
+    Used in TensorArg.device_coordinates to encode indirect access: as a coordinate of an
+    input arg (gather) or an output arg (scatter).
+    IndexedBase was not used because sympify('arg1_1[i]') fails: the parser reconstructs
+    arg1_1 as a Symbol, and Symbol.__getitem__ raises TypeError.
     """
 
     @classmethod
@@ -59,7 +58,6 @@ class TensorArg:
     device_size: list[int]
     device_coordinates: list[Expr]
     allocation: Any
-    stride_map: list[int] | None = None
     per_tile_fixed: bool = False
     name: str | None = None
     element_arrangement: ElementArrangement = dataclasses.field(

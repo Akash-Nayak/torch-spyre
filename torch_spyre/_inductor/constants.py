@@ -86,6 +86,9 @@ SPYRE_FP32_OPS = [
 ]
 
 # Operations that directly handle FP8 dtypes (SEN143_FP8)
+# FP8 E4M3 numeric limits
+FP8_E4M3_MAX = 448.0
+
 SPYRE_FP8_OPS = {
     "qfp8ch",  # Channel-wise FP8 quantization (output: FP8)
     "fp8todl16",  # FP8 to FP16 conversion (input: FP8)

@@ -21,6 +21,8 @@ from torch_spyre.ops.fallbacks import warn_fallback
 
 from .errors import Unsupported
 
+aten = torch.ops.aten
+
 
 @torch.library.custom_op("spyre::softplus", mutates_args=(), device_types="spyre")
 def softplus(
@@ -170,6 +172,18 @@ def gelu(
 
 @gelu.register_fake
 def _(input: torch.Tensor, approximate: str = "none"):
+    return input.new_empty(input.size())
+
+
+@torch.library.custom_op("spyre::silu", mutates_args=(), device_types="spyre")
+def silu(
+    input: torch.Tensor,
+) -> torch.Tensor:
+    return aten.div.Tensor(input, 1 + aten.exp.default(-input))
+
+
+@silu.register_fake
+def _(input: torch.Tensor):
     return input.new_empty(input.size())
 
 
@@ -637,19 +651,6 @@ def dequantize_fp8_with_scale(input: torch.Tensor, scale: torch.Tensor) -> torch
 def _(input: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     # Output is FP16 with same shape as input
     return torch.empty(input.size(), dtype=torch.float16, device=input.device)
-@torch.library.custom_op(
-    "spyre::quantize_weight_fp8_with_scale", mutates_args=(), device_types="spyre"
-)
-def quantize_weight_fp8_with_scale(
-    input: torch.Tensor, scale: torch.Tensor
-) -> torch.Tensor:
-    pass
-
-
-@quantize_weight_fp8_with_scale.register_fake
-def _(input: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    # Output is FP8 with same shape as input
-    return torch.empty(input.size(), dtype=torch.float8_e4m3fn, device=input.device)
 
 
 @torch.library.custom_op("spyre::qfp8wt", mutates_args=(), device_types="spyre")

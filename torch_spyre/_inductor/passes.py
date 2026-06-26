@@ -42,7 +42,6 @@ from .temp_passes import (
     bmm_unflatten_pass,
     mark_direct_unit_bmm_pass,
     mm_to_bmm_pass,
-    convert_constant_with_graph_node,
 )
 from .coarse_tile import hints_to_coarse_tile_groups
 from . import config
@@ -75,6 +74,7 @@ from .deadcode_elimination import deadcode_elimination
 from .dedup_constants import dedup_and_promote_constants
 from .chunk_large_tensors import chunk_large_tensors
 from .coarse_tile import coarse_tile
+from .split_multi_ops import split_multi_ops, validate_ops
 
 
 logger = get_inductor_logger("passes")
@@ -208,7 +208,6 @@ class CustomPostPasses(_SpyreGraphPassPipeline):
         super().__init__(
             [
                 recover_spyre_hints,
-                convert_constant_with_graph_node,
                 mm_to_bmm_pass.apply,
                 mark_direct_unit_bmm_pass,
                 bmm_unflatten_pass.apply,
@@ -273,9 +272,10 @@ def _maybe_chunk_large_tensors(graph: GraphLowering) -> None:
 
 @_runs(hints_to_coarse_tile_groups, coarse_tile)
 def _maybe_coarse_tile(graph: GraphLowering) -> None:
-    groups = hints_to_coarse_tile_groups(graph)
-    if groups:
-        coarse_tile(graph, groups=groups)
+    if not config.ignore_wsr_hints:
+        groups = hints_to_coarse_tile_groups(graph)
+        if groups:
+            coarse_tile(graph, groups=groups)
 
 
 @_runs(cost_model_matmul_division, work_distribution)
@@ -317,7 +317,9 @@ class CustomPreSchedulingPasses:
             deadcode_elimination,
             #
             # Tensor Layout (Stickification)
+            split_multi_ops,
             propagate_spyre_tensor_layouts,
+            validate_ops,
             optimize_restickify_locations,
             finalize_layouts,
             insert_restickify,
