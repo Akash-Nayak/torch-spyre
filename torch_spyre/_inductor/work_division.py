@@ -258,12 +258,20 @@ def multi_dim_iteration_space_split(
     return splits
 
 
-def _has_qfp8wt_tensor(input_tds: list[TensorDep]) -> bool:
-    """Check if any input tensor has QFP8WT element arrangement."""
+def _has_qfp8wt_tensor(tds: list[TensorDep]) -> bool:
+    """Check if any tensor has QFP8WT element arrangement."""
     return any(
         hasattr(td.layout.device_layout, "element_arrangement")
         and td.layout.device_layout.element_arrangement == ElementArrangement.QFP8WT
-        for td in input_tds
+        for td in tds
+    )
+
+
+def _is_qfp8wt_tensor(td: TensorDep) -> bool:
+    """Check if a specific tensor has QFP8WT element arrangement."""
+    return (
+        hasattr(td.layout.device_layout, "element_arrangement")
+        and td.layout.device_layout.element_arrangement == ElementArrangement.QFP8WT
     )
 
 
@@ -277,19 +285,19 @@ def _get_qfp8wt_split_constraints(
     stick dimension across cores to maintain 128-byte alignment.
     """
     constraints: dict[Symbol, int] = {}
-    if not _has_qfp8wt_tensor(input_tds):
+    if not _has_qfp8wt_tensor(input_tds + [output_td]):
         return constraints
 
     # Kernel tensor (second input for batchmatmul)
     if len(input_tds) > 1:
         kernel_td = input_tds[1]
-        if len(kernel_td.device_coords) > 1:
+        if len(kernel_td.device_coords) > 1 and _is_qfp8wt_tensor(kernel_td):
             second_stick_vars = kernel_td.device_coords[-2].free_symbols
             for var in second_stick_vars:
                 constraints[var] = 1
 
     # Output tensor
-    if len(output_td.device_coords) > 1:
+    if len(output_td.device_coords) > 1 and _is_qfp8wt_tensor(output_td):
         second_stick_vars = output_td.device_coords[-2].free_symbols
         for var in second_stick_vars:
             constraints[var] = 1
@@ -1297,7 +1305,7 @@ def _cost_model_matmul_planner(
     k_divs = [int(d) for d in divisors(k_sticks)]
 
     # For batchmatmulfp8 with QFP8WT kernels, do not split K
-    if _has_qfp8wt_tensor(input_tds):
+    if _has_qfp8wt_tensor(input_tds + [output_td]):
         k_divs = [1]
 
     best = None
@@ -1334,7 +1342,7 @@ def _cost_model_matmul_planner(
 
     # Never trade down to fewer cores than the default distributor already found.
     if math.prod(new_splits.values()) < math.prod(splits.values()):
-        if not _has_qfp8wt_tensor(input_tds):
+        if not _has_qfp8wt_tensor(input_tds + [output_td]):
             return splits
         # For QFP8WT, force k_dim = 1 regardless of core count
         new_splits[k_dim] = 1
