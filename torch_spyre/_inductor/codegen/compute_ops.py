@@ -128,13 +128,37 @@ def add_constant(kwargs, name, value) -> int:
     return index
 
 
-def _compute_fp8_coord_params(tensor, dim, sdsc_spec):
+def _layout_info_for_tensor(sdsc_spec, tensor, tensor_idx: int) -> dict:
+    """Return layout metadata to emit for a tensor.
+
+    For individually compiled FP8 batchmatmul kernels, the upstream flattening
+    needed to satisfy DDL's max-dimension limit can erase the semantic 2D-stick
+    metadata on the KERNEL tensor. Restore that metadata here so the emitted
+    SDSC matches the combined-compilation shape contract.
+    """
+    layout_info = sdsc_spec.layouts[tensor.layout]
+    if (
+        sdsc_spec.opfunc == "batchmatmulfp8"
+        and tensor_idx == 1
+        and tensor.data_format == DataFormats.SEN143_FP8
+        and layout_info["stick_size"] == [128]
+    ):
+        return {
+            **layout_info,
+            "stick_dim_order": list(layout_info["dim_order"]),
+            "stick_size": [2, 64],
+        }
+    return layout_info
+
+
+def _compute_fp8_coord_params(tensor, dim, sdsc_spec, tensor_idx: int):
     """Compute FP8 2D stick coordinate parameters for a dimension.
 
     Returns tuple: (is_fp8_stick, other_stick_size, stick_idx)
     """
-    stick_size_list = sdsc_spec.layouts[tensor.layout]["stick_size"]
-    stick_dim_order = sdsc_spec.layouts[tensor.layout]["stick_dim_order"]
+    layout_info = _layout_info_for_tensor(sdsc_spec, tensor, tensor_idx)
+    stick_size_list = layout_info["stick_size"]
+    stick_dim_order = layout_info["stick_dim_order"]
 
     is_fp8_stick = (
         tensor.data_format == DataFormats.SEN143_FP8 and len(stick_size_list) > 1
@@ -590,17 +614,24 @@ def generate_sdsc(
                                 }
                             },
                             "primaryDsInfo_": {
-                                label: {
+                                tensor.layout: {
                                     "layoutDimOrder_": [
-                                        str(dim) for dim in layout_info["dim_order"]
+                                        str(dim)
+                                        for dim in _layout_info_for_tensor(
+                                            sdsc_spec, tensor, i
+                                        )["dim_order"]
                                     ],
                                     "stickDimOrder_": [
                                         str(dim)
-                                        for dim in layout_info["stick_dim_order"]
+                                        for dim in _layout_info_for_tensor(
+                                            sdsc_spec, tensor, i
+                                        )["stick_dim_order"]
                                     ],
-                                    "stickSize_": layout_info["stick_size"],
+                                    "stickSize_": _layout_info_for_tensor(
+                                        sdsc_spec, tensor, i
+                                    )["stick_size"],
                                 }
-                                for label, layout_info in sdsc_spec.layouts.items()
+                                for i, tensor in enumerate(sdsc_spec.args)
                             },
                             "scheduleTree_": [
                                 {
@@ -696,7 +727,7 @@ def generate_sdsc(
                                                 )
                                             )(
                                                 *_compute_fp8_coord_params(
-                                                    tensor, dim, sdsc_spec
+                                                    tensor, dim, sdsc_spec, i
                                                 )
                                             )
                                             for dim in sdsc_spec.layouts[tensor.layout][
