@@ -35,7 +35,7 @@ from torch._inductor.graph import GraphLowering
 from torch_spyre._C import ElementArrangement
 
 from .errors import Unsupported
-from .constants import BATCH_MATMUL_OP, TOPK_OPS
+from .constants import BATCH_MATMUL_OP, TOPK_OPS, BATCH_MATMUL_FP8_OP
 from .ir import FixedTiledLayout
 from .pass_utils import (
     SchedNodeArg,
@@ -256,6 +256,45 @@ def multi_dim_iteration_space_split(
             splits[best_dim] = best_split
 
     return splits
+
+
+def _has_qfp8wt_tensor(input_tds: list[TensorDep]) -> bool:
+    """Check if any input tensor has QFP8WT element arrangement."""
+    return any(
+        hasattr(td.layout.device_layout, "element_arrangement")
+        and td.layout.device_layout.element_arrangement == ElementArrangement.QFP8WT
+        for td in input_tds
+    )
+
+
+def _get_qfp8wt_split_constraints(
+    input_tds: list[TensorDep],
+    output_td: TensorDep,
+) -> dict[Symbol, int]:
+    """Return split constraints (=1) for QFP8WT second stick dimension.
+
+    For QFP8WT tensors with 2D stick layouts, prevent splitting the second
+    stick dimension across cores to maintain 128-byte alignment.
+    """
+    constraints: dict[Symbol, int] = {}
+    if not _has_qfp8wt_tensor(input_tds):
+        return constraints
+
+    # Kernel tensor (second input for batchmatmul)
+    if len(input_tds) > 1:
+        kernel_td = input_tds[1]
+        if len(kernel_td.device_coords) > 1:
+            second_stick_vars = kernel_td.device_coords[-2].free_symbols
+            for var in second_stick_vars:
+                constraints[var] = 1
+
+    # Output tensor
+    if len(output_td.device_coords) > 1:
+        second_stick_vars = output_td.device_coords[-2].free_symbols
+        for var in second_stick_vars:
+            constraints[var] = 1
+
+    return constraints
 
 
 def adjust_it_space_for_sticks(
@@ -789,6 +828,14 @@ def span_reduction_pass(
         all_tds, it_space, it_space_adjusted, stick_vars, max_cores, symbol_meta
     )
 
+    # For matmul ops with QFP8WT kernels, enforce split constraints
+    if isinstance(op.data, Reduction) and op.data.reduction_type in (
+        BATCH_MATMUL_OP,
+        BATCH_MATMUL_FP8_OP,
+    ):
+        qfp8_constraints = _get_qfp8wt_split_constraints(input_tds, output_td)
+        min_splits.update(qfp8_constraints)
+
     coord_vars = {v for e in output_td.device_coords[:-1] for v in e.free_symbols}
     reduction_vars_to_split = set(min_splits) - coord_vars
     # Each entry in Reduction.reduction_ranges maps to at most one Symbol via
@@ -899,6 +946,13 @@ def work_distribution_pass(
     # dims with actual committed splits so they don't overlap with priorities.
     committed_splits = {s: v for s, v in min_splits.items() if v > 1}
 
+    # For matmul ops with QFP8WT kernels, enforce split constraints
+    qfp8_constraints = _get_qfp8wt_split_constraints(input_tds, output_td)
+    for var, split_val in qfp8_constraints.items():
+        if var in committed_splits:
+            del committed_splits[var]
+        min_splits[var] = split_val
+
     if not config.ignore_work_division_hints:
         user_splits = _resolve_work_div_hint(op, it_space_adjusted)
         if user_splits is not None:
@@ -936,6 +990,10 @@ def work_distribution_pass(
     splits, output_dims, reduction_dims = _default_split(
         it_space_adjusted, output_td, committed_splits, max_cores, symbol_meta
     )
+
+    # Enforce QFP8WT split constraints on the final split
+    qfp8_constraints = _get_qfp8wt_split_constraints(input_tds, output_td)
+    splits.update(qfp8_constraints)
 
     apply_splits(op, splits, output_td)
 
@@ -1174,7 +1232,7 @@ def _cost_model_matmul_planner(
     """
     if not isinstance(op.data, Reduction):
         return splits
-    if op.data.reduction_type != BATCH_MATMUL_OP:
+    if op.data.reduction_type not in (BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP):
         return splits
     if committed_splits:
         return splits
@@ -1238,6 +1296,10 @@ def _cost_model_matmul_planner(
     n_divs = [int(d) for d in divisors(n_sticks)]
     k_divs = [int(d) for d in divisors(k_sticks)]
 
+    # For batchmatmulfp8 with QFP8WT kernels, do not split K
+    if _has_qfp8wt_tensor(input_tds):
+        k_divs = [1]
+
     best = None
     best_cost = float("inf")
     for b_combo in b_combos:
@@ -1269,6 +1331,13 @@ def _cost_model_matmul_planner(
     new_splits[m_dim] = m_s
     new_splits[n_dim] = n_s
     new_splits[k_dim] = k_s
+
+    # Never trade down to fewer cores than the default distributor already found.
+    if math.prod(new_splits.values()) < math.prod(splits.values()):
+        if not _has_qfp8wt_tensor(input_tds):
+            return splits
+        # For QFP8WT, force k_dim = 1 regardless of core count
+        new_splits[k_dim] = 1
 
     logger.debug(
         f"cost_model work_division {op.get_name()}: "

@@ -220,7 +220,7 @@ def gen_coord_info_value(
                     {"Affine": {"alpha_": size, "beta_": 0}},
                     {"Affine": {"alpha_": 0, "beta_": 0}},
                     {"Affine": {"alpha_": 0, "beta_": 0}},
-                    {"Affine": {"alpha_": (size // 16), "beta_": 0}},
+                    {"Affine": {"alpha_": 128, "beta_": 0}},
                     {"Affine": {"alpha_": 8, "beta_": 0}},
                     {"Affine": {"alpha_": 64, "beta_": 0}},
                     {"Affine": {"alpha_": 1, "beta_": 0}},
