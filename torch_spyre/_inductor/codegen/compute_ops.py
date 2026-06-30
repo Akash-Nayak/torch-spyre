@@ -131,6 +131,7 @@ def add_constant(kwargs, name, value) -> int:
 # FP8 kernel tensor flattened stick size sentinel
 _FP8_FLAT_STICK_SIZE = [128]
 
+
 def _layout_info_for_tensor(sdsc_spec, tensor, tensor_idx: int) -> dict:
     """Return layout metadata to emit for a tensor.
 
@@ -715,9 +716,9 @@ def generate_sdsc(
                                                     elems_per_stick=tensor.data_format.elems_per_stick(),
                                                     is_stick_dim=(
                                                         dim
-                                                        in sdsc_spec.layouts[
-                                                            tensor.layout
-                                                        ]["stick_dim_order"]
+                                                        in _layout_info_for_tensor(
+                                                            sdsc_spec, tensor, i
+                                                        )["stick_dim_order"]
                                                     ),
                                                     is_stick_reduction=(
                                                         tensor.scales[dim] == -2

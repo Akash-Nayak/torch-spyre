@@ -254,6 +254,11 @@ class TestFP8Operations:
         This test verifies that quantize_weight_fp8_with_scale works correctly
         in eager mode after the fix that added the @torch.library.custom_op
         decorator (previously it would have raised AttributeError at import time).
+        
+        Note: This test validates the eager execution path and dtype correctness
+        but does not verify that the weight-specific qfp8wt kernel path is used
+        rather than the activation qfp8ch path. Kernel path verification would
+        require op tracing or mock assertions.
         """
         weight = cached_randn((128, 128), dtype=torch.float16, scale=1.0)
         scale = torch.max(torch.abs(weight)).reshape(1)
