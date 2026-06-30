@@ -377,6 +377,49 @@ def _collect_index_tensor_layouts(
     return index_tensor_layouts, index_active_dims
 
 
+def _flatten_device_size_for_ddl(
+    device_size: list[int],
+    *,
+    keep_trailing_dims: int,
+    max_dims: int = 3,
+) -> list[int]:
+    """Flatten leading device dims to satisfy the DDL dimension limit.
+
+    ``keep_trailing_dims`` preserves the trailing layout structure that SDSC/DDL
+    interprets semantically (for example the FP8 kernel's 2D stick).  Only the
+    leading outer dims are collapsed.
+    """
+    if len(device_size) <= max_dims:
+        return device_size
+
+    if keep_trailing_dims >= len(device_size):
+        return device_size
+
+    leading_dims = len(device_size) - keep_trailing_dims
+    allowed_leading_dims = max_dims - keep_trailing_dims
+    # Defensive check: allowed_leading_dims should always be >= 1 given current callers
+    # (max_dims=3, keep_trailing_dims<=2), but guard against future changes
+    assert allowed_leading_dims >= 1, (
+        f"Invalid flattening parameters: max_dims={max_dims}, "
+        f"keep_trailing_dims={keep_trailing_dims} results in "
+        f"allowed_leading_dims={allowed_leading_dims} < 1"
+    )
+    if leading_dims <= allowed_leading_dims:
+        return device_size
+
+    dims_to_flatten = leading_dims - allowed_leading_dims + 1
+    flattened_dim = math.prod(device_size[:dims_to_flatten])
+    result = [flattened_dim] + device_size[dims_to_flatten:]
+
+    logger.debug(
+        "Flattened device_size for DDL from %s to %s (keep_trailing_dims=%s)",
+        device_size,
+        result,
+        keep_trailing_dims,
+    )
+    return result
+
+
 def _create_sdsc_tensors(
     op_spec: OpSpec,
     symbol_mapping: dict,
@@ -409,6 +452,24 @@ def _create_sdsc_tensors(
     sdsc_args: list[SDSCArgs] = []
     for i, arg in enumerate(op_spec.args):
         is_fp8_mm_kernel_arg: bool = arg.element_arrangement == ElementArrangement.QFP8WT
+
+        # Flatten device_size only when needed for DDL, preserving the trailing
+        # dimensions that encode the stick structure.
+        original_device_size = arg.device_size
+        keep_trailing_dims = 2 if is_fp8_mm_kernel_arg else 1
+        flattened_device_size = _flatten_device_size_for_ddl(
+            original_device_size,
+            keep_trailing_dims=keep_trailing_dims,
+        )
+        if flattened_device_size != original_device_size:
+            arg = dataclasses.replace(arg, device_size=flattened_device_size)
+            logger.info(
+                "Flattened device_size for arg %s (%s): %s -> %s",
+                i,
+                arg.name or "unnamed",
+                original_device_size,
+                flattened_device_size,
+            )
         # Step 1: Determine dimension order and stick dimension.
         # Index tensors use their pre-computed layout (their coords have no IndirectAccess).
         if has_indirect_access and i in index_tensor_layouts:
