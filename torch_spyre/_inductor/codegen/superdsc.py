@@ -397,7 +397,14 @@ def _flatten_device_size_for_ddl(
 
     leading_dims = len(device_size) - keep_trailing_dims
     allowed_leading_dims = max_dims - keep_trailing_dims
-    if allowed_leading_dims < 1 or leading_dims <= allowed_leading_dims:
+    # Defensive check: allowed_leading_dims should always be >= 1 given current callers
+    # (max_dims=3, keep_trailing_dims<=2), but guard against future changes
+    assert allowed_leading_dims >= 1, (
+        f"Invalid flattening parameters: max_dims={max_dims}, "
+        f"keep_trailing_dims={keep_trailing_dims} results in "
+        f"allowed_leading_dims={allowed_leading_dims} < 1"
+    )
+    if leading_dims <= allowed_leading_dims:
         return device_size
 
     dims_to_flatten = leading_dims - allowed_leading_dims + 1

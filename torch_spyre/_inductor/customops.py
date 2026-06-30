@@ -654,6 +654,7 @@ def _(input: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     # Output is FP16 with same shape as input
     return torch.empty(input.size(), dtype=torch.float16, device=input.device)
 
+
 @torch.library.custom_op(
     "spyre::quantize_weight_fp8_with_scale", mutates_args=(), device_types="spyre"
 )

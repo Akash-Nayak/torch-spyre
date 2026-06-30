@@ -248,6 +248,36 @@ class TestFP8Operations:
 
         compare_with_pytorch(spyre_fn, pytorch_fn, x, scale, atol=0.5, rtol=0.1)
 
+    def test_quantize_weight_fp8_with_scale_eager_mode(self):
+        """Test quantize_weight_fp8_with_scale in eager mode.
+
+        This test verifies that quantize_weight_fp8_with_scale works correctly
+        in eager mode after the fix that added the @torch.library.custom_op
+        decorator (previously it would have raised AttributeError at import time).
+        """
+        weight = cached_randn((128, 128), dtype=torch.float16, scale=1.0)
+        scale = torch.max(torch.abs(weight)).reshape(1)
+
+        def spyre_fn(weight, scale):
+            # Test eager mode execution
+            quantized = torch.ops.spyre.quantize_weight_fp8_with_scale(weight, scale)
+            verify_fp8_dtype(quantized)
+            return torch.ops.spyre.dequantize_fp8_with_scale(quantized, scale)
+
+        def pytorch_fn(weight, scale):
+            return (weight / scale).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX).to(
+                torch.float8_e4m3fn
+            ).to(torch.float16) * scale
+
+        compare_with_pytorch(
+            spyre_fn,
+            pytorch_fn,
+            weight,
+            scale,
+            atol=0.5,
+            rtol=0.1,
+        )
+
     def _run_quantize_dequantize_fp8_test(
         self,
         shape,
