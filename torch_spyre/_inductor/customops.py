@@ -628,7 +628,10 @@ def _(input: torch.Tensor) -> torch.Tensor:
 @torch.library.custom_op(
     "spyre::quantize_fp8_with_scale", mutates_args=(), device_types="spyre"
 )
-def quantize_fp8_with_scale(input: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+@compile_once("spyre.quantize_fp8_with_scale")
+def quantize_fp8_with_scale(
+    input: torch.Tensor, scale: torch.Tensor, compiled
+) -> torch.Tensor:
     """
     Quantize FP16 tensor to FP8 using pre-computed scale.
 
@@ -651,11 +654,43 @@ def quantize_fp8_with_scale(input: torch.Tensor, scale: torch.Tensor) -> torch.T
 
     Note:
         - Uses reciprocal operation (hardware sfp unit) for 1/scale computation
+        - Supports eager mode via compile_once decorator
     """
-    pass
+    return compiled(input, scale)
 
 
 @quantize_fp8_with_scale.register_fake
+def _(input: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    # Output is FP8 with same shape as input
+    return torch.empty(input.size(), dtype=torch.float8_e4m3fn, device=input.device)
+
+
+@torch.library.custom_op(
+    "spyre::quantize_weight_fp8_with_scale", mutates_args=(), device_types="spyre"
+)
+@compile_once("spyre.quantize_weight_fp8_with_scale")
+def quantize_weight_fp8_with_scale(
+    input: torch.Tensor, scale: torch.Tensor, compiled
+) -> torch.Tensor:
+    """
+    Quantize weight tensor to FP8 using pre-computed scale.
+
+    Similar to quantize_fp8_with_scale but uses qfp8wt for weight quantization.
+
+    Args:
+        input: Input weight tensor (FP16) to quantize
+        scale: Quantization scale (FP16)
+
+    Returns:
+        FP8 E4M3 tensor (same shape as input)
+
+    Note:
+        - Supports eager mode via compile_once decorator
+    """
+    return compiled(input, scale)
+
+
+@quantize_weight_fp8_with_scale.register_fake
 def _(input: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     # Output is FP8 with same shape as input
     return torch.empty(input.size(), dtype=torch.float8_e4m3fn, device=input.device)

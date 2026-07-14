@@ -164,12 +164,80 @@ def add_constant(kwargs, name, value) -> int:
     return index
 
 
+# FP8 kernel tensor flattened stick size sentinel
+_FP8_FLAT_STICK_SIZE = [128]
+
+
+def _layout_info_for_tensor(sdsc_spec, tensor, tensor_idx: int) -> dict:
+    """Return layout metadata to emit for a tensor.
+
+    For individually compiled FP8 batchmatmul kernels, the upstream flattening
+    needed to satisfy DDL's max-dimension limit can erase the semantic 2D-stick
+    metadata on the KERNEL tensor. Restore that metadata here so the emitted
+    SDSC matches the combined-compilation shape contract.
+    """
+    layout_info = sdsc_spec.layouts[tensor.layout]
+    if (
+        sdsc_spec.opfunc == "batchmatmulfp8"
+        and tensor_idx == 1
+        and tensor.data_format == DataFormats.SEN143_FP8
+        and layout_info["stick_size"] == _FP8_FLAT_STICK_SIZE
+    ):
+        # Validate that dim_order is 2D for the 2D stick override
+        dim_order = layout_info["dim_order"]
+        if len(dim_order) != 2:
+            raise ValueError(
+                f"FP8 batchmatmul kernel tensor expected 2D dim_order, got {len(dim_order)}D: {dim_order}"
+            )
+        return {
+            **layout_info,
+            "stick_dim_order": list(dim_order),
+            "stick_size": [2, 64],
+        }
+    return layout_info
+
+
+def _compute_fp8_coord_params(
+    tensor, dim, sdsc_spec, tensor_idx: int
+) -> tuple[bool, int, int]:
+    """Compute FP8 2D stick coordinate parameters for a dimension.
+
+    Returns tuple: (is_fp8_stick, other_stick_size, stick_idx)
+    """
+    layout_info = _layout_info_for_tensor(sdsc_spec, tensor, tensor_idx)
+    stick_size_list = layout_info["stick_size"]
+    stick_dim_order = layout_info["stick_dim_order"]
+
+    is_fp8_stick = (
+        tensor.data_format == DataFormats.SEN143_FP8 and len(stick_size_list) > 1
+    )
+
+    if dim in stick_dim_order and len(stick_size_list) > 1:
+        stick_idx = stick_dim_order.index(dim)
+        other_idx = 1 - stick_idx
+        other_stick_size = stick_size_list[other_idx]
+    else:
+        stick_idx = -1
+        other_stick_size = 1
+
+    return (
+        bool(is_fp8_stick),
+        int(other_stick_size),
+        int(stick_idx),
+    )
+
+
 def gen_coord_info_value(
     size: int,
     nsplits: int,
     elems_per_stick: int,
     is_stick_dim: bool,
     is_stick_reduction: bool = False,
+    is_fp8_stick: bool = False,
+    other_stick_size: int = 1,
+    stick_idx: int = -1,
+    tensor_idx: int = -1,
+    opfunc: str = "",
 ):
     return (
         {
@@ -839,17 +907,23 @@ def generate_sdsc(
                                     },
                                 }
                             },
+                            # Iterate args instead of sdsc_spec.layouts so _layout_info_for_tensor
+                            # receives the originating tensor and tensor_idx, allowing it to apply
+                            # any tensor-specific layout adjustments.
                             "primaryDsInfo_": {
-                                label: {
-                                    "layoutDimOrder_": [
-                                        str(dim) for dim in layout_info["dim_order"]
-                                    ],
-                                    "stickDimOrder_": [
-                                        str(layout_info["stick_dim_order"])
-                                    ],
-                                    "stickSize_": [layout_info["stick_size"]],
-                                }
-                                for label, layout_info in sdsc_spec.layouts.items()
+                                tensor.layout: (
+                                    lambda layout_info: {
+                                        "layoutDimOrder_": [
+                                            str(dim) for dim in layout_info["dim_order"]
+                                        ],
+                                        "stickDimOrder_": [
+                                            str(dim)
+                                            for dim in layout_info["stick_dim_order"]
+                                        ],
+                                        "stickSize_": layout_info["stick_size"],
+                                    }
+                                )(_layout_info_for_tensor(sdsc_spec, tensor, i))
+                                for i, tensor in enumerate(sdsc_spec.args)
                             },
                             "scheduleTree_": [
                                 {
@@ -870,9 +944,9 @@ def generate_sdsc(
                                     ],
                                     "maxDimSizes_": [
                                         tensor.max_dim_sizes[dim]
-                                        for dim in sdsc_spec.layouts[tensor.layout][
-                                            "dim_order"
-                                        ]
+                                        for dim in _layout_info_for_tensor(
+                                            sdsc_spec, tensor, i
+                                        )["dim_order"]
                                     ],
                                     **_build_indirect_access_fields(
                                         sdsc_spec, tensor, i
@@ -917,25 +991,40 @@ def generate_sdsc(
                                     "coordinates_": {
                                         "coordInfo": {
                                             str(dim): gen_coord_info_value(
-                                                size=sdsc_spec.iteration_space[dim]
-                                                // sdsc_spec.work_slices[dim]
-                                                if (tensor.scales[dim] == 1)
-                                                else 1,
-                                                nsplits=sdsc_spec.work_slices[dim]
-                                                if (tensor.scales[dim] == 1)
-                                                else 1,
+                                                size=(
+                                                    sdsc_spec.iteration_space[dim]
+                                                    // sdsc_spec.work_slices[dim]
+                                                    if tensor.scales[dim] == 1
+                                                    else 1
+                                                ),
+                                                nsplits=(
+                                                    sdsc_spec.work_slices[dim]
+                                                    if tensor.scales[dim] == 1
+                                                    else 1
+                                                ),
                                                 elems_per_stick=tensor.data_format.elems_per_stick(),
                                                 is_stick_dim=(
-                                                    sdsc_spec.layouts[tensor.layout][
-                                                        "stick_dim_order"
-                                                    ].has(dim)
+                                                    dim
+                                                    in _layout_info_for_tensor(
+                                                        sdsc_spec, tensor, tensor_idx=i
+                                                    )["stick_dim_order"]
                                                 ),
                                                 is_stick_reduction=(
                                                     tensor.scales[dim] == -2
                                                 ),
+                                                is_fp8_stick=is_fp8,
+                                                other_stick_size=other_sz,
+                                                stick_idx=st_idx,
+                                                tensor_idx=i,
+                                                opfunc=sdsc_spec.opfunc,
                                             )
-                                            for dim in sdsc_spec.layouts[tensor.layout][
-                                                "dim_order"
+                                            for dim in _layout_info_for_tensor(
+                                                sdsc_spec, tensor, tensor_idx=i
+                                            )["dim_order"]
+                                            for is_fp8, other_sz, st_idx in [
+                                                _compute_fp8_coord_params(
+                                                    tensor, dim, sdsc_spec, i
+                                                )
                                             ]
                                         },
                                         "coreIdToWkSlice_": {},
@@ -950,9 +1039,9 @@ def generate_sdsc(
                                     "dsType_": tensor.layout,
                                     "scale_": [
                                         tensor.scales[dim]
-                                        for dim in sdsc_spec.layouts[tensor.layout][
-                                            "dim_order"
-                                        ]
+                                        for dim in _layout_info_for_tensor(
+                                            sdsc_spec, tensor, i
+                                        )["dim_order"]
                                     ],
                                     "wordLength": num_bytes(tensor.data_format),
                                     "dataFormat_": tensor.data_format.name,
