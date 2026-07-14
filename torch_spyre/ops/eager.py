@@ -124,6 +124,7 @@ register_torch_compile_kernel(
         aten.clamp,
         aten.constant_pad_nd,
         aten.embedding.default,
+        aten._scaled_mm,
     ]
 )
 
