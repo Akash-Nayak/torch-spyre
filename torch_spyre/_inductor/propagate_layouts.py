@@ -385,7 +385,7 @@ def _qfp8wt_stl(
     """
     in_eps = get_elem_in_stick(in_layout.dtype)
     stick_dim_size = in_layout.size[-1]
-    unaligned = stick_dim_size % in_eps
+    unaligned = concretize_expr(stick_dim_size % in_eps)
     outer_sizes = [concretize_expr(s) for s in output.size[:-1]]
     outer_strides = [concretize_expr(s) for s in output.stride[:-1]]
     last_dim = in_eps if unaligned > 0 else concretize_expr(output.size[-1])

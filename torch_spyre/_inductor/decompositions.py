@@ -857,7 +857,7 @@ def scaled_mm_decomp(
     separation dequantize_fp8_with_scale_decomp uses for its FP8->FP16
     conversion.
     """
-    result = torch.ops.spyre.scaled_mm(mat1, mat2, out_dtype=out_dtype)
+    result = torch.ops.spyre.scaled_mm(mat1, mat2, out_dtype=out_dtype or torch.float16)
 
     if scale_a is not None:
         result = result * scale_a

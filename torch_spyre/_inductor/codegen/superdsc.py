@@ -373,13 +373,99 @@ def _get_device_dim_order(
     return dim_order, stick_dim
 
 
+def _get_semantic_tensor_type(
+    op_name: str,
+    tensor_index: int,
+    total_tensors: int,
+    layout_labels: list[str],
+) -> str:
+    """
+    Determine tensor type based on operation semantics, not position.
+    
+    This function replaces position-based tensor type assignment with semantic
+    detection that considers the operation's actual input/output/weight roles.
+    
+    Args:
+        op_name: Operation name (e.g., "qfp8ch", "batchmatmulfp8", "fp8todl16")
+        tensor_index: 0-based tensor position in operation
+        total_tensors: Total number of tensors in operation
+        layout_labels: Available layout labels for this operation type
+        
+    Returns:
+        Semantic tensor type: "INPUT", "OUTPUT", "KERNEL", or "KERNEL_IDX"
+        
+    Examples:
+        qfp8ch: INPUT (FP16) → OUTPUT (FP8)
+        fp8todl16: INPUT (FP8) → OUTPUT (FP16)
+        batchmatmulfp8: INPUT (act FP8) + KERNEL (wt FP8) → OUTPUT (FP16)
+    """
+    
+    # FP8 quantization operations (qfp8ch, qfp8wt, qfp8chil)
+    # Pattern: INPUT (FP16) → OUTPUT (FP8)
+    if op_name in ["qfp8ch", "qfp8wt", "qfp8chil"]:
+        if tensor_index == 0:
+            return "INPUT"   # Input tensor (FP16)
+        elif tensor_index == 1:
+            return "OUTPUT"  # Output tensor (FP8)
+    
+    # FP8 dequantization operations (fp8todl16)
+    # Pattern: INPUT (FP8) → OUTPUT (FP16)
+    elif op_name == "fp8todl16":
+        if tensor_index == 0:
+            return "INPUT"   # Input tensor (FP8)
+        elif tensor_index == 1:
+            return "OUTPUT"  # Output tensor (FP16)
+    
+    # FP8 matrix multiplication (batchmatmulfp8)
+    # Pattern: INPUT (activations FP8) + KERNEL (weights FP8) → OUTPUT (FP16)
+    elif op_name == "batchmatmulfp8":
+        if tensor_index == 0:
+            return "INPUT"   # Activation tensor (FP8)
+        elif tensor_index == 1:
+            return "KERNEL"  # Weight tensor (FP8)
+        elif tensor_index == 2:
+            return "OUTPUT"  # Output tensor (FP16)
+    
+    # Fallback: use position-based assignment for operations not listed above
+    # This maintains backward compatibility with existing operations
+    # (matmul, conv2d already have correct layout_labels order)
+    if tensor_index < len(layout_labels):
+        return layout_labels[tensor_index]
+    
+    # Safety fallback: if index out of range, use last label
+    return layout_labels[-1]
+
+
 def _get_layout_label(
     layouts: dict,
     dim_order: list,
     stick_dim_order: list,
     stick_size: list,
     layout_labels: list[str],
+    op_name: str | None = None,
+    tensor_index: int | None = None,
+    total_tensors: int | None = None,
 ) -> str:
+    """Get layout label for tensor.
+    
+    First checks if an existing layout matches the tensor's structure.
+    If not found, determines the appropriate label using semantic detection
+    (when op_name/tensor_index provided) or position-based fallback.
+    
+    Args:
+        layouts: Dictionary of existing layouts
+        dim_order: Dimension order for this tensor
+        stick_dim_order: Stick dimension order
+        stick_size: Stick size
+        layout_labels: Available layout labels for this operation type
+        op_name: Optional operation name for semantic type detection
+        tensor_index: Optional 0-based tensor position
+        total_tensors: Optional total number of tensors in operation
+        
+    Returns:
+        Layout label string (e.g., "INPUT", "OUTPUT", "KERNEL")
+    """
+    # Check for existing matching layout
     for label, layout in layouts.items():
         if (
             layout["stick_dim_order"] == stick_dim_order
@@ -387,7 +473,17 @@ def _get_layout_label(
             and layout["stick_size"] == stick_size
         ):
             return label
-    label = layout_labels[len(layouts)]
+    
+    # Determine new label using semantic detection if context available
+    if op_name is not None and tensor_index is not None and total_tensors is not None:
+        label = _get_semantic_tensor_type(
+            op_name, tensor_index, total_tensors, layout_labels
+        )
+    else:
+        # Fallback to position-based for backward compatibility
+        label = layout_labels[len(layouts)]
+    
+    # Register new layout
     layouts[label] = {
         "dim_order": dim_order,
         "stick_dim_order": stick_dim_order,
@@ -396,8 +492,51 @@ def _get_layout_label(
     return label
 
 
+def _flatten_device_size_for_ddl(
+    device_size: list[int],
+    *,
+    keep_trailing_dims: int,
+    max_dims: int = 3,
+) -> list[int]:
+    """Flatten leading device dims to satisfy the DDL dimension limit.
+
+    ``keep_trailing_dims`` preserves the trailing layout structure that SDSC/DDL
+    interprets semantically (for example the FP8 kernel's 2D stick).  Only the
+    leading outer dims are collapsed.
+    """
+    if len(device_size) <= max_dims:
+        return device_size
+
+    if keep_trailing_dims >= len(device_size):
+        return device_size
+
+    leading_dims = len(device_size) - keep_trailing_dims
+    allowed_leading_dims = max_dims - keep_trailing_dims
+    # Defensive check: allowed_leading_dims should always be >= 1 given current callers
+    # (max_dims=3, keep_trailing_dims<=2), but guard against future changes
+    assert allowed_leading_dims >= 1, (
+        f"Invalid flattening parameters: max_dims={max_dims}, "
+        f"keep_trailing_dims={keep_trailing_dims} results in "
+        f"allowed_leading_dims={allowed_leading_dims} < 1"
+    )
+    if leading_dims <= allowed_leading_dims:
+        return device_size
+
+    dims_to_flatten = leading_dims - allowed_leading_dims + 1
+    flattened_dim = math.prod(device_size[:dims_to_flatten])
+    result = [flattened_dim] + device_size[dims_to_flatten:]
+
+    logger.debug(
+        "Flattened device_size for DDL from %s to %s (keep_trailing_dims=%s)",
+        device_size,
+        result,
+        keep_trailing_dims,
+    )
+    return result
+
+
 def _get_padded_iteration_space(
-    op_spec_args: list[TensorArg],
+    op_spec_args,
     sdsc_args: list[SDSCArgs],
     sdsc_iteration_space: dict,
     layouts: dict,
@@ -977,6 +1116,40 @@ def _create_sdsc_tensors(
 
     for i, arg in enumerate(op_spec.args):
         is_fp8_mm_kernel_arg = arg.element_arrangement == ElementArrangement.QFP8WT
+        is_fp8_quantization_arg = arg.element_arrangement in [
+            ElementArrangement.QFP8WT,
+            ElementArrangement.QFP8CH,
+        ]
+
+        # Flatten device_size only when needed for DDL, preserving the trailing
+        # dimensions that encode the stick structure.
+        # For FP8 matrix multiplication KERNEL args, preserve 2D stick [2, 64].
+        # For FP8 quantization operations (qfp8wt, qfp8ch), preserve full 3D layout
+        # as required by the scheduler for proper work distribution.
+        original_device_size = arg.device_size
+        if is_fp8_quantization_arg or is_fp8_mm_kernel_arg:
+            # Flatten but preserve 2D stick structure for FP8 operations
+            flattened_device_size = _flatten_device_size_for_ddl(
+                original_device_size,
+                keep_trailing_dims=2,
+            )
+        else:
+            # Regular tensors: preserve only last dimension (1D stick)
+            flattened_device_size = _flatten_device_size_for_ddl(
+                original_device_size,
+                keep_trailing_dims=1,
+            )
+        
+        if flattened_device_size != original_device_size:
+            arg = dataclasses.replace(arg, device_size=flattened_device_size)
+            logger.info(
+                "Flattened device_size for arg %s (%s): %s -> %s",
+                i,
+                arg.name or "unnamed",
+                original_device_size,
+                flattened_device_size,
+            )
+
 
         # Step 1: Determine dimension order and stick dimension.
         # Index tensors use their pre-computed layout (their coords have no IndirectAccess).
@@ -1200,13 +1373,41 @@ def _create_sdsc_tensors(
                 logger,
             )
         else:
-            label = _get_layout_label(
-                layouts,
-                dim_order,
-                effective_stick,
-                layout_stick_size,
-                layout_labels,
-            )
+            # For FP8 KERNEL tensors (qfp8wt), force KERNEL label instead of position-based assignment
+            if is_fp8_mm_kernel_arg:
+                # Check if KERNEL layout already exists with same structure
+                kernel_label = None
+                for existing_label, layout in layouts.items():
+                    if (
+                        existing_label == "KERNEL"
+                        and layout["stick_dim_order"] == effective_stick
+                        and Counter(layout["dim_order"]) == Counter(dim_order)
+                        and layout["stick_size"] == layout_stick_size
+                    ):
+                        kernel_label = existing_label
+                        break
+                
+                if kernel_label is None:
+                    # Create new KERNEL layout entry
+                    layouts["KERNEL"] = {
+                        "dim_order": dim_order,
+                        "stick_dim_order": effective_stick,
+                        "stick_size": layout_stick_size,
+                    }
+                    label = "KERNEL"
+                else:
+                    label = kernel_label
+            else:
+                label = _get_layout_label(
+                    layouts,
+                    dim_order,
+                    effective_stick,
+                    layout_stick_size,
+                    layout_labels,
+                    op_name=op_spec.op,
+                    tensor_index=i,
+                    total_tensors=len(op_spec.args),
+                )
 
         # Index tensors carry 32-bit integer indices; re-label as SENUINT32 since
         # the backend doesn't yet accept IEEE_INT32 in SDSC (deeptools #4307).

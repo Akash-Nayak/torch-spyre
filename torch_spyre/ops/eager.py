@@ -34,6 +34,18 @@ def compile_once(op, **compile_kwargs):
         def wrapper(*args, **kwargs):
             nonlocal compiled
             nonlocal op
+            
+            # Check if we're inside no_dispatch() (e.g., FakeTensorMode during tracing)
+            # If so, skip compilation and call the op directly to avoid re-entrancy issues
+            if torch._C._dispatch_tls_is_dispatch_key_excluded("Python"):
+                # Inside no_dispatch() - call op directly without compilation
+                if compiled is None and isinstance(op, str):
+                    op = operator.attrgetter(op)(torch.ops)
+                actual_op = compiled if compiled is not None else op
+                # Call without the 'compiled' parameter since we're in fake mode
+                return actual_op(*args, **kwargs)
+            
+            # Normal path: compile once and cache
             if compiled is None:
                 if isinstance(op, str):
                     op = operator.attrgetter(op)(torch.ops)
@@ -239,6 +251,7 @@ register_torch_compile_kernel(
         aten.clamp,
         aten.constant_pad_nd,
         aten.embedding.default,
+        aten._scaled_mm,
     ]
 )
 
