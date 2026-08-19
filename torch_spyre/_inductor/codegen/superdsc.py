@@ -20,15 +20,15 @@ from typing import Any
 from sympy import Expr, Integer, Symbol
 from torch._inductor.virtualized import V
 
-from torch_spyre._C import DataFormats
+from torch_spyre._C import DataFormats, ElementArrangement
 from torch_spyre._inductor import config as _spyre_config
-from torch_spyre._C import ElementArrangement
 from torch_spyre._inductor.constants import (
     CONV2D_DIM_LABELS,
     CONV2D_FWD_OP,
     CONV2D_LAYOUT_LABELS,
     CONV_DIM_LABELS,
     CONV_OPS,
+    DEPTHWISE_CONV2D_OP,
     IDENTITY_OP,
     INPUT_DIM_LABELS,
     LAYOUT_LABELS,
@@ -40,7 +40,6 @@ from torch_spyre._inductor.constants import (
     POOL_OPS,
     QUANTSCALEPERTOKENFP8_OP,
     RESTICKIFY_OP,
-    DEPTHWISE_CONV2D_OP,
     TOPK_OPS,
 )
 from torch_spyre._inductor.core_mapping import core_to_slice_mapping
