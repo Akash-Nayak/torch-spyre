@@ -1182,23 +1182,26 @@ def _create_sdsc_tensors(
 
     for i, arg in enumerate(op_spec.args):
         is_fp8_mm_kernel_arg = arg.element_arrangement == ElementArrangement.QFP8WT
-        # Flatten device_size only when needed for DDL, preserving the trailing
-        # dimensions that encode the stick structure.
-        original_device_size = arg.device_size
-        keep_trailing_dims = 2 if is_fp8_mm_kernel_arg else 1
-        flattened_device_size = _flatten_device_size_for_ddl(
-            original_device_size,
-            keep_trailing_dims=keep_trailing_dims,
-        )
-        if flattened_device_size != original_device_size:
-            arg = dataclasses.replace(arg, device_size=flattened_device_size)
-            logger.info(
-                "Flattened device_size for arg %s (%s): %s -> %s",
-                i,
-                arg.name or "unnamed",
+        # Flatten device_size for QFP8WT tensors in ops that use the 2D-stick layout
+        # (qfp8wt and batchmatmulfp8). fp8todl16 reads a QFP8WT-arranged tensor but
+        # uses a 1D flat FP8 input — its device_size is already within DDL limits.
+        # Non-QFP8WT tensors must not be flattened: their 4D device_size encodes
+        # correct per-dim strides; collapsing leading dims corrupts stride_idx lookups.
+        if is_fp8_mm_kernel_arg and op_spec.op in ("batchmatmulfp8", "qfp8wt"):
+            original_device_size = arg.device_size
+            flattened_device_size = _flatten_device_size_for_ddl(
                 original_device_size,
-                flattened_device_size,
+                keep_trailing_dims=2,
             )
+            if flattened_device_size != original_device_size:
+                arg = dataclasses.replace(arg, device_size=flattened_device_size)
+                logger.info(
+                    "Flattened device_size for arg %s (%s): %s -> %s",
+                    i,
+                    arg.name or "unnamed",
+                    original_device_size,
+                    flattened_device_size,
+                )
         # Step 1: Determine dimension order and stick dimension.
         # Index tensors use their pre-computed layout (their coords have no IndirectAccess).
         if has_indirect_access and i in index_tensor_layouts:
@@ -1424,10 +1427,14 @@ def _create_sdsc_tensors(
         effective_stick = [op_stick_dim if stick_dim is None else stick_dim]
         layout_labels = _get_tensor_layout_labels(use_op_dims, op_spec.op)
 
-        # Special handling for FP8 matmul KERNEL tensor
+        # Special handling for QFP8WT KERNEL tensors.
+        # Both qfp8wt (weight quantization) and batchmatmulfp8 (the consumer) require
+        # a 2D stick [2, stick_size/2] — mandated by quantization_no_pad.ddl and
+        # the batchmatmul DDL respectively. fp8todl16 also carries a QFP8WT-arranged
+        # tensor as input but uses a 1D flat FP8 input (quantization_double_pad.ddl).
         dtype_stick_size = arg.device_dtype.elems_per_stick()
         layout_stick_size = [dtype_stick_size]
-        if is_fp8_mm_kernel_arg:
+        if is_fp8_mm_kernel_arg and op_spec.op in ("batchmatmulfp8", "qfp8wt"):
             # FP8 KERNEL needs 2D stick: [2, stick_size/2]
             layout_stick_size = [2, dtype_stick_size // 2]
             # Use the last two dimensions from dim_order for 2D stick

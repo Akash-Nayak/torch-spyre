@@ -1468,27 +1468,29 @@ def generate_sdsc(
                             },
                             # Iterate args instead of sdsc_spec.layouts so _layout_info_for_tensor
                             # receives the originating tensor and tensor_idx, allowing it to apply
-                            # any tensor-specific layout adjustments.
+                            # any tensor-specific layout adjustments (e.g. FP8 2D-stick override).
                             "primaryDsInfo_": {
-                                label: {
-                                    "layoutDimOrder_": [
-                                        str(dim)
-                                        for dim in _filter_window_dims(
-                                            layout_info["dim_order"], label
-                                        )
-                                    ],
-                                    "stickDimOrder_": [
-                                        str(dim)
-                                        for dim in layout_info["stick_dim_order"]
-                                    ],
-                                    "stickSize_": layout_info["stick_size"],
-                                    **(
-                                        {"stickRepl_": [1]}
-                                        if sdsc_spec.stick_replication
-                                        else {}
-                                    ),
-                                }
-                                for label, layout_info in sdsc_spec.layouts.items()
+                                tensor.layout: (
+                                    lambda layout_info, label=tensor.layout: {
+                                        "layoutDimOrder_": [
+                                            str(dim)
+                                            for dim in _filter_window_dims(
+                                                layout_info["dim_order"], label
+                                            )
+                                        ],
+                                        "stickDimOrder_": [
+                                            str(dim)
+                                            for dim in layout_info["stick_dim_order"]
+                                        ],
+                                        "stickSize_": layout_info["stick_size"],
+                                        **(
+                                            {"stickRepl_": [1]}
+                                            if sdsc_spec.stick_replication
+                                            else {}
+                                        ),
+                                    }
+                                )(_layout_info_for_tensor(sdsc_spec, tensor, i))
+                                for i, tensor in enumerate(sdsc_spec.args)
                             },
                             **(
                                 {"pdsRelation_": {"isPdsReuse": 1}}
