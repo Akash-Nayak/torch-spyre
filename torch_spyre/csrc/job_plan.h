@@ -25,9 +25,11 @@
 #include <memory>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
-#include "util/spyrecode.h"
+#include "spyrecode-host-functions/fast_process_hcm.h"
+#include "spyrecode-host-functions/spyrecode.h"
 
 namespace spyre {
 
@@ -254,7 +256,10 @@ class JobPlanStep {
   }
 
  protected:
-  bool pipeline_barrier_ = false;
+  // true by default: every step is a potential consumer that should wait for
+  // prior ops. Steps that are genuinely overlap-eligible (HostCompute) opt out
+  // explicitly.
+  bool pipeline_barrier_ = true;
 };
 
 /**
@@ -311,22 +316,44 @@ class JobPlanStepH2D final : public JobPlanStep {
 class JobPlanStepD2H final : public JobPlanStep {
  public:
   /**
+   * @brief Device memory virtual address representation
+   *
+   */
+  struct Dmva {
+    uint64_t value;
+  };
+
+  /**
    * @brief Construct D2H step
    *
    * @param device_address Device memory address
    * @param host_address Host memory address (caller manages lifetime)
+   * @param size Size of data to transfer
    */
-  JobPlanStepD2H(flex::CompositeAddress device_address, void* host_address)
+  JobPlanStepD2H(flex::CompositeAddress device_address, void* host_address,
+                 size_t size)
       : device_address_(std::move(device_address)),
-        host_address_(host_address) {}
+        host_address_(host_address),
+        size_(size) {}
+
+  /**
+   * @brief Construct D2H step
+   *
+   * @param dmva Device memory virtual address
+   * @param host_address Host memory address (caller manages lifetime)
+   * @param size Size of data to transfer
+   */
+  JobPlanStepD2H(uint64_t dmva, void* host_address, size_t size)
+      : device_address_(Dmva{dmva}), host_address_(host_address), size_(size) {}
 
   void construct(LaunchContext& ctx, const SpyreStream& stream) const override;
 
   void write(std::ostream& os) const override;
 
  private:
-  flex::CompositeAddress device_address_;
+  std::variant<flex::CompositeAddress, Dmva> device_address_;
   void* host_address_;
+  size_t size_;
 };
 
 /**
@@ -361,6 +388,10 @@ class JobPlanStepCompute final : public JobPlanStep {
         bind_io_addresses_(bind_io_addresses),
         bootstrap_offset_(bootstrap_offset),
         name_(std::move(name)) {}
+
+  const std::string& getName() const {
+    return name_;
+  }
 
   void construct(LaunchContext& ctx, const SpyreStream& stream) const override;
 
@@ -407,7 +438,18 @@ class JobPlanStepHostCompute final : public JobPlanStep {
       : hcm_(std::move(hcm)),
         output_buffer_(output_buffer),
         input_buffer_(input_buffer),
-        ishape_(ishape) {}
+        ishape_(std::move(ishape)) {
+    pipeline_barrier_ = false;  // host callbacks are overlap-eligible
+
+    // Try to build fast plan at construction time (prepare time)
+    if (hcm_) {
+      fast_plan_.valid = deeptools::buildFastHcmPatchPlan(fast_plan_, *hcm_);
+      if (!fast_plan_.valid) {
+        // Mark as permanently invalid so we don't retry
+        fast_plan_.output_size = UINT32_MAX;
+      }
+    }
+  }
 
   void construct(LaunchContext& ctx, const SpyreStream& stream) const override;
 
@@ -418,6 +460,9 @@ class JobPlanStepHostCompute final : public JobPlanStep {
   void* output_buffer_;       // Non-owning pointer (JobPlan owns the buffer)
   const void* input_buffer_;  // Non-owning pointer (JobPlan owns the buffer)
   std::vector<int64_t> ishape_;
+
+  // Pre-compiled patch plan for fast execution
+  mutable deeptools::FastHcmPatchPlan fast_plan_;
 };
 
 /**
