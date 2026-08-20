@@ -1099,18 +1099,23 @@ def _flatten_device_size_for_ddl(
     *,
     keep_trailing_dims: int,
     max_dims: int = 3,
-) -> list[int]:
+) -> tuple[list[int], int]:
     """Flatten leading device dims to satisfy the DDL dimension limit.
 
     ``keep_trailing_dims`` preserves the trailing layout structure that SDSC/DDL
     interprets semantically (for example the FP8 kernel's 2D stick).  Only the
     leading outer dims are collapsed.
+
+    Returns ``(flattened_size, dims_to_flatten)`` so the caller can apply the
+    same collapse to ``device_coordinates`` via
+    ``_flatten_device_coordinates_for_ddl``.  ``dims_to_flatten`` is 0 when no
+    flattening was needed.
     """
     if len(device_size) <= max_dims:
-        return device_size
+        return device_size, 0
 
     if keep_trailing_dims >= len(device_size):
-        return device_size
+        return device_size, 0
 
     leading_dims = len(device_size) - keep_trailing_dims
     allowed_leading_dims = max_dims - keep_trailing_dims
@@ -1122,7 +1127,7 @@ def _flatten_device_size_for_ddl(
         f"allowed_leading_dims={allowed_leading_dims} < 1"
     )
     if leading_dims <= allowed_leading_dims:
-        return device_size
+        return device_size, 0
 
     dims_to_flatten = leading_dims - allowed_leading_dims + 1
     flattened_dim = math.prod(device_size[:dims_to_flatten])
@@ -1134,7 +1139,30 @@ def _flatten_device_size_for_ddl(
         result,
         keep_trailing_dims,
     )
-    return result
+    return result, dims_to_flatten
+
+
+def _flatten_device_coordinates_for_ddl(
+    device_coordinates: list,
+    dims_to_flatten: int,
+) -> list:
+    """Collapse the leading ``dims_to_flatten`` device coordinates to a single zero.
+
+    Mirrors ``_flatten_device_size_for_ddl``.  For QFP8WT kernel tensors the
+    leading outer-batch coordinates are always compile-time constants (all zero
+    for a single partition), so the combined linear offset of the collapsed dims
+    is zero and can be represented by a single ``sympy.S.Zero`` entry.  This
+    keeps ``device_coordinates`` and ``device_size`` in sync so that the
+    ``coord_idx = -stride_idx - 2`` lookups in ``_create_sdsc_tensors`` index
+    the correct physical axis after flattening.
+    """
+    import sympy
+
+    if dims_to_flatten <= 1:
+        return device_coordinates
+    # Collapse the first dims_to_flatten entries into a single zero.
+    # (They are the outer-batch coords that are 0 for single-partition execution.)
+    return [sympy.S.Zero] + list(device_coordinates[dims_to_flatten:])
 
 
 def _create_sdsc_tensors(
@@ -1182,19 +1210,30 @@ def _create_sdsc_tensors(
 
     for i, arg in enumerate(op_spec.args):
         is_fp8_mm_kernel_arg = arg.element_arrangement == ElementArrangement.QFP8WT
-        # Flatten device_size for QFP8WT tensors in ops that use the 2D-stick layout
-        # (qfp8wt and batchmatmulfp8). fp8todl16 reads a QFP8WT-arranged tensor but
-        # uses a 1D flat FP8 input — its device_size is already within DDL limits.
-        # Non-QFP8WT tensors must not be flattened: their 4D device_size encodes
-        # correct per-dim strides; collapsing leading dims corrupts stride_idx lookups.
+        # Flatten device_size (and device_coordinates) for QFP8WT tensors in ops
+        # that use the 2D-stick layout (qfp8wt and batchmatmulfp8). fp8todl16 reads
+        # a QFP8WT-arranged tensor but uses a 1D flat FP8 input — its device_size is
+        # already within DDL limits. Non-QFP8WT tensors must not be flattened: their
+        # 4D device_size encodes correct per-dim strides; collapsing leading dims
+        # corrupts stride_idx lookups.
+        # device_coordinates must be co-flattened with device_size so that the
+        # coord_idx = -stride_idx - 2 lookups in the loop below index the correct
+        # physical axis after flattening.
         if is_fp8_mm_kernel_arg and op_spec.op in ("batchmatmulfp8", "qfp8wt"):
             original_device_size = arg.device_size
-            flattened_device_size = _flatten_device_size_for_ddl(
+            flattened_device_size, dims_to_flatten = _flatten_device_size_for_ddl(
                 original_device_size,
                 keep_trailing_dims=2,
             )
             if flattened_device_size != original_device_size:
-                arg = dataclasses.replace(arg, device_size=flattened_device_size)
+                flattened_coords = _flatten_device_coordinates_for_ddl(
+                    arg.device_coordinates, dims_to_flatten
+                )
+                arg = dataclasses.replace(
+                    arg,
+                    device_size=flattened_device_size,
+                    device_coordinates=flattened_coords,
+                )
                 logger.info(
                     "Flattened device_size for arg %s (%s): %s -> %s",
                     i,

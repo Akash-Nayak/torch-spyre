@@ -35,6 +35,13 @@ from utils_inductor import (
 FP8_E4M3_MAX_SPACING = 32.0
 
 
+def _fp8_reference_quantize_dequantize(x, scale):
+    """CPU reference for FP8 quantize→dequantize: clamp, cast to FP8, cast back, rescale."""
+    return (x / scale).clamp(FP8_E4M3FN_MIN, FP8_E4M3FN_MAX).to(
+        torch.float8_e4m3fn
+    ).to(torch.float16) * scale
+
+
 class TestFP8Operations:
     """Test suite for FP8 quantization operations not covered in test_inductor_ops.py."""
 
@@ -62,8 +69,7 @@ class TestFP8Operations:
 
         def pytorch_fn(x, scale):
             # CPU reference: direct format conversion with identity scale
-            x_fp8 = x.clamp(FP8_E4M3FN_MIN, FP8_E4M3FN_MAX).to(torch.float8_e4m3fn)
-            return x_fp8.to(torch.float16) * scale
+            return _fp8_reference_quantize_dequantize(x, scale)
 
         compare_with_pytorch(
             spyre_fn,
@@ -105,8 +111,7 @@ class TestFP8Operations:
 
         def pytorch_fn(x, scale):
             # CPU reference: FP16 → FP8 → FP16 conversion with identity scale
-            x_fp8 = x.clamp(FP8_E4M3FN_MIN, FP8_E4M3FN_MAX).to(torch.float8_e4m3fn)
-            return x_fp8.to(torch.float16) * scale
+            return _fp8_reference_quantize_dequantize(x, scale)
 
         compare_with_pytorch(
             spyre_fn,
@@ -243,9 +248,7 @@ class TestFP8Operations:
             return torch.ops.spyre.dequantize_fp8_with_scale(x_fp8, scale)
 
         def pytorch_fn(x, scale):
-            return (x / scale).clamp(FP8_E4M3FN_MIN, FP8_E4M3FN_MAX).to(
-                torch.float8_e4m3fn
-            ).to(torch.float16) * scale
+            return _fp8_reference_quantize_dequantize(x, scale)
 
         compare_with_pytorch(spyre_fn, pytorch_fn, x, scale, atol=0.5, rtol=0.1)
 
@@ -299,9 +302,7 @@ class TestFP8Operations:
             return torch.ops.spyre.dequantize_fp8_with_scale(x_fp8, scale)
 
         def pytorch_fn(x, scale):
-            return (x / scale).clamp(FP8_E4M3FN_MIN, FP8_E4M3FN_MAX).to(
-                torch.float8_e4m3fn
-            ).to(torch.float16) * scale
+            return _fp8_reference_quantize_dequantize(x, scale)
 
         compare_with_pytorch(
             spyre_fn,

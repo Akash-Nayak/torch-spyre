@@ -255,11 +255,14 @@ def _layout_info_for_tensor(sdsc_spec, tensor, tensor_idx: int) -> dict:
         and tensor.data_format == DataFormats.SEN143_FP8
         and layout_info["stick_size"] == _FP8_FLAT_STICK_SIZE
     ):
-        # Validate that dim_order is 2D for the 2D stick override
+        # Validate that dim_order has at least 2 dims for the 2D stick override.
+        # After DDL flattening a higher-rank tensor may produce a 3-element dim_order
+        # (one collapsed leading dim + the two trailing stick dims), which is fine —
+        # we only need the last two entries for the 2D stick metadata.
         dim_order = layout_info["dim_order"]
-        if len(dim_order) != 2:
+        if len(dim_order) < 2:
             raise ValueError(
-                f"FP8 batchmatmul kernel tensor expected 2D dim_order, got {len(dim_order)}D: {dim_order}"
+                f"FP8 batchmatmul kernel tensor expected at least 2D dim_order, got {len(dim_order)}D: {dim_order}"
             )
         return {
             **layout_info,
@@ -271,10 +274,10 @@ def _layout_info_for_tensor(sdsc_spec, tensor, tensor_idx: int) -> dict:
 
 def _compute_fp8_coord_params(
     tensor, dim, sdsc_spec, tensor_idx: int
-) -> tuple[bool, int, int]:
+) -> tuple[bool, int]:
     """Compute FP8 2D stick coordinate parameters for a dimension.
 
-    Returns tuple: (is_fp8_stick, other_stick_size, stick_idx)
+    Returns tuple: (is_fp8_stick, stick_idx)
     """
     layout_info = _layout_info_for_tensor(sdsc_spec, tensor, tensor_idx)
     stick_size_list = layout_info["stick_size"]
@@ -286,15 +289,11 @@ def _compute_fp8_coord_params(
 
     if dim in stick_dim_order and len(stick_size_list) > 1:
         stick_idx = stick_dim_order.index(dim)
-        other_idx = 1 - stick_idx
-        other_stick_size = stick_size_list[other_idx]
     else:
         stick_idx = -1
-        other_stick_size = 1
 
     return (
         bool(is_fp8_stick),
-        int(other_stick_size),
         int(stick_idx),
     )
 
@@ -308,7 +307,6 @@ def gen_coord_info_value(
     conv_params=None,
     padding: str = "nopad",
     is_fp8_stick: bool = False,
-    other_stick_size: int = 1,
     stick_idx: int = -1,
     tensor_idx: int = -1,
     opfunc: str = "",
@@ -1201,7 +1199,7 @@ def generate_sdsc(
             # depthwise and every other op.
             dim_size = _coord_size(dim_str, sdsc_spec.iteration_space[dim], is_input)
             size = _coord_per_core_size(dim, is_input, nsplits) if is_tiled else 1
-            is_fp8, _, st_idx = _compute_fp8_coord_params(tensor, dim, sdsc_spec, tensor_idx)
+            is_fp8, st_idx = _compute_fp8_coord_params(tensor, dim, sdsc_spec, tensor_idx)
             conv_params = (
                 get_conv_params(
                     tensor_idx,
@@ -1490,6 +1488,12 @@ def generate_sdsc(
                                         ),
                                     }
                                 )(_layout_info_for_tensor(sdsc_spec, tensor, i))
+                                # Keyed by tensor.layout (the layout-role label assigned by
+                                # _get_layout_label). Two tensors share a label only when their
+                                # dim_order, stick_dim_order, and stick_size are all identical —
+                                # in that case the values are equal too, so the overwrite is
+                                # harmless. If the same label could map to distinct layouts in
+                                # the future, key by (i, tensor.layout) instead.
                                 for i, tensor in enumerate(sdsc_spec.args)
                             },
                             **(
