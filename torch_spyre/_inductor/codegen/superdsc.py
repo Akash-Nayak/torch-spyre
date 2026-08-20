@@ -63,7 +63,7 @@ from torch_spyre._inductor.op_spec import (
 )
 from torch_spyre._inductor.pass_utils import coeff_through_floor
 
-from .compute_ops import SymbolKind, generate_sdsc, num_bytes
+from .compute_ops import FP8_2D_STICK_OPS, SymbolKind, generate_sdsc, num_bytes
 
 logger = get_inductor_logger("codegen.superdsc")
 
@@ -1099,6 +1099,8 @@ def _flatten_device_size_for_ddl(
     *,
     keep_trailing_dims: int,
     max_dims: int = 3,
+    # NOTE: Return type is tuple[list[int], int] — a breaking change from the
+    # original list[int] return. All call-sites must unpack both values.
 ) -> tuple[list[int], int]:
     """Flatten leading device dims to satisfy the DDL dimension limit.
 
@@ -1155,13 +1157,28 @@ def _flatten_device_coordinates_for_ddl(
     keeps ``device_coordinates`` and ``device_size`` in sync so that the
     ``coord_idx = -stride_idx - 2`` lookups in ``_create_sdsc_tensors`` index
     the correct physical axis after flattening.
+
+    Precondition: all collapsed leading coordinates must be zero — only valid
+    for single-partition compilation where outer-batch coords are unused.
     """
     import sympy
 
-    if dims_to_flatten <= 1:
+    # dims_to_flatten == 0 means _flatten_device_size_for_ddl found no flattening
+    # needed; dims_to_flatten == 1 would be a no-op (collapsing one dim into itself).
+    # _flatten_device_size_for_ddl never returns 1, so <= 1 guards both cases.
+    if dims_to_flatten <= 0:
         return device_coordinates
+    assert dims_to_flatten >= 2, (
+        f"dims_to_flatten={dims_to_flatten} is unexpected; "
+        f"_flatten_device_size_for_ddl should never return 1"
+    )
+    # Precondition: all collapsed leading coords must be zero.
+    # Outer-batch coordinates are always 0 for single-partition execution.
+    assert all(c == sympy.S.Zero for c in device_coordinates[:dims_to_flatten]), (
+        f"Expected all-zero leading coordinates for DDL flattening, got: "
+        f"{device_coordinates[:dims_to_flatten]}"
+    )
     # Collapse the first dims_to_flatten entries into a single zero.
-    # (They are the outer-batch coords that are 0 for single-partition execution.)
     return [sympy.S.Zero] + list(device_coordinates[dims_to_flatten:])
 
 
@@ -1219,7 +1236,7 @@ def _create_sdsc_tensors(
         # device_coordinates must be co-flattened with device_size so that the
         # coord_idx = -stride_idx - 2 lookups in the loop below index the correct
         # physical axis after flattening.
-        if is_fp8_mm_kernel_arg and op_spec.op in ("batchmatmulfp8", "qfp8wt"):
+        if is_fp8_mm_kernel_arg and op_spec.op in FP8_2D_STICK_OPS:
             original_device_size = arg.device_size
             flattened_device_size, dims_to_flatten = _flatten_device_size_for_ddl(
                 original_device_size,

@@ -252,38 +252,68 @@ class TestFP8Operations:
 
         compare_with_pytorch(spyre_fn, pytorch_fn, x, scale, atol=0.5, rtol=0.1)
 
-    def test_quantize_weight_fp8_with_scale_eager_mode(self):
-        """Test quantize_weight_fp8_with_scale in eager mode.
+    def test_quantize_weight_fp8_with_scale_eager_mode_dtype_only(self):
+        """Regression guard: quantize_weight_fp8_with_scale returns valid FP8 in eager mode.
 
-        Validates that quantize_weight_fp8_with_scale executes correctly in
-        eager mode via the compile_once decorator (previously would have raised
-        AttributeError at import time due to the missing @torch.library.custom_op
-        decorator).
+        Guards against the regression fixed in commit 8f2e78ff where a duplicate
+        @torch.library.custom_op registration (with a pass body) silently overwrote
+        the real implementation at import time, causing the op to return None in
+        eager mode. A None return fails verify_fp8_dtype immediately.
 
-        Runs in eager (non-compiled) mode to exercise the compile_once path.
-        Verifies that the output has FP8 E4M3 dtype, and that the quantized
-        values (when cast back to FP16) are numerically close to the reference.
-
-        Note: This test does not verify that the weight-specific qfp8wt kernel
-        path is used rather than the activation qfp8ch path. Kernel path
-        verification would require op tracing or mock assertions.
+        This test intentionally checks dtype and shape only — not numerical correctness.
+        The qfp8wt op produces a QFP8WT 2D-stick physical layout that is opaque to
+        fp8todl16 (dequantize uses a 1D flat read), so a naive quantize→dequantize
+        roundtrip will not match a CPU reference. Numerical correctness of the
+        qfp8wt → batchmatmulfp8 path is covered by test_fp8_scaled_mm in
+        test_inductor_ops.py.
         """
         weight = cached_randn((128, 128), dtype=torch.float16, scale=1.0)
         scale = torch.max(torch.abs(weight)).reshape(1)
         weight_d = weight.to(DEVICE)
         scale_d = scale.to(DEVICE)
 
-        # Run quantize in eager mode to exercise the compile_once decorator path.
-        # Primary assertion: the op executes without error and returns FP8 output.
-        # (Numerical correctness of the weight quantization format is verified
-        # end-to-end in test_fp8_scaled_mm via the _scaled_mm path.)
+        # Call directly without torch.compile — exercises the compile_once eager path.
         quantized = torch.ops.spyre.quantize_weight_fp8_with_scale(weight_d, scale_d)
-        verify_fp8_dtype(quantized)
 
-        # Verify shape is preserved
+        verify_fp8_dtype(quantized)
         assert quantized.shape == weight_d.shape, (
             f"Expected shape {weight_d.shape}, got {quantized.shape}"
         )
+
+    def test_dequantize_fp8_with_scale_eager_mode(self):
+        """Test dequantize_fp8_with_scale in eager mode.
+
+        Validates that dequantize_fp8_with_scale now works in eager mode via
+        the compile_once decorator (previously required torch.compile and
+        returned None when called directly).
+
+        Uses quantize_fp8_with_scale (qfp8ch path) to produce the FP8 input
+        since that path produces a flat QFP8CH layout compatible with
+        fp8todl16. Verifies dtype, shape, and numerical correctness.
+        """
+        x = cached_randn((1, 2, 8), dtype=torch.float16, scale=1.0)
+        scale = torch.tensor([1.0], dtype=torch.float16)
+        x_d = x.to(DEVICE)
+        scale_d = scale.to(DEVICE)
+
+        x_fp8 = torch.ops.spyre.quantize_fp8_with_scale(x_d, scale_d)
+        dequantized = torch.ops.spyre.dequantize_fp8_with_scale(x_fp8, scale_d)
+
+        # Verify output dtype and shape.
+        verify_fp16_dtype(dequantized)
+        assert dequantized.shape == x_d.shape, (
+            f"Expected shape {x_d.shape}, got {dequantized.shape}"
+        )
+
+        # Numerical roundtrip: compare to CPU reference.
+        def spyre_fn(inp, s):
+            q = torch.ops.spyre.quantize_fp8_with_scale(inp, s)
+            return torch.ops.spyre.dequantize_fp8_with_scale(q, s)
+
+        def pytorch_fn(inp, s):
+            return _fp8_reference_quantize_dequantize(inp, s)
+
+        compare_with_pytorch(spyre_fn, pytorch_fn, x, scale, atol=0.5, rtol=0.1)
 
     def _run_quantize_dequantize_fp8_test(
         self,

@@ -782,27 +782,28 @@ def _(input: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
 @torch.library.custom_op(
     "spyre::dequantize_fp8_with_scale", mutates_args=(), device_types="spyre"
 )
-def dequantize_fp8_with_scale(input: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:  # type: ignore[empty-body]
+@compile_once("spyre.dequantize_fp8_with_scale")
+def dequantize_fp8_with_scale(input: torch.Tensor, scale: torch.Tensor, compiled) -> torch.Tensor:
     """
     Dequantize FP8 tensor to FP16 using pre-computed scale.
+
     Performs two steps:
     1. Convert FP8 to FP16: x_fp16 = fp8todl16(x) (dtype conversion)
     2. Scale the output: x_scaled = x_fp16 * scale (POINTWISE)
+
     Args:
         input: Input tensor (FP8) to dequantize, shape [batch, seq, hidden]
         scale: Dequantization scale (FP16), shape [batch, seq, 1]
+
     Returns:
         FP16 tensor (same shape as input)
-    Example:
-        >>> @torch.compile(backend='inductor')
-        >>> def dequant(x_fp8, scale):
-        >>>     return torch.ops.spyre.dequantize_fp8_with_scale(x_fp8, scale)
+
     Note:
-        - MUST use torch.compile(backend='inductor') - does not work in eager mode
+        - Supports eager mode via compile_once decorator
         - Uses fp8todl16 operation for FP8→FP16 conversion
         - Scale must be FP16, NOT FP32
     """
-    pass
+    return compiled(input, scale)
 
 
 @dequantize_fp8_with_scale.register_fake
