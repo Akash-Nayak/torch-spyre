@@ -1243,6 +1243,8 @@ def _create_sdsc_tensors(
                 keep_trailing_dims=2,
             )
             if flattened_device_size != original_device_size:
+                # Precondition: leading outer-batch coords are 0 for single-partition
+                # compilation. See _flatten_device_coordinates_for_ddl for details.
                 flattened_coords = _flatten_device_coordinates_for_ddl(
                     arg.device_coordinates, dims_to_flatten
                 )

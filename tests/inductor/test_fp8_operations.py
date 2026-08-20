@@ -252,6 +252,27 @@ class TestFP8Operations:
 
         compare_with_pytorch(spyre_fn, pytorch_fn, x, scale, atol=0.5, rtol=0.1)
 
+    def test_quantize_dequantize_fp8_4d_shape(self):
+        """Test FP8 quantize/dequantize with a 4D input tensor.
+
+        Exercises the len(dim_order) < 2 relaxation in _layout_info_for_tensor
+        and the _flatten_device_size_for_ddl / _flatten_device_coordinates_for_ddl
+        co-flattening logic: a rank-4 tensor exceeds DDL's 3-dim limit, so
+        leading dims are collapsed before SDSC emission.
+        """
+        shape = (2, 4, 128, 512)
+        x = cached_randn(shape, dtype=torch.float16, scale=1.0) * 2.0 + 1.0
+        scale = torch.tensor([1.0], dtype=torch.float16)
+
+        def spyre_fn(x, scale):
+            x_fp8 = torch.ops.spyre.quantize_fp8_with_scale(x, scale)
+            return torch.ops.spyre.dequantize_fp8_with_scale(x_fp8, scale)
+
+        def pytorch_fn(x, scale):
+            return _fp8_reference_quantize_dequantize(x, scale)
+
+        compare_with_pytorch(spyre_fn, pytorch_fn, x, scale, atol=0.5, rtol=0.1)
+
     def test_quantize_weight_fp8_with_scale_eager_mode_dtype_only(self):
         """Regression guard: quantize_weight_fp8_with_scale returns valid FP8 in eager mode.
 

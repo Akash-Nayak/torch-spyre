@@ -708,6 +708,19 @@ def _(input: torch.Tensor) -> torch.Tensor:
     return torch.empty(input.size(), dtype=torch.float8_e4m3fn, device=input.device)
 
 
+# Both quantize_fp8_with_scale and quantize_weight_fp8_with_scale share the same
+# four-step pipeline; the only difference is the final format-conversion kernel:
+#   1. Compute inverse scale: inv_scale = 1 / scale  (reciprocal, hardware sfp unit)
+#   2. Scale the input:       x_scaled = x * inv_scale  (POINTWISE)
+#   3. Clamp to FP8 E4M3:    x_clamped = clamp(x_scaled, -448, 448)  (POINTWISE)
+#   4. Format conversion:     qfp8ch (activation) or qfp8wt (weight)  (POINTWISE)
+#
+# The reciprocal in step 1 is emitted as a separate hardware op. For scalar or
+# broadcast scales the compiler does not currently fuse it into a single multiply,
+# so there is one sfp-unit op for 1/scale and one for x * inv_scale.  Callers with
+# a hot-path constraint can pre-compute inv_scale and pass it directly to the
+# underlying spyre.qfp8ch / spyre.qfp8wt decomposition ops instead.
+
 @torch.library.custom_op(
     "spyre::quantize_fp8_with_scale", mutates_args=(), device_types="spyre"
 )
@@ -715,28 +728,19 @@ def _(input: torch.Tensor) -> torch.Tensor:
 def quantize_fp8_with_scale(
     input: torch.Tensor, scale: torch.Tensor, compiled
 ) -> torch.Tensor:
-    """
-    Quantize FP16 tensor to FP8 using pre-computed scale.
+    """Quantize FP16 activation tensor to FP8 using a pre-computed scale.
 
-    Performs four steps:
-    1. Compute inverse scale: inv_scale = 1 / scale (reciprocal, POINTWISE on sfp unit)
-    2. Scale the input: x_scaled = x * inv_scale (POINTWISE)
-    3. Clamp to FP8 E4M3 range: x_clamped = clamp(x_scaled, -448, 448) (POINTWISE)
-    4. Convert to FP8 format: x_fp8 = qfp8ch(x_clamped) (POINTWISE format conversion)
+    Implements the four-step pipeline described above using qfp8ch for the
+    final format conversion (activation / channel layout).
 
     Args:
-        input: Input tensor (FP16) to quantize, shape [batch, seq, hidden]
+        input: FP16 activation tensor to quantize, shape [batch, seq, hidden]
         scale: Quantization scale (FP16), shape [batch, seq, 1]
 
     Returns:
-        FP8 E4M3 tensor (same shape as input)
-
-    Example:
-        >>> x = torch.randn(2, 4, 8, dtype=torch.float16, device='spyre')
-        >>> x_fp8 = torch.ops.spyre.quantize_fp8_with_scale(x, scale)
+        FP8 E4M3 tensor with the same shape as input.
 
     Note:
-        - Uses reciprocal operation (hardware sfp unit) for 1/scale computation
         - Supports eager mode via compile_once decorator
     """
     return compiled(input, scale)
@@ -748,6 +752,9 @@ def _(input: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     return torch.empty(input.size(), dtype=torch.float8_e4m3fn, device=input.device)
 
 
+# NOTE: Do NOT add a second @torch.library.custom_op registration for this op.
+# A duplicate with a pass body was introduced in commit 8f2e78ff and silently
+# overwrote this implementation at import time, causing None returns in eager mode.
 @torch.library.custom_op(
     "spyre::quantize_weight_fp8_with_scale", mutates_args=(), device_types="spyre"
 )
@@ -755,17 +762,17 @@ def _(input: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
 def quantize_weight_fp8_with_scale(
     input: torch.Tensor, scale: torch.Tensor, compiled
 ) -> torch.Tensor:
-    """
-    Quantize weight tensor to FP8 using pre-computed scale.
+    """Quantize FP16 weight tensor to FP8 using a pre-computed scale.
 
-    Similar to quantize_fp8_with_scale but uses qfp8wt for weight quantization.
+    Implements the four-step pipeline described above using qfp8wt for the
+    final format conversion (weight / kernel layout).
 
     Args:
-        input: Input weight tensor (FP16) to quantize
+        input: FP16 weight tensor to quantize
         scale: Quantization scale (FP16)
 
     Returns:
-        FP8 E4M3 tensor (same shape as input)
+        FP8 E4M3 tensor with the same shape as input.
 
     Note:
         - Supports eager mode via compile_once decorator
