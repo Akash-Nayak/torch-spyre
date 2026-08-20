@@ -230,6 +230,8 @@ def _dma_to_spyre_fp8_kernel(
         f"Weight must be torch.float8_e4m3fn, got {weight.dtype}"
     )
 
+    _ensure_spyre_runtime()
+
     if not weight.is_contiguous():
         weight = weight.contiguous()
 
