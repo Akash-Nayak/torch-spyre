@@ -28,6 +28,7 @@ from torch_spyre._inductor.constants import (
     CONV2D_LAYOUT_LABELS,
     CONV_DIM_LABELS,
     CONV_OPS,
+    DEPTHWISE_CONV2D_OP,
     IDENTITY_OP,
     INPUT_DIM_LABELS,
     LAYOUT_LABELS,
@@ -38,7 +39,6 @@ from torch_spyre._inductor.constants import (
     POOL_DIM_LABELS,
     POOL_OPS,
     RESTICKIFY_OP,
-    DEPTHWISE_CONV2D_OP,
     TOPK_OPS,
 )
 from torch_spyre._inductor.core_mapping import core_to_slice_mapping

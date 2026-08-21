@@ -721,6 +721,7 @@ def _(input: torch.Tensor) -> torch.Tensor:
 # a hot-path constraint can pre-compute inv_scale and pass it directly to the
 # underlying spyre.qfp8ch / spyre.qfp8wt decomposition ops instead.
 
+
 @torch.library.custom_op(
     "spyre::quantize_fp8_with_scale", mutates_args=(), device_types="spyre"
 )
@@ -790,7 +791,9 @@ def _(input: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     "spyre::dequantize_fp8_with_scale", mutates_args=(), device_types="spyre"
 )
 @compile_once("spyre.dequantize_fp8_with_scale")
-def dequantize_fp8_with_scale(input: torch.Tensor, scale: torch.Tensor, compiled) -> torch.Tensor:
+def dequantize_fp8_with_scale(
+    input: torch.Tensor, scale: torch.Tensor, compiled
+) -> torch.Tensor:
     """
     Dequantize FP8 tensor to FP16 using pre-computed scale.
 

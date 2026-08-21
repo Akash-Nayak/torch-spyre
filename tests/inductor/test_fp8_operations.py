@@ -23,13 +23,13 @@ Tests cover:
 
 import pytest
 import torch
-
-from torch_spyre._inductor.constants import FP8_E4M3FN_MAX, FP8_E4M3FN_MIN
 from utils_inductor import (
+    DEVICE,
     cached_randn,
     compare_with_pytorch,
-    DEVICE,
 )
+
+from torch_spyre._inductor.constants import FP8_E4M3FN_MAX, FP8_E4M3FN_MIN
 
 # Maximum spacing between adjacent representable values in FP8 E4M3
 FP8_E4M3_MAX_SPACING = 32.0
@@ -37,9 +37,9 @@ FP8_E4M3_MAX_SPACING = 32.0
 
 def _fp8_reference_quantize_dequantize(x, scale):
     """CPU reference for FP8 quantize→dequantize: clamp, cast to FP8, cast back, rescale."""
-    return (x / scale).clamp(FP8_E4M3FN_MIN, FP8_E4M3FN_MAX).to(
-        torch.float8_e4m3fn
-    ).to(torch.float16) * scale
+    return (x / scale).clamp(FP8_E4M3FN_MIN, FP8_E4M3FN_MAX).to(torch.float8_e4m3fn).to(
+        torch.float16
+    ) * scale
 
 
 class TestFP8Operations:

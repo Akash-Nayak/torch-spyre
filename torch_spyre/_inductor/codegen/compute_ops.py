@@ -1218,7 +1218,9 @@ def generate_sdsc(
             # depthwise and every other op.
             dim_size = _coord_size(dim_str, sdsc_spec.iteration_space[dim], is_input)
             size = _coord_per_core_size(dim, is_input, nsplits) if is_tiled else 1
-            is_fp8, st_idx = _compute_fp8_coord_params(tensor, dim, sdsc_spec, tensor_idx)
+            is_fp8, st_idx = _compute_fp8_coord_params(
+                tensor, dim, sdsc_spec, tensor_idx
+            )
             conv_params = (
                 get_conv_params(
                     tensor_idx,
