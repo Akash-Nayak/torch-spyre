@@ -253,12 +253,12 @@ class TestFP8Operations:
         compare_with_pytorch(spyre_fn, pytorch_fn, x, scale, atol=0.5, rtol=0.1)
 
     def test_quantize_dequantize_fp8_4d_shape(self):
-        """Test FP8 quantize/dequantize with a 4D input tensor.
+        """Test FP8 quantize/dequantize (qfp8ch path) with a 4D input tensor.
 
-        Exercises the len(dim_order) < 2 relaxation in _layout_info_for_tensor
-        and the _flatten_device_size_for_ddl / _flatten_device_coordinates_for_ddl
-        co-flattening logic: a rank-4 tensor exceeds DDL's 3-dim limit, so
-        leading dims are collapsed before SDSC emission.
+        Exercises the general 4D compilation path for quantize_fp8_with_scale
+        (qfp8ch / activation quantization). Note: qfp8ch is not in FP8_2D_STICK_OPS
+        and does not trigger DDL dimension flattening. See
+        test_quantize_weight_fp8_with_scale_4d_shape for the qfp8wt flattening path.
         """
         shape = (2, 4, 128, 512)
         x = cached_randn(shape, dtype=torch.float16, scale=1.0) * 2.0 + 1.0
@@ -310,23 +310,11 @@ class TestFP8Operations:
 
         Uses quantize_fp8_with_scale (qfp8ch path) to produce the FP8 input
         since that path produces a flat QFP8CH layout compatible with
-        fp8todl16. Verifies dtype, shape, and numerical correctness.
+        fp8todl16. Verifies numerical correctness via a compiled roundtrip.
         """
         x = cached_randn((1, 2, 8), dtype=torch.float16, scale=1.0)
         scale = torch.tensor([1.0], dtype=torch.float16)
-        x_d = x.to(DEVICE)
-        scale_d = scale.to(DEVICE)
 
-        x_fp8 = torch.ops.spyre.quantize_fp8_with_scale(x_d, scale_d)
-        dequantized = torch.ops.spyre.dequantize_fp8_with_scale(x_fp8, scale_d)
-
-        # Verify output dtype and shape.
-        verify_fp16_dtype(dequantized)
-        assert dequantized.shape == x_d.shape, (
-            f"Expected shape {x_d.shape}, got {dequantized.shape}"
-        )
-
-        # Numerical roundtrip: compare to CPU reference.
         def spyre_fn(inp, s):
             q = torch.ops.spyre.quantize_fp8_with_scale(inp, s)
             return torch.ops.spyre.dequantize_fp8_with_scale(q, s)

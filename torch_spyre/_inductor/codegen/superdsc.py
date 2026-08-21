@@ -17,7 +17,7 @@ import math
 from collections import Counter
 from typing import Any
 
-from sympy import Expr, Integer, Symbol
+from sympy import Expr, Integer, S, Symbol
 from torch._inductor.virtualized import V
 
 from torch_spyre._C import DataFormats, ElementArrangement
@@ -29,6 +29,7 @@ from torch_spyre._inductor.constants import (
     CONV_DIM_LABELS,
     CONV_OPS,
     DEPTHWISE_CONV2D_OP,
+    FP8_2D_STICK_OPS,
     IDENTITY_OP,
     INPUT_DIM_LABELS,
     LAYOUT_LABELS,
@@ -63,7 +64,7 @@ from torch_spyre._inductor.op_spec import (
 )
 from torch_spyre._inductor.pass_utils import coeff_through_floor
 
-from .compute_ops import FP8_2D_STICK_OPS, SymbolKind, generate_sdsc, num_bytes
+from .compute_ops import SymbolKind, generate_sdsc, num_bytes
 
 logger = get_inductor_logger("codegen.superdsc")
 
@@ -1161,8 +1162,6 @@ def _flatten_device_coordinates_for_ddl(
     Precondition: all collapsed leading coordinates must be zero — only valid
     for single-partition compilation where outer-batch coords are unused.
     """
-    import sympy
-
     # dims_to_flatten == 0 means _flatten_device_size_for_ddl found no flattening
     # needed; dims_to_flatten == 1 would be a no-op (collapsing one dim into itself).
     # _flatten_device_size_for_ddl never returns 1, so <= 1 guards both cases.
@@ -1174,12 +1173,12 @@ def _flatten_device_coordinates_for_ddl(
     )
     # Precondition: all collapsed leading coords must be zero.
     # Outer-batch coordinates are always 0 for single-partition execution.
-    assert all(c == sympy.S.Zero for c in device_coordinates[:dims_to_flatten]), (
+    assert all(c == S.Zero for c in device_coordinates[:dims_to_flatten]), (
         f"Expected all-zero leading coordinates for DDL flattening, got: "
         f"{device_coordinates[:dims_to_flatten]}"
     )
     # Collapse the first dims_to_flatten entries into a single zero.
-    return [sympy.S.Zero] + list(device_coordinates[dims_to_flatten:])
+    return [S.Zero] + list(device_coordinates[dims_to_flatten:])
 
 
 def _create_sdsc_tensors(

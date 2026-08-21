@@ -18,7 +18,11 @@ import dataclasses
 from sympy import Symbol
 
 from torch_spyre._C import DataFormats, encode_constant
-from torch_spyre._inductor.constants import CONV2D_DIM_LABELS, DEPTHWISE_CONV2D_OP
+from torch_spyre._inductor.constants import (
+    CONV2D_DIM_LABELS,
+    DEPTHWISE_CONV2D_OP,
+    FP8_2D_STICK_OPS,
+)
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.op_spec import TensorWorkDivision
 from torch_spyre._inductor.pass_utils import coeff_through_floor
@@ -241,14 +245,12 @@ def add_constant(kwargs, name, value) -> int:
 # tensors that need their 2D-stick metadata restored.
 _FP8_FLAT_STICK_SIZE = [128]  # == 2 * 64
 
-# Ops that use the FP8 2D-stick (QFP8WT) layout for their kernel/weight tensor.
-# Must stay in sync with the analogous guard in superdsc._create_sdsc_tensors,
-# which gates DDL dimension flattening on the same set of ops.
-FP8_2D_STICK_OPS = ("batchmatmulfp8", "qfp8wt")
-
-# Kernel tensor index within each op in FP8_2D_STICK_OPS.
-# batchmatmulfp8: arg 0 = INPUT activation, arg 1 = KERNEL weight
-# qfp8wt:         arg 0 = INPUT fp16 weight, arg 1 = OUTPUT fp8 weight
+# Index of the QFP8WT-layout tensor within each op in FP8_2D_STICK_OPS.
+# Both ops store it at argument index 1 in op_spec.args (inputs then outputs):
+#   batchmatmulfp8: arg 0 = INPUT activation,  arg 1 = INPUT KERNEL weight (QFP8WT)
+#   qfp8wt:         arg 0 = INPUT fp16 weight,  arg 1 = OUTPUT fp8 weight (QFP8WT)
+# In hardware terminology both are "KERNEL layout" tensors — qfp8wt's OUTPUT is
+# the weight that batchmatmulfp8 will subsequently consume as its KERNEL input.
 _FP8_2D_STICK_TENSOR_IDX = 1
 
 
