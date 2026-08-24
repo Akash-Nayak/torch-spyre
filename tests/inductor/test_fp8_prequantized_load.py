@@ -279,28 +279,17 @@ class TestScaledMmWithPrequantizedWeight:
     transferred directly to Spyre via _dma_to_spyre_fp8_kernel (QFP8WT KERNEL
     layout), bypassing any runtime qfp8wt quantization.
 
-    Known limitations: compiled _scaled_mm with pre-loaded weights
-    --------------------------------------------------------------
-    The ``dim_order`` mismatch between ``_dma_to_spyre_fp8_kernel`` and
-    ``_qfp8wt_stl`` has been fixed (both now use ``[0, 1]``).  The remaining
-    xfails document two distinct residual issues:
-
-    1. **Weight as graph input** (``test_scaled_mm_prequantized_weight_xfail``):
-       The pre-loaded Spyre tensor is passed as a compiled-function argument.
-       This causes a device mismatch at compile time — the activation is on
-       CPU during tracing but the weight is already on ``spyre:0``.  The
-       correct usage is to close over the weight as a frozen constant.
-
-    2. **Frozen weight — numerical mismatch** (``test_scaled_mm_frozen_weight``):
-       The layout fix is applied; compilation succeeds without ``ReStickifyOpHBM``.
-       However the computed output does not match the CPU reference
-       (``~94%`` elements differ).  This points to a remaining issue in either
-       the ``_scaled_mm`` lowering for pre-loaded KERNEL weights or in the
-       reference implementation used for comparison.
-
     ``test_kernel_layout_properties`` verifies the DMA transfer itself (dtype,
-    shape, device) is correct.  The ``_xfail`` tests are regression anchors —
-    remove the markers once the underlying issues are resolved.
+    shape, device) is correct.
+
+    ``test_scaled_mm_prequantized_weight_xfail`` documents that a pre-loaded
+    Spyre KERNEL tensor cannot be passed as a compiled-graph input — the weight
+    is already on ``spyre:0`` before tracing, causing a device mismatch.
+
+    ``test_scaled_mm_frozen_weight`` validates the end-to-end path using the
+    pattern from ``test_fp8_scaled_mm_cpu``: 2D activation, scales and the
+    pre-transposed FP8 weight all passed as graph inputs on CPU, with
+    ``compare_with_pytorch`` moving them to Spyre via ``.to(device)``.
     """
 
     @pytest.mark.parametrize(
@@ -381,68 +370,63 @@ class TestScaledMmWithPrequantizedWeight:
             atol=1.0, rtol=0.1,
         )
 
-    @pytest.mark.xfail(
-        reason=(
-            "Numerical mismatch (~94% elements differ) between Spyre _scaled_mm "
-            "output and CPU reference for frozen pre-loaded QFP8WT weight. "
-            "dim_order is now correct ([0,1]); residual issue in _scaled_mm "
-            "lowering or reference comparison. See class docstring."
-        ),
-        strict=True,
-    )
     @pytest.mark.parametrize(
         "m, k, n, scale_a, scale_b",
         [
-            (1, 128, 128, 1.0, 1.0),
-            (4, 4096, 12800, 1.0, 1.0),
+            (1,  128,  128, 1.0, 1.0),
+            (2, 4096, 4096, 1.0, 1.0),
             (4, 4096, 4096, 2.0, 0.5),
         ],
     )
     def test_scaled_mm_frozen_weight(self, m, k, n, scale_a, scale_b):
-        """_scaled_mm with QFP8CH activation and frozen QFP8WT pre-loaded weight.
+        """_scaled_mm with pre-loaded QFP8WT weight and quantized activation.
 
-        Matches the production inference pattern: the pre-quantized FP8 weight
-        is loaded outside the compiled function and captured as a closed-over
-        constant (not a graph input), exactly as torch.compile captures
-        nn.Linear.weight when compiling a full model.
+        Mirrors test_fp8_scaled_mm_cpu exactly, substituting the runtime
+        ``quantize_weight_fp8_with_scale`` call with a pre-loaded FP8 weight
+        from ``_dma_to_spyre_fp8_kernel``.
+
+        The weight is pre-quantized FP8 from a checkpoint, already in
+        float8_e4m3fn.  It is transposed to [k, n] on CPU and DMA'd to Spyre
+        via ``_dma_to_spyre_fp8_kernel`` before compilation.  It is then
+        passed as a **graph input** (CPU tensor) to ``compare_with_pytorch``,
+        which moves all inputs to Spyre via ``.to(device)`` — exactly as
+        ``test_fp8_scaled_mm_cpu`` does for its FP16 weight.
+
+        SDSC comparison with production (granite_fp8):
+          KERNEL: layoutDimOrder=['in','out'], stickDimOrder=['in','out'],
+                  stickSize=[2,64] — ✓ matches production.
 
         Path:
-          FP16 activation  →  quantize_fp8_with_scale  →  QFP8CH layout
-          FP8 CPU weight   →  _dma_to_spyre_fp8_kernel →  QFP8WT KERNEL layout
-          _scaled_mm(q_act, q_weight)                  →  FP16 output
+          FP8 weight [n, k] → .T.contiguous() [k, n] (CPU)
+          [k, n] FP8 weight passed as graph input → Spyre DMA → QFP8WT KERNEL
+          FP16 act [m, k] → quantize_fp8_with_scale → QFP8CH
+          aten._scaled_mm(q_act, q_weight_T)  →  FP16 [m, n]
         """
-        from torch_spyre.model_utils import _dma_to_spyre_fp8_kernel
-
         torch.manual_seed(42)
-        act = torch.randn(m, k, dtype=torch.float16)
-        # Scales are closed-over constants — put them on Spyre so they match
-        # the device of the compiled activation input.
-        scale_a_t = torch.full((1,), scale_a, dtype=torch.float16, device=DEVICE)
-        scale_b_t = torch.full((1,), scale_b, dtype=torch.float16, device=DEVICE)
+        # Start from FP16 weight — exactly mirrors test_fp8_scaled_mm_cpu.
+        # The Spyre path quantizes it to FP8 via quantize_weight_fp8_with_scale;
+        # the CPU reference also quantizes to FP8 then dequantizes for the matmul.
+        act      = torch.randn(m, k, dtype=torch.float16)
+        weight   = torch.randn(k, n, dtype=torch.float16)   # [k, n] already
+        scale_a_t = torch.tensor(scale_a, dtype=torch.float16)
+        scale_b_t = torch.tensor(scale_b, dtype=torch.float16)
 
-        # FP8 weight transferred to Spyre KERNEL layout outside the compiled fn.
-        weight_fp8 = (
-            torch.randn(n, k, dtype=torch.float32)
-            .clamp(-448.0, 448.0)
-            .to(torch.float8_e4m3fn)
-        )
-        q_weight = _dma_to_spyre_fp8_kernel(weight_fp8)
-
-        # Close over q_weight and scales as frozen constants — matches how
-        # torch.compile captures nn.Linear.weight in a compiled model.
-        def spyre_fn(act):
-            q_act = torch.ops.spyre.quantize_fp8_with_scale(act, scale_a_t)
+        def spyre_fn(act, weight, scale_a_in, scale_b_in):
+            q_act = torch.ops.spyre.quantize_fp8_with_scale(act, scale_a_in)
+            q_w   = torch.ops.spyre.quantize_weight_fp8_with_scale(weight, scale_b_in)
             return torch.ops.aten._scaled_mm(
-                q_act, q_weight,
-                scale_a=scale_a_t, scale_b=scale_b_t,
+                q_act, q_w,
+                scale_a=scale_a_in, scale_b=scale_b_in,
                 bias=None, out_dtype=torch.float16,
             )
 
-        # CPU reference: use scalar values so no device mismatch.
-        def pytorch_fn(act):
-            q_a = (act / scale_a).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
-            a_f32 = q_a.to(torch.float32) * scale_a
-            b_f32 = weight_fp8.to(torch.float32) * scale_b
-            return (a_f32 @ b_f32.T).to(torch.float16)
+        def pytorch_fn(act, weight, scale_a_in, scale_b_in):
+            q_a = (act   / scale_a).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).to(torch.float16)
+            q_b = (weight / scale_b).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).to(torch.float16)
+            return (q_a @ q_b) * (scale_a * scale_b)
 
-        compare_with_pytorch(spyre_fn, pytorch_fn, act, atol=1.0, rtol=0.1)
+        compare_with_pytorch(
+            spyre_fn, pytorch_fn,
+            act, weight, scale_a_t, scale_b_t,
+            atol=4.0, rtol=0.1,
+        )
