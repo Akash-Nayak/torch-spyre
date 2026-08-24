@@ -14,24 +14,27 @@
 
 """Optimal weight layout utilities for loading models onto Spyre.
 
-Transfers ``nn.Linear`` weights to Spyre with a device layout where the
-``out_features`` dimension is stickified (the optimal layout for Spyre
-matmul where both operands need their rows in the stick).
+Transfers ``nn.Linear`` weights to Spyre with an optimal device layout:
 
-This is achieved using ``dim_order=[1, 0]`` in ``SpyreTensorLayout``,
-which tells the DMA engine to stickify along host dim-0 (out_features)
-instead of the default last dim (in_features). No CPU transpose or
-intermediate copy is required.
+* **FP16/BF16 weights** use ``dim_order=[1, 0]`` in ``SpyreTensorLayout``,
+  which tells the DMA engine to stickify along host dim-0 (out_features)
+  instead of the default last dim (in_features).  Because ``aten.linear``
+  decomposes to ``matmul(input, weight.T)``, stickifying out_features at
+  DMA time means layout propagation sees a zero-cost match after the
+  transpose — no ``ReStickify`` required.
+
+* **Pre-quantized FP8 weights** (``torch.float8_e4m3fn``) use
+  ``dim_order=[0, 1]`` (identity order) with ``ElementArrangement.QFP8WT``
+  and a 2D stick ``[2, 64]`` (KERNEL layout).  The ``_scaled_mm`` path does
+  not transpose the weight, so the compiler's ``_qfp8wt_stl`` propagation
+  function generates the same identity ``dim_order=[0, 1]``.  Using ``[0, 1]``
+  here ensures the DMA-produced ``stride_map`` matches what the compiler
+  expects — no ``ReStickify`` required.
 
 ``nn.Embedding`` tables are instead read as a gather (indexed by token id
 along the vocab/leading dim), so they get a gather-optimal "indirect
 access" layout -- vocab dim outermost, hidden dim split into sticks --
 rather than the matmul or default layout.
-
-Pre-quantized FP8 ``nn.Linear`` weights (``torch.float8_e4m3fn``) can be
-loaded directly into a KERNEL layout with 2D stick ``[2, 64]`` and
-``ElementArrangement.QFP8WT``, bypassing any runtime ``qfp8wt`` quantization
-step and feeding ``_scaled_mm`` directly.
 
 Critically, the tensor's PyTorch shape stays ``(out, in)`` -- only the
 *device* layout changes. This means:
@@ -239,7 +242,7 @@ def _dma_to_spyre_fp8_kernel(
         list(weight.shape),   # host_size: (out_features, in_features)
         list(weight.stride()),  # host_strides: row-major (out, 1)
         torch.float8_e4m3fn,
-        [1, 0],               # dim_order: stick on dim-0 = out_features
+        [0, 1],               # dim_order: identity, matches _qfp8wt_stl in propagate_layouts
         ElementArrangement.QFP8WT,  # 2D stick [2, 64] for KERNEL tensor
     )
     dst = spyre_empty_with_layout(
