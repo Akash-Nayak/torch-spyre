@@ -274,12 +274,11 @@ class TestFP8Operations:
         compare_with_pytorch(spyre_fn, pytorch_fn, x, scale, atol=0.5, rtol=0.1)
 
     def test_quantize_weight_fp8_with_scale_eager_mode_dtype_only(self):
-        """Regression guard: quantize_weight_fp8_with_scale returns valid FP8 in eager mode.
+        """Regression guard: quantize_weight_fp8_with_scale returns a valid FP8 tensor in eager mode.
 
-        Guards against the regression fixed in commit 8f2e78ff where a duplicate
-        @torch.library.custom_op registration (with a pass body) silently overwrote
-        the real implementation at import time, causing the op to return None in
-        eager mode. A None return fails verify_fp8_dtype immediately.
+        A duplicate custom op registration with an empty body can silently overwrite
+        the real implementation at import time, causing the op to return None in eager
+        mode. A None return fails verify_fp8_dtype immediately.
 
         This test intentionally checks dtype and shape only — not numerical correctness.
         The qfp8wt op produces a QFP8WT 2D-stick physical layout that is opaque to
