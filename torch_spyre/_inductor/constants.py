@@ -190,7 +190,7 @@ SPYRE_FP8_OPS = {
 
 # Ops whose QFP8WT-arranged weight/output tensor requires a 2D stick [2, 64].
 # Used consistently in both compute_ops._layout_info_for_tensor and
-# superdsc._create_sdsc_tensors to gate DDL dimension flattening and
+# superdsc._create_sdsc_tensors to gate device-size flattening and
 # 2D-stick metadata restoration.
 FP8_2D_STICK_OPS = ("batchmatmulfp8", "qfp8wt")
 

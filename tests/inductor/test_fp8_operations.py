@@ -257,7 +257,7 @@ class TestFP8Operations:
 
         Exercises the general 4D compilation path for quantize_fp8_with_scale
         (qfp8ch / activation quantization). Note: qfp8ch is not in FP8_2D_STICK_OPS
-        and does not trigger DDL dimension flattening. See
+        and does not trigger device-size flattening. See
         test_quantize_weight_fp8_with_scale_4d_shape for the qfp8wt flattening path.
         """
         shape = (2, 4, 128, 512)

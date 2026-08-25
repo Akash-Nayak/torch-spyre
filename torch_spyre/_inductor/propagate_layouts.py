@@ -1839,7 +1839,7 @@ def propagate_spyre_tensor_layouts(
                     # Treat the mutation op like a normal pointwise op: run
                     # _multi_arg_pointwise_layouts with the non-target inputs.
                     # This enforces input-compatibility and slice constraints,
-                    # so the backend DDL slice check passes.
+                    # so the backend slice check passes.
                     rw = op.get_read_writes()
                     output_dep = next(iter(rw.writes))
                     all_args = _get_prop_args(rw.reads)

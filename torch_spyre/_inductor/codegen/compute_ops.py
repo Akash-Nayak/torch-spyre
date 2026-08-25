@@ -241,8 +241,8 @@ def add_constant(kwargs, name, value) -> int:
 
 
 # FP8 has 128 elements per stick. A QFP8WT tensor with 2D stick [2, 64]
-# is flattened back to [128] by DDL. Matching this sentinel identifies
-# tensors that need their 2D-stick metadata restored.
+# is flattened back to [128] after device-size flattening. Matching this
+# sentinel identifies tensors that need their 2D-stick metadata restored.
 _FP8_FLAT_STICK_SIZE = [128]  # == 2 * 64
 
 # Index of the QFP8WT-layout tensor within each op in FP8_2D_STICK_OPS.
@@ -258,7 +258,7 @@ def _layout_info_for_tensor(sdsc_spec, tensor, tensor_idx: int) -> dict:
     """Return layout metadata to emit for a tensor.
 
     For individually compiled FP8 ops in FP8_2D_STICK_OPS, the upstream
-    flattening needed to satisfy DDL's max-dimension limit can erase the
+    flattening needed to satisfy the SDSC dimension limit can erase the
     semantic 2D-stick metadata on the KERNEL tensor. Restore that metadata
     here so the emitted SDSC matches the combined-compilation shape contract.
 
@@ -273,12 +273,12 @@ def _layout_info_for_tensor(sdsc_spec, tensor, tensor_idx: int) -> dict:
         and tensor.data_format == DataFormats.SEN143_FP8
         and layout_info["stick_size"] == _FP8_FLAT_STICK_SIZE
     ):
-        # After DDL flattening a rank-4+ tensor produces a 3-element dim_order
-        # (one collapsed leading dim + the two trailing stick dims). The [-2:]
-        # slice always selects the two stick dims regardless of how many leading
-        # dims were collapsed, because flattening only touches leading dims and
-        # the trailing stick dims are preserved as-is by _flatten_device_size_for_ddl
-        # (keep_trailing_dims=2). Ranks above 3 are therefore safe.
+        # After device-size flattening a rank-4+ tensor produces a 3-element
+        # dim_order (one collapsed leading dim + the two trailing stick dims).
+        # The [-2:] slice always selects the two stick dims regardless of how
+        # many leading dims were collapsed, because flattening only touches
+        # leading dims and the trailing stick dims are preserved as-is by
+        # _flatten_device_size (keep_trailing_dims=2). Ranks above 3 are safe.
         dim_order = layout_info["dim_order"]
         if len(dim_order) < 2:
             raise ValueError(
