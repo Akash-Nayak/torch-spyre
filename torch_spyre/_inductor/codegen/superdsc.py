@@ -1108,7 +1108,7 @@ def _collect_index_tensor_layouts(
     return index_tensor_layouts, index_active_dims
 
 
-def _flatten_device_size_for_ddl(
+def _flatten_device_size(
     device_size: list[int],
     *,
     keep_trailing_dims: int,
@@ -1116,15 +1116,15 @@ def _flatten_device_size_for_ddl(
     # NOTE: Return type is tuple[list[int], int] — a breaking change from the
     # original list[int] return. All call-sites must unpack both values.
 ) -> tuple[list[int], int]:
-    """Flatten leading device dims to satisfy the DDL dimension limit.
+    """Flatten leading device dims to satisfy the SDSC dimension limit.
 
-    ``keep_trailing_dims`` preserves the trailing layout structure that SDSC/DDL
+    ``keep_trailing_dims`` preserves the trailing layout structure that SDSC
     interprets semantically (for example the FP8 kernel's 2D stick).  Only the
     leading outer dims are collapsed.
 
     Returns ``(flattened_size, dims_to_flatten)`` so the caller can apply the
     same collapse to ``device_coordinates`` via
-    ``_flatten_device_coordinates_for_ddl``.  ``dims_to_flatten`` is 0 when no
+    ``_flatten_device_coordinates``.  ``dims_to_flatten`` is 0 when no
     flattening was needed.
     """
     if len(device_size) <= max_dims:
@@ -1150,7 +1150,7 @@ def _flatten_device_size_for_ddl(
     result = [flattened_dim] + device_size[dims_to_flatten:]
 
     logger.debug(
-        "Flattened device_size for DDL from %s to %s (keep_trailing_dims=%s)",
+        "Flattened device_size from %s to %s (keep_trailing_dims=%s)",
         device_size,
         result,
         keep_trailing_dims,
@@ -1158,13 +1158,13 @@ def _flatten_device_size_for_ddl(
     return result, dims_to_flatten
 
 
-def _flatten_device_coordinates_for_ddl(
+def _flatten_device_coordinates(
     device_coordinates: list,
     dims_to_flatten: int,
 ) -> list:
     """Collapse the leading ``dims_to_flatten`` device coordinates to a single zero.
 
-    Mirrors ``_flatten_device_size_for_ddl``.  For QFP8WT kernel tensors the
+    Mirrors ``_flatten_device_size``.  For QFP8WT kernel tensors the
     leading outer-batch coordinates are always compile-time constants (all zero
     for a single partition), so the combined linear offset of the collapsed dims
     is zero and can be represented by a single ``sympy.S.Zero`` entry.  This
@@ -1175,19 +1175,19 @@ def _flatten_device_coordinates_for_ddl(
     Precondition: all collapsed leading coordinates must be zero — only valid
     for single-partition compilation where outer-batch coords are unused.
     """
-    # dims_to_flatten == 0 means _flatten_device_size_for_ddl found no flattening
+    # dims_to_flatten == 0 means _flatten_device_size found no flattening
     # needed; dims_to_flatten == 1 would be a no-op (collapsing one dim into itself).
-    # _flatten_device_size_for_ddl never returns 1, so <= 1 guards both cases.
+    # _flatten_device_size never returns 1, so <= 1 guards both cases.
     if dims_to_flatten <= 0:
         return device_coordinates
     assert dims_to_flatten >= 2, (
         f"dims_to_flatten={dims_to_flatten} is unexpected; "
-        f"_flatten_device_size_for_ddl should never return 1"
+        f"_flatten_device_size should never return 1"
     )
     # Precondition: all collapsed leading coords must be zero.
     # Outer-batch coordinates are always 0 for single-partition execution.
     assert all(c == S.Zero for c in device_coordinates[:dims_to_flatten]), (
-        f"Expected all-zero leading coordinates for DDL flattening, got: "
+        f"Expected all-zero leading coordinates for flattening, got: "
         f"{device_coordinates[:dims_to_flatten]}"
     )
     # Collapse the first dims_to_flatten entries into a single zero.
@@ -1242,22 +1242,22 @@ def _create_sdsc_tensors(
         # Flatten device_size (and device_coordinates) for QFP8WT tensors in ops
         # that use the 2D-stick layout (qfp8wt and batchmatmulfp8). fp8todl16 reads
         # a QFP8WT-arranged tensor but uses a 1D flat FP8 input — its device_size is
-        # already within DDL limits. Non-QFP8WT tensors must not be flattened: their
-        # 4D device_size encodes correct per-dim strides; collapsing leading dims
-        # corrupts stride_idx lookups.
+        # already within the SDSC dimension limit. Non-QFP8WT tensors must not be
+        # flattened: their 4D device_size encodes correct per-dim strides; collapsing
+        # leading dims corrupts stride_idx lookups.
         # device_coordinates must be co-flattened with device_size so that the
         # coord_idx = -stride_idx - 2 lookups in the loop below index the correct
         # physical axis after flattening.
         if is_fp8_mm_kernel_arg and op_spec.op in FP8_2D_STICK_OPS:
             original_device_size = arg.device_size
-            flattened_device_size, dims_to_flatten = _flatten_device_size_for_ddl(
+            flattened_device_size, dims_to_flatten = _flatten_device_size(
                 original_device_size,
                 keep_trailing_dims=2,
             )
             if flattened_device_size != original_device_size:
                 # Precondition: leading outer-batch coords are 0 for single-partition
-                # compilation. See _flatten_device_coordinates_for_ddl for details.
-                flattened_coords = _flatten_device_coordinates_for_ddl(
+                # compilation. See _flatten_device_coordinates for details.
+                flattened_coords = _flatten_device_coordinates(
                     arg.device_coordinates, dims_to_flatten
                 )
                 arg = dataclasses.replace(
@@ -1499,9 +1499,8 @@ def _create_sdsc_tensors(
 
         # Special handling for QFP8WT KERNEL tensors.
         # Both qfp8wt (weight quantization) and batchmatmulfp8 (the consumer) require
-        # a 2D stick [2, stick_size/2] — mandated by quantization_no_pad.ddl and
-        # the batchmatmul DDL respectively. fp8todl16 also carries a QFP8WT-arranged
-        # tensor as input but uses a 1D flat FP8 input (quantization_double_pad.ddl).
+        # a 2D stick [2, stick_size/2]. fp8todl16 also carries a QFP8WT-arranged
+        # tensor as input but uses a 1D flat FP8 input.
         dtype_stick_size = arg.device_dtype.elems_per_stick()
         layout_stick_size = [dtype_stick_size]
         if is_fp8_mm_kernel_arg and op_spec.op in ("batchmatmulfp8", "qfp8wt"):
