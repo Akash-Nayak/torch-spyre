@@ -36,6 +36,11 @@ along the vocab/leading dim), so they get a gather-optimal "indirect
 access" layout -- vocab dim outermost, hidden dim split into sticks --
 rather than the matmul or default layout.
 
+Pre-quantized FP8 ``nn.Linear`` weights (``torch.float8_e4m3fn``) can be
+loaded directly into a KERNEL layout with 2D stick ``[2, 64]`` and
+``ElementArrangement.QFP8WT``, bypassing any runtime ``qfp8wt`` quantization
+step and feeding ``_scaled_mm`` directly.
+
 Critically, the tensor's PyTorch shape stays ``(out, in)`` -- only the
 *device* layout changes. This means:
 
