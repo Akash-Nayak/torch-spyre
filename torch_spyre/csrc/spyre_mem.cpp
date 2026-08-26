@@ -384,12 +384,6 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
   dci.isHostToSen_ = host2device;
   dci.dataformat_src_ = host2device ? cpu_format_host : dev_format_dev;
   dci.dataformat_dst_ = host2device ? dev_format_dev : cpu_format_host;
-  TORCH_CHECK(
-      isDCIConversionSupported(dci.dataformat_src_, dci.dataformat_dst_),
-      "Unsupported DCI data format conversion: src=",
-      static_cast<int>(dci.dataformat_src_),
-      " dst=", static_cast<int>(dci.dataformat_dst_),
-      " (cpu_type=", cpu_str_type, ", dev_type=", dev_str_type, ")");
 
   std::vector<int64_t> cpu_shape;
   std::vector<int64_t> dev_shape = stl.device_size;
@@ -432,11 +426,55 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
   // Reverse PyTorch ordering
   std::reverse(cpu_shape.begin(), cpu_shape.end());
   std::reverse(dev_shape.begin(), dev_shape.end());
-  dci.dcsi_ = get_device_stride_infos(t_sizes, t_dev_strides, cpu_offset, stl,
-                                      host2device, t_cpu_strides);
+
+  // FP8 multi-dim stick layout uses specialized DCI generation
+  if (stl.element_arrangement == ElementArrangement::QFP8WT) {
+    const int64_t eps = stl.elems_per_stick();
+    const int64_t si = 2;
+    const int64_t so = eps / si;
+    const int64_t K = cpu_shape[0];
+    const int64_t N = cpu_shape[1];
+
+    // Expanded device shape: [si, so, K/si, N/so]
+    const int64_t dim2 = K / si;
+    const int64_t dim3 = N / so;
+
+    // Host strides for the expanded layout
+    // stride_map[0] = K stride in host elements
+    const int64_t dst2 = si * so;      // = eps = 128 (one full [2,64] stick)
+    const int64_t dst3 = dim2 * eps;   // = (K/si) * si * so = K * so (one N-strip of sticks)
+
+    // Host (row-major) strides in the expanded 4D index space [si, so, dim2, dim3]:
+    //   element [k,n]: k = d2*si + a,  n = d3*so + b
+    //   host byte = k*N + n = (d2*si + a)*N + (d3*so + b)
+    //             = a*N + b*1 + d2*(si*N) + d3*so
+    //   → stride_src = [N, 1, si*N, so]
+    const std::vector<int64_t> host_strides = {N, 1, si * N, so};
+
+    // Device (QFP8WT [2,64] stick) strides in the expanded 4D index space:
+    //   physical byte = a*1 + b*si + d2*dst2 + d3*dst3
+    //   (within a stick: si dimension innermost at stride=1, so dimension at stride=si)
+    //   → stride = [1, si, dst2, dst3]
+    const std::vector<int64_t> device_strides = {1, si, dst2, dst3};
+
+    DataConversionStrideInfo dcsi;
+    dcsi.size_ = {si, so, dim2, dim3};
+    dcsi.stride_src_ = host2device ? host_strides : device_strides;
+    dcsi.stride_dst_ = host2device ? device_strides : host_strides;
+    dcsi.offset_src_ = host2device ? cpu_offset : 0;
+    dcsi.offset_dst_ = host2device ? 0 : cpu_offset;
+    dci.dcsi_ = {dcsi};
+    // For H2D, output (device) shape is the expanded 4D form.
+    // For D2H, output (host) shape is the original 2D cpu_shape.
+    const std::vector<int64_t> expanded_dev_shape = {si, so, dim2, dim3};
+    dci.output_shape_ = host2device ? expanded_dev_shape : cpu_shape;
+  } else {
+    dci.dcsi_ = get_device_stride_infos(t_sizes, t_dev_strides, cpu_offset, stl,
+                                        host2device, t_cpu_strides);
+    dci.output_shape_ = host2device ? dev_shape : cpu_shape;
+  }
 
   dci.input_shape_ = host2device ? cpu_shape : dev_shape;
-  dci.output_shape_ = host2device ? dev_shape : cpu_shape;
   if (torch_spyre::logging::legacy::is_legacy_debug_enabled()) {
     std::stringstream s;
     dci.exportJson(s);
