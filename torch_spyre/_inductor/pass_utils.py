@@ -820,9 +820,14 @@ def identify_matmul_inputs(
 def find_reduction_var(x_dep: MemoryDep, out_dep: MemoryDep) -> sympy.Symbol:
     """Return the single loop variable that appears in x's index but not in the output's.
 
+    Intersects with x_dep.var_names to exclude symbolic size/stride constants
+    (e.g. s27 appearing as a stride coefficient in d0*s27 + d2) — those are not loop
+    variables and must not be treated as the reduction variable.
+
     Raises Unsupported if the count is not exactly 1.
     """
-    reduction_vars = x_dep.index.free_symbols - out_dep.index.free_symbols
+    loop_vars = set(x_dep.var_names) if hasattr(x_dep, "var_names") else x_dep.index.free_symbols
+    reduction_vars = (x_dep.index.free_symbols - out_dep.index.free_symbols) & loop_vars
     if len(reduction_vars) != 1:
         raise Unsupported(
             f"expected exactly 1 reduction variable, got {reduction_vars}"
@@ -836,11 +841,14 @@ def find_matmul_generated_var(
     """Return the single loop variable that appears in y's and the output's index but not in x's.
 
     This is the N (generation) dimension of a matmul.
+    Intersects with y_dep.var_names to exclude symbolic size/stride constants
+    (e.g. s40 appearing as a stride coefficient) — those are not loop variables.
     Raises Unsupported if the count is not exactly 1.
     """
+    loop_vars = set(y_dep.var_names) if hasattr(y_dep, "var_names") else y_dep.index.free_symbols
     generated_vars = (
-        y_dep.index.free_symbols & out_dep.index.free_symbols
-    ) - x_dep.index.free_symbols
+        (y_dep.index.free_symbols & out_dep.index.free_symbols) - x_dep.index.free_symbols
+    ) & loop_vars
     if len(generated_vars) != 1:
         raise Unsupported(
             f"expected exactly 1 generated variable, got {generated_vars}"
