@@ -1647,12 +1647,23 @@ def _cost_model_matmul_planner(
     n_divs = factors(n_dim, n_sticks)
     k_divs = factors(k_dim, k_sticks)
 
+    is_fp8_bmm = op.data.reduction_type == BATCH_MATMUL_FP8_OP
+    # The batchmatmulfp8 KERNEL tensor 'out'-dim always uses core_fold=4 regardless
+    # of N. Production Granite FP8 SDSCs confirm this across all shapes (N=512, 1024,
+    # 2048, 4096). Pinning work_slices[n_dim] to this constant ensures compute_ops.py
+    # emits the correct SDSC coordInfo (alpha = N//4, factor = 4).
+    _FP8_BMM_N_SPLIT = 4
+
     best = None
     best_cost = math.inf
     for b_combo in b_combos:
         b_prod = math.prod(b_combo)
+        if is_fp8_bmm and b_prod != 1:
+            continue
         for mm in m_divs:
             for nn in n_divs:
+                if is_fp8_bmm and nn != _FP8_BMM_N_SPLIT:
+                    continue
                 for kk in k_divs:
                     if b_prod * mm * nn * kk > max_cores:
                         continue
@@ -1823,7 +1834,7 @@ def _cost_model_divide_op(op: ComputedBuffer, max_cores: int) -> bool:
     """
     if not isinstance(op.data, Reduction):
         return False
-    if op.data.reduction_type != BATCH_MATMUL_OP:
+    if op.data.reduction_type not in (BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP):
         return False
     if not config.ignore_work_division_hints and _has_work_div_hint(op):
         # User hints take ownership of the split decision; do not override them.

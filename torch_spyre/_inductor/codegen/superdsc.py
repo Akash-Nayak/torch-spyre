@@ -1264,8 +1264,6 @@ def _create_sdsc_tensors(
         # coord_idx = -stride_idx - 2 lookups in the loop below index the correct
         # physical axis after flattening.
         if is_fp8_mm_kernel_arg and op_spec.op in FP8_2D_STICK_OPS:
-            import sys as _sys
-            print(f"[SUPERDSC_DBG] arg {i} (KERNEL) device_size={arg.device_size} device_coordinates={[str(c) for c in arg.device_coordinates]} element_arrangement={arg.element_arrangement}", file=_sys.stderr)
             original_device_size = arg.device_size
             flattened_device_size, dims_to_flatten = _flatten_device_size_for_ddl(
                 original_device_size,
@@ -1391,14 +1389,6 @@ def _create_sdsc_tensors(
                 and dim in (index_stick_syms.values() if index_stick_syms else [])
             ):
                 strides[dim] = 1
-            elif dim == stick_dim and is_fp8_mm_kernel_arg:
-                # QFP8WT 2D-stick: the stick dimension (out/N) has a 2D-stick layout
-                # [outer_group, K, inner_N].  The address stride must skip one full
-                # outer-stick group = prod(device_size) / device_size[0] = 16384, but
-                # divided by work_slices in core_idx_to_slice_offset requires the full
-                # prod(device_size) = 32768.  Use stride_idx+1 to include the outer-group
-                # dimension in the product.
-                strides[dim] = _calculate_device_stride(stride_idx + 1, arg.device_size)
             else:
                 strides[dim] = _calculate_device_stride(stride_idx, arg.device_size)
             offsets[dim] = 0
@@ -1440,16 +1430,8 @@ def _create_sdsc_tensors(
                 else:
                     dev_dim_size = arg.device_size[size_idx]
                 it_dim_size = iteration_space[dim]
-                # LX buffers are per-core: compare against the per-core slice size.
-                is_lx = "lx" in arg.allocation
-                if is_lx and work_slices and dim in work_slices and work_slices[dim] > 1:
-                    it_dim_size = it_dim_size // work_slices[dim]
                 if dim == stick_dim:
                     stick_size = arg.device_dtype.elems_per_stick()
-                    # 2D-stick QFP8WT: the iteration variable indexes the inner
-                    # stick only (size 64), not the full flat 128-element stick.
-                    if is_fp8_mm_kernel_arg:
-                        stick_size = stick_size // 2
                     dev_dim_size *= stick_size
                     it_dim_size = ((it_dim_size - 1) // stick_size + 1) * stick_size
 
@@ -1472,16 +1454,7 @@ def _create_sdsc_tensors(
             # Same out-of-range case as the device_size lookup above: such a dim
             # has no device coordinate either, and this subscript would raise
             # before the size comparison below could skip it.
-            # For QFP8WT 2D-stick KERNEL tensors, device_coordinates has one extra
-            # leading entry (the outer-stick group: floor(out/128)). Shift coord_idx
-            # by 1 extra so that non-stick dims map to the correct coordinate:
-            #   device_coordinates = [floor(out/128), in, Mod(out,128)]
-            #   out (stride_idx=0) → coord_idx=-3 → floor(out/128)  ✓
-            #   in  (stride_idx=1) → coord_idx=-4 → (out of range)  ✓ (no offset for in)
-            # Without this shift, out→coord_idx=-2→in(c2), in→coord_idx=-3→floor(out/128),
-            # which gives wrong startAddress offsets — all cores see the same weight half.
-            extra = 1 if is_fp8_mm_kernel_arg else 0
-            coord_idx = -stride_idx - 2 - extra
+            coord_idx = -stride_idx - 2
             dim_coord = (
                 arg.device_coordinates[coord_idx]
                 if -coord_idx <= len(arg.device_coordinates)
@@ -1500,7 +1473,13 @@ def _create_sdsc_tensors(
                 # iteration extent. Emitting a backGap for a conv op double-counts
                 # that gap and corrupts the generated addressing.
                 #
-                if not _is_conv(op_spec.op):
+                # LX buffers must not carry a backGap: the scratchpad planner
+                # (_would_produce_lx_back_gap) already prevents any LX buffer
+                # whose device_size > it_dim_size from being placed in LX, so
+                # this branch should never fire for LX in practice.  Guard
+                # defensively to avoid corrupting the generated SDSC.
+                is_lx = "lx" in arg.allocation
+                if not _is_conv(op_spec.op) and not is_lx:
                     backGap[dim] = dev_dim_size - it_dim_size
                 # 2D-stick QFP8WT: stride is already the inner-stick stride
                 # (= outer_stick = 2); do not rescale it by dev/it ratio.

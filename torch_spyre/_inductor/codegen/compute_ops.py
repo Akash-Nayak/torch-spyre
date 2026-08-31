@@ -397,7 +397,41 @@ def gen_coord_info_value(
                 ],
             },
         }
+    elif is_stick_dim and is_fp8_stick and is_2d_stick and stick_idx == 0:
+        # QFP8WT 2D-stick: the `in` (K/reduction) dimension of the KERNEL weight.
+        # Physical memory layout groups K in pairs (outer_stick=2), so the stride
+        # between K-groups is 2 elements, not elems_per_stick=128.
+        # Production Granite FP8 SDSCs confirm: alpha=[...,2,1], factor=[K//2, 2].
+        # (other_stick_size here is stickSize_[1]=64, but the K stride uses [0]=2.)
+        _outer_stick = 2  # stickSize_[0] for QFP8WT is always 2
+        return {
+            "spatial": 3,
+            "temporal": 0,
+            "elemArr": 2,
+            "padding": "nopad",
+            "folds": {
+                "dim_prop_func": [
+                    {"Affine": {"alpha_": size, "beta_": 0}},
+                    {"Affine": {"alpha_": 0, "beta_": 0}},
+                    {"Affine": {"alpha_": 0, "beta_": 0}},
+                    {"Affine": {"alpha_": _outer_stick, "beta_": 0}},
+                    {"Affine": {"alpha_": 1, "beta_": 0}},
+                ],
+                "dim_prop_attr": [
+                    {"factor_": nsplits, "label_": "core_fold"},
+                    {"factor_": 1, "label_": "corelet_fold"},
+                    {"factor_": 1, "label_": "row_fold"},
+                    {"factor_": size // _outer_stick, "label_": "elem_arr_1"},
+                    {"factor_": _outer_stick, "label_": "elem_arr_0"},
+                ],
+            },
+        }
     elif is_stick_dim and is_fp8_stick and not (is_2d_stick and stick_idx == 0):
+        # QFP8WT 2D-stick layout: the out/N dimension of the KERNEL weight is
+        # arranged in groups of 64 (outer) containing 8 sub-groups of 8 elements.
+        # Production Granite FP8 SDSCs (granite_fp8/execute_itr0/sdsc/) confirm
+        # the fixed encoding: alpha=[...,64,8,1], factor=[size//64,8,8].
+        # Non-2D FP8 sticks keep the same encoding derived from size.
         return {
             "spatial": 3,
             "temporal": 0,
@@ -408,33 +442,17 @@ def gen_coord_info_value(
                     {"Affine": {"alpha_": size, "beta_": 0}},
                     {"Affine": {"alpha_": 0, "beta_": 0}},
                     {"Affine": {"alpha_": 0, "beta_": 0}},
-                    {
-                        "Affine": {
-                            "alpha_": (other_stick_size if is_2d_stick else 64),
-                            "beta_": 0,
-                        }
-                    },
-                    {
-                        "Affine": {
-                            "alpha_": (size // other_stick_size if is_2d_stick else 8),
-                            "beta_": 0,
-                        }
-                    },
+                    {"Affine": {"alpha_": 64, "beta_": 0}},
+                    {"Affine": {"alpha_": 8, "beta_": 0}},
                     {"Affine": {"alpha_": 1, "beta_": 0}},
                 ],
                 "dim_prop_attr": [
                     {"factor_": nsplits, "label_": "core_fold"},
                     {"factor_": 1, "label_": "corelet_fold"},
                     {"factor_": 1, "label_": "row_fold"},
-                    {
-                        "factor_": (64 if is_2d_stick else (size // 64)),
-                        "label_": "elem_arr_2",
-                    },
-                    {
-                        "factor_": (other_stick_size if is_2d_stick else 8),
-                        "label_": "elem_arr_1",
-                    },
-                    {"factor_": 1 if is_2d_stick else 8, "label_": "elem_arr_0"},
+                    {"factor_": size // 64, "label_": "elem_arr_2"},
+                    {"factor_": 8, "label_": "elem_arr_1"},
+                    {"factor_": 8, "label_": "elem_arr_0"},
                 ],
             },
         }
@@ -1399,46 +1417,6 @@ def generate_sdsc(
             extra["dsOffset"] = 0
             extra["allocateNode_"] = alloc_node
         return extra
-
-    # --- DEBUG: dump batchmatmulfp8 SDSC to stderr for investigation ---
-    import os as _os, json as _json, sys as _sys
-    if sdsc_spec.opfunc == "batchmatmulfp8":
-        _dump_dir = _os.environ.get("PERFDSC_DUMP_DIR", "")
-        # Reconstruct per-arg stick_dim for debug (mirrors _create_sdsc_tensors logic)
-        def _dbg_arg_info(a):
-            from torch_spyre._inductor.codegen.superdsc import _get_device_dim_order, ElementArrangement
-            try:
-                dim_order, stick_dim = _get_device_dim_order(a, sdsc_spec.symbol_mapping, sdsc_spec, tensor_position=sdsc_spec.args.index(a))
-            except Exception as e:
-                dim_order, stick_dim = [], f"ERR:{e}"
-            return {
-                "layout": a.layout,
-                "allocation": {str(k): str(v) for k, v in a.allocation.items()},
-                "data_format": str(a.data_format),
-                "element_arrangement": str(getattr(a, "element_arrangement", "N/A")),
-                "device_size": getattr(a, "device_size", "N/A"),
-                "device_coordinates": [str(c) for c in getattr(a, "device_coordinates", [])],
-                "stick_dim": str(stick_dim),
-                "scales": {str(k): str(v) for k, v in a.scales.items()},
-                "strides": {str(k): str(v) for k, v in a.strides.items()},
-                "offsets": {str(k): str(v) for k, v in a.offsets.items()},
-                "backGap": {str(k): str(v) for k, v in a.backGap.items()},
-                "dim_order": [str(d) for d in a.dim_order],
-            }
-        _entry = {
-            "opfunc": sdsc_spec.opfunc,
-            "num_cores": sdsc_spec.num_cores,
-            "iteration_space": {str(k): int(v) for k, v in sdsc_spec.iteration_space.items()},
-            "work_slices": {str(k): int(v) for k, v in sdsc_spec.work_slices.items()},
-            "args": [_dbg_arg_info(a) for a in sdsc_spec.args],
-        }
-        if _dump_dir:
-            _fname = _os.path.join(_dump_dir, f"batchmatmulfp8_{idx}_spec.json")
-            with open(_fname, "w") as _f:
-                _json.dump(_entry, _f, indent=2, default=str)
-        else:
-            print(f"[SDSC_DBG] batchmatmulfp8 spec:\n{_json.dumps(_entry, indent=2, default=str)}", file=_sys.stderr)
-    # --- END DEBUG ---
 
     return (
         {

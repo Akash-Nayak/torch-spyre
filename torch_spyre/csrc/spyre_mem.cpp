@@ -432,8 +432,10 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
     const int64_t eps = stl.elems_per_stick();
     const int64_t si = 2;
     const int64_t so = eps / si;
-    const int64_t K = cpu_shape[0];
-    const int64_t N = cpu_shape[1];
+    // cpu_shape is reversed from PyTorch ordering [K, N] → [N, K], so
+    // cpu_shape[0] = N (columns) and cpu_shape[1] = K (rows).
+    const int64_t N = cpu_shape[0];
+    const int64_t K = cpu_shape[1];
 
     // Expanded device shape: [si, so, K/si, N/so]
     const int64_t dim2 = K / si;

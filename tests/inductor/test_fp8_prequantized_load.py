@@ -430,3 +430,88 @@ class TestScaledMmWithPrequantizedWeight:
             act, weight, scale_a_t, scale_b_t,
             atol=4.0, rtol=0.1,
         )
+
+
+# ---------------------------------------------------------------------------
+# Pre-quantized FP8 weight closed-over as frozen constant
+# ---------------------------------------------------------------------------
+
+
+class TestScaledMmPrequantizedClosedOver:
+    """Test _scaled_mm with a pre-quantized FP8 weight closed over in the compiled fn.
+
+    This is the production pattern for pre-quantized checkpoint weights:
+      1. Weight arrives on CPU as float8_e4m3fn from the checkpoint.
+      2. _dma_to_spyre_fp8_kernel transfers it to Spyre in QFP8WT KERNEL layout.
+      3. The on-device tensor is captured in the closure of the @torch.compile
+         function — it is NOT passed as a graph input.
+
+    Bug history:
+      - Non-square shapes (K ≠ N) were silently wrong before two fixes:
+        (a) spyre_mem.cpp QFP8WT DCI: K and N were swapped after the
+            PyTorch→hardware axis reversal, scrambling bytes for K ≠ N.
+        (b) work_division.py: `core_fold` was set to N//128 (= n_sticks)
+            instead of the hardware constant 4, giving wrong SDSC coordInfo
+            for all N except 512.
+    """
+
+    @pytest.mark.parametrize(
+        "m, k, n",
+        [
+            # Square (K == N): passed before fixes (self-consistent wrong encoding)
+            (4,  512,  512),
+            (4, 4096, 4096),
+            # Non-square (K ≠ N): failed before fixes — now the primary regression guard
+            (4, 4096,  512),   # K > N  (e.g. k_proj/v_proj in Granite GQA)
+            (4,  512, 1024),   # K < N
+            (4, 4096, 1024),   # K > N  (e.g. k_proj/v_proj)
+            (4, 2048, 4096),   # K < N  (e.g. down_proj)
+        ],
+    )
+    def test_prequantized_closed_over(self, m, k, n):
+        """Pre-quantized FP8 weight closed over as frozen constant produces correct output.
+
+        Weight is quantized on CPU to float8_e4m3fn, transferred to Spyre via
+        _dma_to_spyre_fp8_kernel, and closed over in the compiled function.
+        CPU reference: quantize both inputs to FP8, dequantize, matmul in FP16.
+        """
+        from torch_spyre.model_utils import _dma_to_spyre_fp8_kernel
+
+        torch.manual_seed(42)
+        act_cpu    = torch.randn(m, k, dtype=torch.float16)
+        weight_cpu = torch.randn(n, k, dtype=torch.float16)   # [n, k] → T → [k, n]
+        scale_a    = torch.tensor(1.0, dtype=torch.float16)
+        scale_b    = torch.tensor(1.0, dtype=torch.float16)
+
+        # Simulate a checkpoint FP8 weight: quantize [n,k], transpose to [k,n] for matmul
+        weight_fp8_T = (
+            weight_cpu.clamp(-448.0, 448.0).to(torch.float8_e4m3fn).T.contiguous()
+        )
+        # Transfer to Spyre as QFP8WT KERNEL tensor; close over in compiled fn
+        q_w_spyre = _dma_to_spyre_fp8_kernel(weight_fp8_T)
+
+        torch._dynamo.reset()
+
+        @torch.compile(backend="inductor")
+        def spyre_fn(act, sa, sb):
+            q_act = torch.ops.spyre.quantize_fp8_with_scale(act, sa)
+            # q_w_spyre is a frozen constant from the enclosing scope
+            return torch.ops.aten._scaled_mm(
+                q_act, q_w_spyre,
+                scale_a=sa, scale_b=sb,
+                bias=None, out_dtype=torch.float16,
+            )
+
+        result = spyre_fn(
+            act_cpu.to(DEVICE),
+            scale_a.to(DEVICE),
+            scale_b.to(DEVICE),
+        )
+
+        # CPU reference: quantize both to FP8, dequantize, matmul
+        q_a = act_cpu.clamp(-448.0, 448.0).to(torch.float8_e4m3fn).to(torch.float16)
+        q_b = weight_cpu.clamp(-448.0, 448.0).to(torch.float8_e4m3fn).to(torch.float16)
+        cpu_ref = (q_a @ q_b.T) * 1.0
+
+        out_cpu = result.to("cpu").to(torch.float16)
+        torch.testing.assert_close(out_cpu, cpu_ref, atol=4.0, rtol=0.1)
