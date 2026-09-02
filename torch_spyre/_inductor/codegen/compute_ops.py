@@ -18,11 +18,7 @@ import dataclasses
 from sympy import Symbol
 
 from torch_spyre._C import DataFormats, encode_constant
-from torch_spyre._inductor.constants import (
-    CONV2D_DIM_LABELS,
-    DEPTHWISE_CONV2D_OP,
-    FP8_2D_STICK_OPS,
-)
+from torch_spyre._inductor.constants import CONV2D_DIM_LABELS, DEPTHWISE_CONV2D_OP
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.op_spec import TensorWorkDivision
 from torch_spyre._inductor.pass_utils import coeff_through_floor
@@ -240,69 +236,13 @@ def add_constant(kwargs, name, value) -> int:
     return index
 
 
-# FP8 has 128 elements per stick. A QFP8WT tensor with 2D stick [2, 64]
-# is flattened back to [128] by DDL. Matching this sentinel identifies
-# tensors that need their 2D-stick metadata restored.
-_FP8_FLAT_STICK_SIZE = [128]  # == 2 * 64
-
-# Index of the QFP8WT-layout tensor within each op in FP8_2D_STICK_OPS.
-# Both ops store it at argument index 1 in op_spec.args (inputs then outputs):
-#   batchmatmulfp8: arg 0 = INPUT activation,  arg 1 = INPUT KERNEL weight (QFP8WT)
-#   qfp8wt:         arg 0 = INPUT fp16 weight,  arg 1 = OUTPUT fp8 weight (QFP8WT)
-# In hardware terminology both are "KERNEL layout" tensors — qfp8wt's OUTPUT is
-# the weight that batchmatmulfp8 will subsequently consume as its KERNEL input.
-_FP8_2D_STICK_TENSOR_IDX = 1
-
-
-def _layout_info_for_tensor(sdsc_spec, tensor, tensor_idx: int) -> dict:
-    """Return layout metadata to emit for a tensor.
-
-    For individually compiled FP8 ops in FP8_2D_STICK_OPS, the upstream
-    flattening needed to satisfy DDL's max-dimension limit can erase the
-    semantic 2D-stick metadata on the KERNEL tensor. Restore that metadata
-    here so the emitted SDSC matches the combined-compilation shape contract.
-
-    Covers both ``batchmatmulfp8`` (consumer) and ``qfp8wt`` (producer) so
-    that individually compiled kernels for either op emit the correct 2D-stick
-    layout, mirroring the flattening guard in superdsc._create_sdsc_tensors.
-    """
-    layout_info = sdsc_spec.layouts[tensor.layout]
-    if (
-        sdsc_spec.opfunc in FP8_2D_STICK_OPS
-        and tensor_idx == _FP8_2D_STICK_TENSOR_IDX
-        and tensor.data_format == DataFormats.SEN143_FP8
-        and layout_info["stick_size"] == _FP8_FLAT_STICK_SIZE
-    ):
-        # After DDL flattening a rank-4+ tensor produces a 3-element dim_order
-        # (one collapsed leading dim + the two trailing stick dims). The [-2:]
-        # slice always selects the two stick dims regardless of how many leading
-        # dims were collapsed, because flattening only touches leading dims and
-        # the trailing stick dims are preserved as-is by _flatten_device_size_for_ddl
-        # (keep_trailing_dims=2). Ranks above 3 are therefore safe.
-        dim_order = layout_info["dim_order"]
-        if len(dim_order) < 2:
-            raise ValueError(
-                f"FP8 {sdsc_spec.opfunc} kernel tensor expected at least 2D "
-                f"dim_order, got {len(dim_order)}D: {dim_order}"
-            )
-        return {
-            **layout_info,
-            "stick_dim_order": list(dim_order),
-            "stick_size": [2, 64],
-        }
-    return layout_info
-
-
-def _compute_fp8_coord_params(
-    tensor, dim, sdsc_spec, tensor_idx: int
-) -> tuple[bool, int]:
+def _compute_fp8_coord_params(tensor, dim, sdsc_spec):
     """Compute FP8 2D stick coordinate parameters for a dimension.
 
-    Returns tuple: (is_fp8_stick, stick_idx)
+    Returns tuple: (is_fp8_stick, other_stick_size, stick_idx)
     """
-    layout_info = _layout_info_for_tensor(sdsc_spec, tensor, tensor_idx)
-    stick_size_list = layout_info["stick_size"]
-    stick_dim_order = layout_info["stick_dim_order"]
+    stick_size_list = sdsc_spec.layouts[tensor.layout]["stick_size"]
+    stick_dim_order = sdsc_spec.layouts[tensor.layout]["stick_dim_order"]
 
     is_fp8_stick = (
         tensor.data_format == DataFormats.SEN143_FP8 and len(stick_size_list) > 1
@@ -310,13 +250,13 @@ def _compute_fp8_coord_params(
 
     if dim in stick_dim_order and len(stick_size_list) > 1:
         stick_idx = stick_dim_order.index(dim)
+        other_idx = 1 - stick_idx
+        other_stick_size = stick_size_list[other_idx]
     else:
         stick_idx = -1
+        other_stick_size = 1
 
-    return (
-        bool(is_fp8_stick),
-        int(stick_idx),
-    )
+    return is_fp8_stick, other_stick_size, stick_idx
 
 
 def gen_coord_info_value(
@@ -328,8 +268,6 @@ def gen_coord_info_value(
     conv_params=None,
     padding: str = "nopad",
     is_fp8_stick: bool = False,
-    is_2d_stick: bool = False,
-    other_stick_size: int = 1,
     stick_idx: int = -1,
     tensor_idx: int = -1,
     opfunc: str = "",
@@ -397,41 +335,7 @@ def gen_coord_info_value(
                 ],
             },
         }
-    elif is_stick_dim and is_fp8_stick and is_2d_stick and stick_idx == 0:
-        # QFP8WT 2D-stick: the `in` (K/reduction) dimension of the KERNEL weight.
-        # Physical memory layout groups K in pairs (outer_stick=2), so the stride
-        # between K-groups is 2 elements, not elems_per_stick=128.
-        # Production Granite FP8 SDSCs confirm: alpha=[...,2,1], factor=[K//2, 2].
-        # (other_stick_size here is stickSize_[1]=64, but the K stride uses [0]=2.)
-        _outer_stick = 2  # stickSize_[0] for QFP8WT is always 2
-        return {
-            "spatial": 3,
-            "temporal": 0,
-            "elemArr": 2,
-            "padding": "nopad",
-            "folds": {
-                "dim_prop_func": [
-                    {"Affine": {"alpha_": size, "beta_": 0}},
-                    {"Affine": {"alpha_": 0, "beta_": 0}},
-                    {"Affine": {"alpha_": 0, "beta_": 0}},
-                    {"Affine": {"alpha_": _outer_stick, "beta_": 0}},
-                    {"Affine": {"alpha_": 1, "beta_": 0}},
-                ],
-                "dim_prop_attr": [
-                    {"factor_": nsplits, "label_": "core_fold"},
-                    {"factor_": 1, "label_": "corelet_fold"},
-                    {"factor_": 1, "label_": "row_fold"},
-                    {"factor_": size // _outer_stick, "label_": "elem_arr_1"},
-                    {"factor_": _outer_stick, "label_": "elem_arr_0"},
-                ],
-            },
-        }
-    elif is_stick_dim and is_fp8_stick and not (is_2d_stick and stick_idx == 0):
-        # QFP8WT 2D-stick layout: the out/N dimension of the KERNEL weight is
-        # arranged in groups of 64 (outer) containing 8 sub-groups of 8 elements.
-        # Production Granite FP8 SDSCs (granite_fp8/execute_itr0/sdsc/) confirm
-        # the fixed encoding: alpha=[...,64,8,1], factor=[size//64,8,8].
-        # Non-2D FP8 sticks keep the same encoding derived from size.
+    elif is_stick_dim and is_fp8_stick and not (stick_idx == 0):
         return {
             "spatial": 3,
             "temporal": 0,
@@ -1243,8 +1147,6 @@ def generate_sdsc(
         layout = sdsc_spec.layouts[tensor.layout]
         dim_order = _filter_window_dims(layout["dim_order"], tensor.layout)
         stick_dim_order = layout["stick_dim_order"]
-        stick_size_list = layout["stick_size"]
-        has_2d_stick = len(stick_size_list) > 1
         is_input = tensor_idx < sdsc_spec.num_inputs
         result = {}
         for dim in dim_order:
@@ -1259,9 +1161,7 @@ def generate_sdsc(
             # depthwise and every other op.
             dim_size = _coord_size(dim_str, sdsc_spec.iteration_space[dim], is_input)
             size = _coord_per_core_size(dim, is_input, nsplits) if is_tiled else 1
-            is_fp8, st_idx = _compute_fp8_coord_params(
-                tensor, dim, sdsc_spec, tensor_idx
-            )
+            is_fp8, _, st_idx = _compute_fp8_coord_params(tensor, dim, sdsc_spec)
             conv_params = (
                 get_conv_params(
                     tensor_idx,
@@ -1274,14 +1174,6 @@ def generate_sdsc(
                 if op == DEPTHWISE_CONV2D_OP
                 else None
             )
-            # For 2D-stick (QFP8WT) dims, compute the other stick size so
-            # gen_coord_info_value can emit correct elem_arr factors.
-            if has_2d_stick and (dim in stick_dim_order):
-                cur_stick_idx = stick_dim_order.index(dim)
-                other_stick_idx = 1 - cur_stick_idx
-                other_stick_size = stick_size_list[other_stick_idx]
-            else:
-                other_stick_size = 1
 
             result[dim_str] = gen_coord_info_value(
                 size=size,
@@ -1290,8 +1182,6 @@ def generate_sdsc(
                 is_stick_dim=(dim in stick_dim_order),
                 is_stick_reduction=(scale == -2),
                 is_fp8_stick=is_fp8,
-                is_2d_stick=has_2d_stick,
-                other_stick_size=other_stick_size,
                 stick_idx=st_idx,
                 tensor_idx=tensor_idx,
                 opfunc=sdsc_spec.opfunc,
@@ -1536,37 +1426,26 @@ def generate_sdsc(
                                     },
                                 }
                             },
-                            # Iterate args instead of sdsc_spec.layouts so _layout_info_for_tensor
-                            # receives the originating tensor and tensor_idx, allowing it to apply
-                            # any tensor-specific layout adjustments (e.g. FP8 2D-stick override).
                             "primaryDsInfo_": {
-                                tensor.layout: (
-                                    lambda layout_info, label=tensor.layout: {
-                                        "layoutDimOrder_": [
-                                            str(dim)
-                                            for dim in _filter_window_dims(
-                                                layout_info["dim_order"], label
-                                            )
-                                        ],
-                                        "stickDimOrder_": [
-                                            str(dim)
-                                            for dim in layout_info["stick_dim_order"]
-                                        ],
-                                        "stickSize_": layout_info["stick_size"],
-                                        **(
-                                            {"stickRepl_": [1]}
-                                            if sdsc_spec.stick_replication
-                                            else {}
-                                        ),
-                                    }
-                                )(_layout_info_for_tensor(sdsc_spec, tensor, i))
-                                # Keyed by tensor.layout (the layout-role label assigned by
-                                # _get_layout_label). Two tensors share a label only when their
-                                # dim_order, stick_dim_order, and stick_size are all identical —
-                                # in that case the values are equal too, so the overwrite is
-                                # harmless. If the same label could map to distinct layouts in
-                                # the future, key by (i, tensor.layout) instead.
-                                for i, tensor in enumerate(sdsc_spec.args)
+                                label: {
+                                    "layoutDimOrder_": [
+                                        str(dim)
+                                        for dim in _filter_window_dims(
+                                            layout_info["dim_order"], label
+                                        )
+                                    ],
+                                    "stickDimOrder_": [
+                                        str(dim)
+                                        for dim in layout_info["stick_dim_order"]
+                                    ],
+                                    "stickSize_": layout_info["stick_size"],
+                                    **(
+                                        {"stickRepl_": [1]}
+                                        if sdsc_spec.stick_replication
+                                        else {}
+                                    ),
+                                }
+                                for label, layout_info in sdsc_spec.layouts.items()
                             },
                             **(
                                 {"pdsRelation_": {"isPdsReuse": 1}}

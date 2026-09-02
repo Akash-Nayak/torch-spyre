@@ -17,11 +17,12 @@ import math
 from collections import Counter
 from typing import Any
 
-from sympy import Expr, Integer, S, Symbol
+from sympy import Expr, Integer, Symbol
 from torch._inductor.virtualized import V
 
-from torch_spyre._C import DataFormats, ElementArrangement
+from torch_spyre._C import DataFormats
 from torch_spyre._inductor import config as _spyre_config
+from torch_spyre._C import ElementArrangement
 from torch_spyre._inductor.constants import (
     CONV2D_DIM_LABELS,
     CONV2D_FWD_OP,
@@ -30,7 +31,6 @@ from torch_spyre._inductor.constants import (
     CONV_OPS,
     DEPTHWISE_CONV2D_OP,
     FP32TOINT32_OP,
-    FP8_2D_STICK_OPS,
     IDENTITY_OP,
     INPUT_DIM_LABELS,
     INT32TOFP32_OP,
@@ -270,15 +270,6 @@ def _get_coordinate_mask(
 
 def _calculate_device_stride(dev_dim_idx: int, device_size: list) -> int:
     return math.prod(device_size[-dev_dim_idx - 2 :])
-
-
-def _qfp8wt_stick_stride(device_size: list) -> int:
-    """Return the stride for the inner stick iteration variable of a QFP8WT tensor.
-
-    In the QFP8WT device layout [outer_stick, non_stick..., inner_stick], the inner
-    stick iteration variable's stride in DCI terms is just outer_stick = device_size[0].
-    """
-    return device_size[0]
 
 
 # SDSC dim labels for the conv2d padding (output-spatial) and window (kernel)
@@ -1121,92 +1112,6 @@ def _collect_index_tensor_layouts(
     return index_tensor_layouts, index_active_dims
 
 
-def _flatten_device_size_for_ddl(
-    device_size: list[int],
-    *,
-    keep_trailing_dims: int,
-    max_dims: int = 3,
-    # NOTE: Return type is tuple[list[int], int] — a breaking change from the
-    # original list[int] return. All call-sites must unpack both values.
-) -> tuple[list[int], int]:
-    """Flatten leading device dims to satisfy the DDL dimension limit.
-
-    ``keep_trailing_dims`` preserves the trailing layout structure that SDSC/DDL
-    interprets semantically (for example the FP8 kernel's 2D stick).  Only the
-    leading outer dims are collapsed.
-
-    Returns ``(flattened_size, dims_to_flatten)`` so the caller can apply the
-    same collapse to ``device_coordinates`` via
-    ``_flatten_device_coordinates_for_ddl``.  ``dims_to_flatten`` is 0 when no
-    flattening was needed.
-    """
-    if len(device_size) <= max_dims:
-        return device_size, 0
-
-    if keep_trailing_dims >= len(device_size):
-        return device_size, 0
-
-    leading_dims = len(device_size) - keep_trailing_dims
-    allowed_leading_dims = max_dims - keep_trailing_dims
-    # Defensive check: allowed_leading_dims should always be >= 1 given current callers
-    # (max_dims=3, keep_trailing_dims<=2), but guard against future changes
-    assert allowed_leading_dims >= 1, (
-        f"Invalid flattening parameters: max_dims={max_dims}, "
-        f"keep_trailing_dims={keep_trailing_dims} results in "
-        f"allowed_leading_dims={allowed_leading_dims} < 1"
-    )
-    if leading_dims <= allowed_leading_dims:
-        return device_size, 0
-
-    dims_to_flatten = leading_dims - allowed_leading_dims + 1
-    flattened_dim = math.prod(device_size[:dims_to_flatten])
-    result = [flattened_dim] + device_size[dims_to_flatten:]
-
-    logger.debug(
-        "Flattened device_size for DDL from %s to %s (keep_trailing_dims=%s)",
-        device_size,
-        result,
-        keep_trailing_dims,
-    )
-    return result, dims_to_flatten
-
-
-def _flatten_device_coordinates_for_ddl(
-    device_coordinates: list,
-    dims_to_flatten: int,
-) -> list:
-    """Collapse the leading ``dims_to_flatten`` device coordinates to a single zero.
-
-    Mirrors ``_flatten_device_size_for_ddl``.  For QFP8WT kernel tensors the
-    leading outer-batch coordinates are always compile-time constants (all zero
-    for a single partition), so the combined linear offset of the collapsed dims
-    is zero and can be represented by a single ``sympy.S.Zero`` entry.  This
-    keeps ``device_coordinates`` and ``device_size`` in sync so that the
-    ``coord_idx = -stride_idx - 2`` lookups in ``_create_sdsc_tensors`` index
-    the correct physical axis after flattening.
-
-    Precondition: all collapsed leading coordinates must be zero — only valid
-    for single-partition compilation where outer-batch coords are unused.
-    """
-    # dims_to_flatten == 0 means _flatten_device_size_for_ddl found no flattening
-    # needed; dims_to_flatten == 1 would be a no-op (collapsing one dim into itself).
-    # _flatten_device_size_for_ddl never returns 1, so <= 1 guards both cases.
-    if dims_to_flatten <= 0:
-        return device_coordinates
-    assert dims_to_flatten >= 2, (
-        f"dims_to_flatten={dims_to_flatten} is unexpected; "
-        f"_flatten_device_size_for_ddl should never return 1"
-    )
-    # Precondition: all collapsed leading coords must be zero.
-    # Outer-batch coordinates are always 0 for single-partition execution.
-    assert all(c == S.Zero for c in device_coordinates[:dims_to_flatten]), (
-        f"Expected all-zero leading coordinates for DDL flattening, got: "
-        f"{device_coordinates[:dims_to_flatten]}"
-    )
-    # Collapse the first dims_to_flatten entries into a single zero.
-    return [S.Zero] + list(device_coordinates[dims_to_flatten:])
-
-
 def _create_sdsc_tensors(
     op_spec: OpSpec,
     symbol_mapping: dict,
@@ -1214,7 +1119,6 @@ def _create_sdsc_tensors(
     op_dim_order: list[Symbol],
     op_stick_dim: Symbol | None,
     injected_dims: dict[str, Any] | None = None,
-    work_slices: dict | None = None,
 ) -> tuple[list[SDSCArgs], dict, Symbol | None]:
     dims = list(iteration_space.keys())
     if injected_dims is None:
@@ -1253,39 +1157,7 @@ def _create_sdsc_tensors(
 
     for i, arg in enumerate(op_spec.args):
         is_fp8_mm_kernel_arg = arg.element_arrangement == ElementArrangement.QFP8WT
-        # Flatten device_size (and device_coordinates) for QFP8WT tensors in ops
-        # that use the 2D-stick layout (qfp8wt and batchmatmulfp8). fp8todl16 reads
-        # a QFP8WT-arranged tensor but uses a 1D flat FP8 input — its device_size is
-        # already within DDL limits. Non-QFP8WT tensors must not be flattened: their
-        # 4D device_size encodes correct per-dim strides; collapsing leading dims
-        # corrupts stride_idx lookups.
-        # device_coordinates must be co-flattened with device_size so that the
-        # coord_idx = -stride_idx - 2 lookups in the loop below index the correct
-        # physical axis after flattening.
-        if is_fp8_mm_kernel_arg and op_spec.op in FP8_2D_STICK_OPS:
-            original_device_size = arg.device_size
-            flattened_device_size, dims_to_flatten = _flatten_device_size_for_ddl(
-                original_device_size,
-                keep_trailing_dims=2,
-            )
-            if flattened_device_size != original_device_size:
-                # Precondition: leading outer-batch coords are 0 for single-partition
-                # compilation. See _flatten_device_coordinates_for_ddl for details.
-                flattened_coords = _flatten_device_coordinates_for_ddl(
-                    arg.device_coordinates, dims_to_flatten
-                )
-                arg = dataclasses.replace(
-                    arg,
-                    device_size=flattened_device_size,
-                    device_coordinates=flattened_coords,
-                )
-                logger.info(
-                    "Flattened device_size for arg %s (%s): %s -> %s",
-                    i,
-                    arg.name or "unnamed",
-                    original_device_size,
-                    flattened_device_size,
-                )
+
         # Step 1: Determine dimension order and stick dimension.
         # Index tensors use their pre-computed layout (their coords have no IndirectAccess).
         if has_indirect_access and i in index_tensor_layouts:
@@ -1472,18 +1344,9 @@ def _create_sdsc_tensors(
                 # iteration extent. Emitting a backGap for a conv op double-counts
                 # that gap and corrupts the generated addressing.
                 #
-                # LX buffers must not carry a backGap: the scratchpad planner
-                # (_would_produce_lx_back_gap) already prevents any LX buffer
-                # whose device_size > it_dim_size from being placed in LX, so
-                # this branch should never fire for LX in practice.  Guard
-                # defensively to avoid corrupting the generated SDSC.
-                is_lx = "lx" in arg.allocation
-                if not _is_conv(op_spec.op) and not is_lx:
+                if not _is_conv(op_spec.op):
                     backGap[dim] = dev_dim_size - it_dim_size
-                # 2D-stick QFP8WT: stride is already the inner-stick stride
-                # (= outer_stick = 2); do not rescale it by dev/it ratio.
-                if not is_fp8_mm_kernel_arg:
-                    strides[dim] = strides[dim] // dev_dim_size * it_dim_size
+                strides[dim] = strides[dim] // dev_dim_size * it_dim_size
 
         # Injected dimensions (mb_sym for P=1, stick symbols for absent coords)
         # require explicit max_dim_size: 1 for value/output, -1 for others.
@@ -1525,14 +1388,10 @@ def _create_sdsc_tensors(
         effective_stick = [op_stick_dim if stick_dim is None else stick_dim]
         layout_labels = _get_tensor_layout_labels(use_op_dims, op_spec.op)
 
-        # Special handling for QFP8WT KERNEL tensors.
-        # Both qfp8wt (weight quantization) and batchmatmulfp8 (the consumer) require
-        # a 2D stick [2, stick_size/2] — mandated by quantization_no_pad.ddl and
-        # the batchmatmul DDL respectively. fp8todl16 also carries a QFP8WT-arranged
-        # tensor as input but uses a 1D flat FP8 input (quantization_double_pad.ddl).
+        # Special handling for FP8 matmul KERNEL tensor
         dtype_stick_size = arg.device_dtype.elems_per_stick()
         layout_stick_size = [dtype_stick_size]
-        if is_fp8_mm_kernel_arg and op_spec.op in ("batchmatmulfp8", "qfp8wt"):
+        if is_fp8_mm_kernel_arg:
             # FP8 KERNEL needs 2D stick: [2, stick_size/2]
             layout_stick_size = [2, dtype_stick_size // 2]
             # Use the last two dimensions from dim_order for 2D stick
@@ -2157,7 +2016,6 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         op_dim_order,
         op_stick_dim,
         injected_dims=injected_dims,
-        work_slices=work_slices,
     )
     if missing_dim is not None:
         # A dimension was added to the iteration space, update splits and work slices

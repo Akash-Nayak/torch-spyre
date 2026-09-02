@@ -1742,8 +1742,11 @@ def _cost_model_matmul_planner(
     if math.prod(new_splits.values()) < math.prod(splits.values()):
         if not has_qfp8wt_tensor(input_tds + [output_td]):
             return splits
-        # For QFP8WT, force k_dim = 1 regardless of core count
+        # For QFP8WT, force k_dim = 1 and, for batchmatmulfp8, n_dim to the
+        # required constant split regardless of core count.
         new_splits[k_dim] = 1
+        if is_fp8_bmm:
+            new_splits[n_dim] = _FP8_BMM_N_SPLIT
 
     logger.debug(
         f"cost_model work_division {op.get_name()}: "
