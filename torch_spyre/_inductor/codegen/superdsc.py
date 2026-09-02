@@ -1155,8 +1155,27 @@ def _create_sdsc_tensors(
     missing_dim = None
     sdsc_args: list[SDSCArgs] = []
 
+    # Detect whether this is a QFP8WT identity (copy_from_d2d) op.  The
+    # hardware identity op does not support backGapCore_ on an elemArr=3
+    # (3-level QFP8WT) dimension, which is what the 2D-stick encoding produces
+    # for the outer stick axis.  For a verbatim bit-copy of QFP8WT data (clone
+    # of a strided N-slice) the copy just moves raw bytes — it does not need
+    # the 3-level decode.  Using the standard 1D-stick encoding (elemArr=2 on
+    # the outer stick dim, elemArr=1 on the inner) lets the hardware process
+    # the backGap on elemArr=2, which it supports.
+    _is_qfp8wt_identity = op_spec.op == IDENTITY_OP and any(
+        a.element_arrangement == ElementArrangement.QFP8WT and a.is_input
+        for a in op_spec.args
+    )
+
     for i, arg in enumerate(op_spec.args):
         is_fp8_mm_kernel_arg = arg.element_arrangement == ElementArrangement.QFP8WT
+        # For QFP8WT identity copies, suppress the 2D-stick override so that
+        # both the source and destination use the plain 1D-stick layout.  This
+        # downgrades the out-dim to elemArr=2 and allows the hardware to apply
+        # backGapCore_ correctly.
+        if _is_qfp8wt_identity:
+            is_fp8_mm_kernel_arg = False
 
         # Step 1: Determine dimension order and stick dimension.
         # Index tensors use their pre-computed layout (their coords have no IndirectAccess).

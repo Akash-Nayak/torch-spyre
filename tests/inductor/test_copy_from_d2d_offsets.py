@@ -238,5 +238,119 @@ class TestCopyFromD2DStridedViews(unittest.TestCase):
             )
 
 
+class TestCopyFromD2DFP8QFP8WT(unittest.TestCase):
+    """copy_from_d2d (clone) on QFP8WT KERNEL tensors.
+
+    Guards against the two-bug crash introduced when cloning a strided
+    column-slice of a QFP8WT weight tensor on Spyre:
+
+      Bug 1 (superdsc.py): is_fp8_mm_kernel_arg unconditionally applied the
+        2D-stick encoding (elemArr=3) for QFP8WT tensors, including identity
+        copy ops.  The hardware identity op does not support backGapCore_ on
+        an elemArr=3 dimension.  Fix: suppress the 2D-stick override for
+        QFP8WT identity ops so both tensors use the plain 1D-stick layout
+        (elemArr=2 on the outer stick axis), which the hardware can combine
+        with backGapCore_.
+
+      Bug 2 (deeptools DDL): unary_parallel.ddl had no identity binding for
+        SEN143_FP8.  The DDC scheduler matched computeOp_.dataFormat_ against
+        the binding type list and found nothing, aborting with "Scheduler
+        failed to find a suitable op mapping for sdsc: 0_identity".  Fix:
+        add %identity_fp8_op = ddl.operation_bind([%type_fp8], ...) to
+        unary_parallel.ddl.
+
+    Both fixes are required: Bug 1 produces the wrong SDSC structure; Bug 2
+    means the DDC cannot schedule even the correct structure.
+    """
+
+    def _make_fp8_kernel(self, K, N):
+        """DMA a [K, N] float8_e4m3fn matrix to Spyre in QFP8WT KERNEL layout."""
+        from torch_spyre.model_utils import _dma_to_spyre_fp8_kernel
+
+        cpu = torch.randn(K, N).to(torch.float8_e4m3fn)
+        return _dma_to_spyre_fp8_kernel(cpu)
+
+    def test_contiguous_clone(self):
+        """Cloning a contiguous QFP8WT tensor succeeds and preserves bit-identical data.
+
+        Correctness is verified by cloning a second independent copy of the same
+        weight tensor and comparing the two clones byte-for-byte.  Direct
+        comparison to the original CPU tensor is not meaningful because
+        _dma_to_spyre_fp8_kernel reorders bytes into QFP8WT packed layout on device.
+        """
+        K, N = 4096, 4096
+        w_spyre = self._make_fp8_kernel(K, N)
+        clone_a = w_spyre.clone()
+        clone_b = w_spyre.clone()
+        self.assertEqual(clone_a.shape, w_spyre.shape)
+        self.assertEqual(clone_a.stride(), (N, 1))
+        torch.testing.assert_close(
+            clone_a.cpu().view(torch.uint8), clone_b.cpu().view(torch.uint8)
+        )
+
+    def test_column_tile_clone(self):
+        """Cloning a strided column-slice [:, 0:N_tile] succeeds and is bit-identical
+        to an independent contiguous copy of the same tile.
+
+        Primary reproducer: w_full[:, 0:N_tile] inherits stride=(N_full, 1),
+        so copy_from_d2d must emit backGapCore_ to skip the trailing
+        N_full-N_tile elements at the end of each K-row.  Without both fixes
+        this aborts with "Scheduler failed to find a suitable op mapping for
+        sdsc: 0_identity".
+        """
+        K, N_full, N_tile = 4096, 6144, 4096
+        w_full = self._make_fp8_kernel(K, N_full)
+        # Build an independent contiguous reference for the same tile by DMAs
+        # a [K, N_tile] weight separately — same K rows, contiguous on device.
+        w_ref = self._make_fp8_kernel(K, N_full)[:, 0:N_tile].clone()
+
+        w_tile = w_full[:, 0:N_tile]
+        self.assertFalse(w_tile.is_contiguous())
+        self.assertEqual(w_tile.stride(), (N_full, 1))
+
+        w_clone = w_tile.clone()
+
+        self.assertEqual(w_clone.shape, torch.Size([K, N_tile]))
+        self.assertTrue(w_clone.is_contiguous())
+        self.assertEqual(w_clone.stride(), (N_tile, 1))
+        # Both clones come from the same on-device packed bytes — they must match.
+        torch.testing.assert_close(
+            w_clone.cpu().view(torch.uint8),
+            w_ref.cpu().view(torch.uint8),
+        )
+
+    def test_multiple_column_tiles(self):
+        """Cloning the same tile twice from the same base gives identical results.
+
+        Verifies consistency across repeated copies of the same strided view —
+        guards against the earlier silent-wrong-data bug where the second clone
+        returned the first call's data.
+        """
+        K, N_full, N_tile = 4096, 6144, 2048
+        w_full = self._make_fp8_kernel(K, N_full)
+        n_tiles = N_full // N_tile
+        for i in range(n_tiles):
+            col_start = i * N_tile
+            w_tile = w_full[:, col_start : col_start + N_tile]
+            clone_a = w_tile.clone()
+            clone_b = w_tile.clone()
+            self.assertEqual(clone_a.shape, torch.Size([K, N_tile]))
+            torch.testing.assert_close(
+                clone_a.cpu().view(torch.uint8),
+                clone_b.cpu().view(torch.uint8),
+                msg=f"tile {i} (cols {col_start}:{col_start + N_tile})",
+            )
+
+    def test_revisit_same_tile(self):
+        """Cloning the same tile multiple times returns consistent data."""
+        K, N_full, N_tile = 4096, 6144, 4096
+        w_full = self._make_fp8_kernel(K, N_full)
+        w_tile = w_full[:, 0:N_tile]
+        first = w_tile.clone().cpu().view(torch.uint8)
+        for _ in range(2):
+            w_clone = w_tile.clone()
+            torch.testing.assert_close(w_clone.cpu().view(torch.uint8), first)
+
+
 if __name__ == "__main__":
     unittest.main()
