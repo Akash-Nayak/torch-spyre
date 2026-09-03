@@ -275,6 +275,8 @@ def gen_coord_info_value(
     is_stick_reduction: bool = False,
     conv_params=None,
     padding: str = "nopad",
+    is_fp8_stick: bool = False,
+    stick_idx: int = -1,
     tensor_idx: int = -1,
     opfunc: str = "",
     core_stride: int | None = None,
@@ -338,6 +340,40 @@ def gen_coord_info_value(
                         "factor_": elem_arr_factor,
                         "label_": "elem_arr_0",
                     },
+                ],
+            },
+        }
+    elif is_stick_dim and is_fp8_stick and not (stick_idx == 0):
+        # size is the per-core element count for this dim (iteration_space[dim] //
+        # nsplits, in elements).  For QFP8WT the outer stick dim has a fixed
+        # inner granularity of 64 elements, so size must be 64-aligned.  This is
+        # guaranteed because n_sticks = N // 128, nsplits is a divisor of n_sticks,
+        # so size = N // nsplits = 128 * (n_sticks // nsplits), and 128 // 64 = 2.
+        assert size % 64 == 0, (
+            f"FP8 outer-stick dim size must be 64-aligned for correct elemArr "
+            f"encoding, got size={size} (nsplits={nsplits})"
+        )
+        return {
+            "spatial": 3,
+            "temporal": 0,
+            "elemArr": 3,
+            "padding": "nopad",
+            "folds": {
+                "dim_prop_func": [
+                    {"Affine": {"alpha_": size, "beta_": 0}},
+                    {"Affine": {"alpha_": 0, "beta_": 0}},
+                    {"Affine": {"alpha_": 0, "beta_": 0}},
+                    {"Affine": {"alpha_": 64, "beta_": 0}},
+                    {"Affine": {"alpha_": 8, "beta_": 0}},
+                    {"Affine": {"alpha_": 1, "beta_": 0}},
+                ],
+                "dim_prop_attr": [
+                    {"factor_": nsplits, "label_": "core_fold"},
+                    {"factor_": 1, "label_": "corelet_fold"},
+                    {"factor_": 1, "label_": "row_fold"},
+                    {"factor_": size // 64, "label_": "elem_arr_2"},
+                    {"factor_": 8, "label_": "elem_arr_1"},
+                    {"factor_": 8, "label_": "elem_arr_0"},
                 ],
             },
         }
@@ -1142,6 +1178,16 @@ def generate_sdsc(
             # depthwise and every other op.
             dim_size = _coord_size(dim_str, sdsc_spec.iteration_space[dim], is_input)
             size = _coord_per_core_size(dim, is_input, nsplits) if is_tiled else 1
+            stick_size_list = layout["stick_size"]
+            is_fp8 = (
+                tensor.data_format == DataFormats.SEN143_FP8
+                and len(stick_size_list) > 1
+            )
+            st_idx = (
+                stick_dim_order.index(dim)
+                if dim in stick_dim_order and len(stick_size_list) > 1
+                else -1
+            )
             conv_params = (
                 get_conv_params(
                     tensor_idx,
@@ -1161,6 +1207,8 @@ def generate_sdsc(
                 elems_per_stick=tensor.data_format.elems_per_stick(),
                 is_stick_dim=(dim in stick_dim_order),
                 is_stick_reduction=(scale == -2),
+                is_fp8_stick=is_fp8,
+                stick_idx=st_idx,
                 tensor_idx=tensor_idx,
                 opfunc=sdsc_spec.opfunc,
                 padding=_coord_padding(dim_str, is_input),
