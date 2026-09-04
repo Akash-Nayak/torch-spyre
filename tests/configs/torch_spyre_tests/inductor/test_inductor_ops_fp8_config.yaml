@@ -9,8 +9,3 @@ test_suite_config:
           mode: mandatory_success
           tags:
             - ops__inductor-fp8
-        - names:
-            - TestFP8IssuesVerification::test_scaled_mm_granite_fp8_shapes.*
-          mode: mandatory_success
-          tags:
-            - ops__inductor-fp8
