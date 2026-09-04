@@ -2074,14 +2074,15 @@ def compute_restickify_needed(
     ):
         return False, None
 
-    # ReStickifyOpHBM currently supports only the native FP16 device format
-    # (both logical float16 and bfloat16 map to SEN169_FP16).
+    # ReStickifyOpHBM supports the native FP16 device format (SEN169_FP16) and
+    # FP8 (SEN143_FP8). IEEE_FP32 and other non-DL16 formats are not supported.
     # Do not advertise an edge as feasible when codegen cannot lower it: this
     # is especially important for fp32-upcast graphs, where a later IEEE_FP32
     # restick can otherwise tie with and displace the valid FP16 restick before
     # the conversion. This also deliberately precedes the factorized-layout
     # target below: a concrete target is not actionable for a non-DL16 input.
-    if in_stl.device_dtype != DataFormats.SEN169_FP16:
+    _RESTICKIFY_SUPPORTED_DTYPES = (DataFormats.SEN169_FP16, DataFormats.SEN143_FP8)
+    if in_stl.device_dtype not in _RESTICKIFY_SUPPORTED_DTYPES:
         return True, None
 
     if factorized_layout_mismatch:
@@ -2132,6 +2133,16 @@ def compute_restickify_needed(
         if reduction_vars:
             red_var = min(reduction_vars, key=str)
             target_stick = sympy.Mod(red_var, in_stl.elems_per_stick())
+
+    if idc[-1] == sympy.S.Zero and target_stick != sympy.S.Zero:
+        # The input has a sparse stick (idc[-1]=0) but the output requests a
+        # real stick expression. This arises for QFP8CH activations produced
+        # by a preceding matmul in the unexpanded layout (e.g. chained MLP
+        # fp8_linear). compute_restickify_target_layout bails because
+        # matching_dim(ic, 0) fails when idc[-1] has no free symbols.
+        # out_stl is already the correct canonical target.
+        return True, out_stl
+
     return True, compute_restickify_target_layout(
         in_stl, in_host, target_stick, ic, idc
     )

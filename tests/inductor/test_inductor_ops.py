@@ -5646,6 +5646,19 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "param_sets": SCALED_MM_TESTS,
         },
         (
+            "test_fp8_chained_scaled_mm",
+            "test_fp8_chained_scaled_mm_cpu",
+        ): {
+            # Regression for three combined issues that blocked chained FP8
+            # matmul (MLP pattern: fp8_linear(fp8_linear(x))).
+            # Shapes: (m, k, n_hidden, n_out)
+            "param_sets": {
+                "granite_m2_k4096_n1024_n4096": (2, 4096, 1024, 4096),
+                "granite_m1_k4096_n1024_n4096": (1, 4096, 1024, 4096),
+                "granite_m2_k4096_n4096_n4096": (2, 4096, 4096, 4096),
+            },
+        },
+        (
             "test_multiops_split",
             "test_view_permute_mul",
         ): {
@@ -8438,6 +8451,97 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         compare_with_pytorch(
             spyre_fn, pytorch_fn, a, b, scale_a, scale_b, bias, atol=0.1, rtol=0.1
+        )
+
+    def test_fp8_chained_scaled_mm_cpu(self, m, k, n_hidden, n_out):
+        """Regression test for chained FP8 matmul (MLP / decoder block pattern).
+
+        Two fp8_linear calls where the output of the first feeds the input of
+        the second — the MLP pattern in a Granite decoder block. Per-row
+        dynamic x_scale computed from the activation; external per-column
+        w_scale passed in.
+
+        Previously failed with:
+          NotImplementedError: no mechanism to resolve stick incompatibility
+
+        Root cause: three combined issues unblocked by this fix:
+          1. pass_utils.py: compute_restickify_needed blocked SEN143_FP8 (#4238)
+          2. spyre_kernel.py: RESTICKIFY_OP gate excluded SEN143_FP8
+          3. propagate_layouts.py: find_stick_compatible_input_layout returned
+             sparse QFP8CH without checking reduction_var was on the stick
+        """
+        FP8_MAX = 448.0
+        SCALE_EPS = 1e-4
+
+        def fp8_linear(x, w, w_scale):
+            x_scale = (x.abs().amax(dim=-1, keepdim=True) * (1.0 / FP8_MAX)).clamp(
+                min=SCALE_EPS
+            )
+            wq = torch.ops.spyre.quantize_weight_fp8_with_scale(w, w_scale)
+            xq = torch.ops.spyre.quantize_fp8_with_scale(x, x_scale)
+            y = torch.ops.spyre.scaled_mm(
+                xq.reshape(-1, xq.shape[-1]), wq, out_dtype=torch.float16
+            )
+            return (y.reshape(*x.shape[:-1], w.shape[-1]) * x_scale * w_scale).to(
+                x.dtype
+            )
+
+        x = cached_randn(
+            (1, m, k),
+            dtype=torch.float16,
+            differentiation=("x", m, k, n_hidden, n_out),
+            scale=0.1,
+        )
+        g = cached_randn(
+            (k,),
+            dtype=torch.float16,
+            differentiation=("g", m, k, n_hidden, n_out),
+            scale=0.1,
+        )
+        w1 = cached_randn(
+            (k, n_hidden),
+            dtype=torch.float16,
+            differentiation=("w1", m, k, n_hidden, n_out),
+            scale=0.1,
+        )
+        w2 = cached_randn(
+            (n_hidden, n_out),
+            dtype=torch.float16,
+            differentiation=("w2", m, k, n_hidden, n_out),
+            scale=0.1,
+        )
+        ws1 = torch.full((n_hidden,), 0.1, dtype=torch.float16)
+        ws2 = torch.full((n_out,), 0.1, dtype=torch.float16)
+
+        def spyre_fn(x, g, w1, ws1, w2, ws2):
+            h = x * g
+            return fp8_linear(fp8_linear(h, w1, ws1), w2, ws2)
+
+        def pytorch_fn(x, g, w1, ws1, w2, ws2):
+            def ref_linear(x, w, ws):
+                x_scale = (x.abs().amax(dim=-1, keepdim=True) * (1.0 / FP8_MAX)).clamp(
+                    min=SCALE_EPS
+                )
+                xq = (
+                    (x / x_scale)
+                    .clamp(-FP8_MAX, FP8_MAX)
+                    .to(torch.float8_e4m3fn)
+                    .to(torch.float16)
+                )
+                wq = (
+                    (w / ws)
+                    .clamp(-FP8_MAX, FP8_MAX)
+                    .to(torch.float8_e4m3fn)
+                    .to(torch.float16)
+                )
+                y = (xq.reshape(-1, xq.shape[-1]) @ wq) * (x_scale * ws)
+                return y.reshape(*x.shape[:-1], w.shape[-1]).to(x.dtype)
+
+            h = x * g
+            return ref_linear(ref_linear(h, w1, ws1), w2, ws2)
+
+        compare_with_pytorch(
+            spyre_fn, pytorch_fn, x, g, w1, ws1, w2, ws2, atol=2.0, rtol=0.2
         )
 
     def test_is_nonzero_cpu(self, *args):

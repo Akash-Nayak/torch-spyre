@@ -973,7 +973,17 @@ def find_stick_compatible_input_layout(
     # so return immediately without checking the stick.
     for stl, dev_coords in candidates:
         if stl.element_arrangement != ElementArrangement.STANDARD:
-            return stl
+            # Non-STANDARD arrangements (QFP8WT etc.) carry their own contraction
+            # structure and are normally returned immediately. However for
+            # batchmatmulfp8 the activation input (QFP8CH) must still have the
+            # reduction_var on its stick — a sparse QFP8CH output from a preceding
+            # matmul has reduction_var on an outer dim, not the stick, and must go
+            # through Pass 2 / Pass 3 to get restickified first.
+            if reduction_type != BATCH_MATMUL_FP8_OP or (
+                reduction_var in dev_coords[-1].free_symbols
+            ):
+                return stl
+            continue
         if reduction_var not in dev_coords[-1].free_symbols:
             continue
         if reduction_type == BATCH_MATMUL_OP and any(
