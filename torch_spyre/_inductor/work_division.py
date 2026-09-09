@@ -1811,10 +1811,8 @@ def _cost_model_matmul_planner(
         # n_dim is left as the cost model's chosen n_s; any legal divisor of
         # n_sticks is safe because N is always a multiple of 128 (one FP8
         # stick), so size = N // n_split = 128 * (n_sticks // n_split) is
-        # always a multiple of 64 — matching the hardware invariant
-        # P_.out_ = 64 * myCoreledOutSp from dmlite.cpp.  The assert
-        # size % 64 == 0 in gen_coord_info_value's elemArr=3 branch enforces
-        # this at codegen time.
+        # always a multiple of 64 — satisfying the hardware alignment
+        # requirement enforced at codegen time.
         new_splits[k_dim] = 1
 
     logger.debug(
