@@ -256,9 +256,7 @@ class TestFP8Operations:
         """Test FP8 quantize/dequantize (qfp8ch path) with a 4D input tensor.
 
         Exercises the general 4D compilation path for quantize_fp8_with_scale
-        (qfp8ch / activation quantization). Note: qfp8ch is not in FP8_2D_STICK_OPS
-        and does not trigger device-size flattening. See
-        test_quantize_weight_fp8_with_scale_4d_shape for the qfp8wt flattening path.
+        (qfp8ch / activation quantization).
         """
         shape = (2, 4, 128, 512)
         x = cached_randn(shape, dtype=torch.float16, scale=1.0) * 2.0 + 1.0
@@ -272,6 +270,61 @@ class TestFP8Operations:
             return _fp8_reference_quantize_dequantize(x, scale)
 
         compare_with_pytorch(spyre_fn, pytorch_fn, x, scale, atol=0.5, rtol=0.1)
+
+    def test_fp8_scaled_mm_separate_compilation(self):
+        """Regression test for FP8 batchmatmulfp8 SDSC crash under separate compilation.
+
+        Pre-quantizing the weight in one torch.compile call and running _scaled_mm
+        in a second torch.compile call crosses the compile boundary: the QFP8WT
+        kernel tensor arrives at the batchmatmulfp8 SDSC codegen with a
+        flat stick_size=[128] (instead of the canonical [2, 64]) because the
+        SpyreTensorLayout crossing the compile boundary loses the 2D-stick structure.
+        Without _layout_info_for_tensor restoring it, batchmatmulfp8 codegen
+        produced:
+
+            loc("bmm.ddl":22:24): error: Fixed layout with too many dimensions
+            DtException: Impossible to match for sdsc0_batchmatmulfp8
+
+        The fix lives in _layout_info_for_tensor (compute_ops.py): it detects the
+        flat stick_size=[128] at the compile boundary and restores stick_size=[2, 64].
+        """
+        M, K, N = 128, 128, 128
+        mat_a = cached_randn((M, K), dtype=torch.float16, scale=1.0)
+        mat_b = cached_randn((K, N), dtype=torch.float16, scale=1.0)
+        scale_a = torch.tensor([1.0], dtype=torch.float16)
+        scale_b = torch.max(torch.abs(mat_b)).reshape(1).to(torch.float16)
+
+        mat_a_d = mat_a.to(DEVICE)
+        mat_b_d = mat_b.to(DEVICE)
+        scale_a_d = scale_a.to(DEVICE)
+        scale_b_d = scale_b.to(DEVICE)
+
+        # Quantize activation and weight in separate compiled calls.
+        quantize_a = torch.compile(
+            lambda x, s: torch.ops.spyre.quantize_fp8_with_scale(x, s)
+        )
+        quantize_b = torch.compile(
+            lambda x, s: torch.ops.spyre.quantize_weight_fp8_with_scale(x, s)
+        )
+        q_a = quantize_a(mat_a_d, scale_a_d)
+        q_b = quantize_b(mat_b_d, scale_b_d)
+
+        # Run _scaled_mm in a third separate compiled call — this is the case
+        # that triggered the "Fixed layout with too many dimensions" crash.
+        scaled_mm = torch.compile(
+            lambda a, b: torch.ops.aten._scaled_mm(
+                a, b, scale_a=None, scale_b=None, bias=None,
+                out_dtype=torch.float16,
+            )
+        )
+        result = scaled_mm(q_a, q_b)
+
+        assert result.dtype == torch.float16, (
+            f"Expected torch.float16, got {result.dtype}"
+        )
+        assert result.shape == (M, N), (
+            f"Expected shape ({M}, {N}), got {result.shape}"
+        )
 
     def test_quantize_weight_fp8_with_scale_eager_mode_dtype_only(self):
         """Regression guard: quantize_weight_fp8_with_scale returns a valid FP8 tensor in eager mode.
