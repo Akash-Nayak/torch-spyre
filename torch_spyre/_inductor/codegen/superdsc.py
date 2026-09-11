@@ -23,6 +23,7 @@ from torch._inductor.virtualized import V
 from torch_spyre._C import DataFormats, ElementArrangement
 from torch_spyre._inductor import config as _spyre_config
 from torch_spyre._inductor.constants import (
+    BATCH_MATMUL_FP8_OP,
     CONV2D_DIM_LABELS,
     CONV2D_FWD_OP,
     CONV2D_LAYOUT_LABELS,
@@ -1195,7 +1196,10 @@ def _create_sdsc_tensors(
     )
 
     for i, arg in enumerate(op_spec.args):
-        is_fp8_mm_kernel_arg = arg.element_arrangement == ElementArrangement.QFP8WT
+        is_fp8_mm_kernel_arg = (
+            arg.element_arrangement == ElementArrangement.QFP8WT
+            or (op_spec.op == BATCH_MATMUL_FP8_OP and i == 1)
+        )
         # For QFP8WT identity copies, suppress the 2D-stick override so that
         # both the source and destination use the plain 1D-stick layout.  This
         # downgrades the out-dim to elemArr=2 and allows the hardware to apply
