@@ -37,13 +37,27 @@ def _make_generator(*args) -> torch.Generator:
     return gen
 
 
-# shape is a tuple of integers representing dimension of the tensor
-# to avoid using the same cached tensor of the same shape, add a unique
-# differentiation argument
 @functools.lru_cache(maxsize=None)
 def cached_randn(
     shape, differentiation=None, abs=False, dtype=torch.float16, scale=1.0
 ):
+    """Return a deterministically-seeded random tensor, cached by arguments.
+
+    Args:
+        shape: Tuple of ints giving the tensor dimensions.
+        differentiation: Optional hashable value added to the cache key so two
+            calls with the same shape but different ``differentiation`` values
+            return independent tensors rather than the same cached one.
+        abs: If True, return the absolute value of the generated tensor.
+        dtype: Output dtype (default: float16).
+        scale: Variance multiplier applied as ``randn(...) * scale``. A value of
+            1.0 gives unit-variance outputs; larger values spread the range.
+            Also seeds the RNG so the same (shape, scale) always yields the same
+            values across test runs.
+
+    Returns:
+        A cached CPU tensor of the requested shape and dtype.
+    """
     gen = _make_generator(shape, differentiation, abs, dtype, scale)
     out = torch.randn(shape, dtype=dtype, generator=gen) * scale
     return out if not abs else torch.abs(out)
@@ -633,6 +647,8 @@ def compare_with_cpu(
     needs_device=False,
     cpu_compile=None,
     target=None,
+    cpu_eager_result=None,
+    cpu_compile_result=None,
     run_eager=True,
     run_compile=True,
     source_check=None,
@@ -649,12 +665,16 @@ def compare_with_cpu(
     - **Eager only**: ``run_compile=False``, ``run_eager=True``.
     - **Neither**: raises ``ValueError``.
 
-    When ``cpu_compile`` is True, each selected Spyre path is also compared to CPU
-    using the same compile flag (compiled vs compiled, or eager vs eager).
+    When ``cpu_compile`` is True, each selected Spyre path is also compared
+    against a compiled-CPU reference.
 
     Args:
         run_compile: Run the compiled path on Spyre.
         run_eager: Run the eager (non-compiled) path on Spyre.
+        cpu_eager_result: Optional precomputed eager CPU reference; skips live
+            ``fn(*args)`` on CPU when set.
+        cpu_compile_result: Optional precomputed compiled-CPU reference; when set
+            and ``cpu_compile`` is True, skips live compiled-CPU execution.
     """
     # if this flag is explicitly passed in by the test, use it
     if cpu_compile is None:
@@ -667,7 +687,9 @@ def compare_with_cpu(
             return args
         return [arg.clone() if isinstance(arg, torch.Tensor) else arg for arg in args]
 
-    cpu_result = fn(*get_args())
+    cpu_eager_precomputed = cpu_eager_result is not None
+    if not cpu_eager_precomputed:
+        cpu_eager_result = fn(*get_args())
 
     # Order: compiled first, then eager (matches prior [True, False] when both on).
     modes = tuple(
@@ -677,6 +699,11 @@ def compare_with_cpu(
     )
     if not modes:
         raise ValueError("At least one of run_compile or run_eager must be True")
+
+    if cpu_compile and cpu_compile_result is None:
+        cpu_compile_result = _compile_and_run(
+            fn, get_args(), "cpu", needs_device=needs_device, compile=True
+        )
 
     for compiled in modes:
         mode = "compiled" if compiled else "eager"
@@ -694,19 +721,24 @@ def compare_with_cpu(
         )
 
         _assert_results_close(
-            spyre_result, cpu_result, atol, rtol, f"{mode} spyre <-> cpu"
+            spyre_result,
+            cpu_eager_result,
+            atol,
+            rtol,
+            (
+                f"{mode} spyre <-> precomputed cpu ref"
+                if cpu_eager_precomputed
+                else f"{mode} spyre <-> cpu"
+            ),
         )
 
         if cpu_compile:
-            cpu_other_result = _compile_and_run(
-                fn, get_args(), "cpu", needs_device=needs_device, compile=True
-            )
             _assert_results_close(
                 spyre_result,
-                cpu_other_result,
+                cpu_compile_result,
                 atol,
                 rtol,
-                f"{mode} spyre <-> {mode} cpu",
+                f"{mode} spyre <-> compiled cpu",
             )
 
 
