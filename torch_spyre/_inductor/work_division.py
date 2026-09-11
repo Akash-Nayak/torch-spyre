@@ -60,6 +60,7 @@ from .pass_utils import (
     device_coordinates,
     finite_upper_or_none,
     get_mem_deps_from_rw,
+    input_layout_for_operation,
     iteration_space_from_op,
     commit_iteration_space_ownership,
     op_read_writes,
@@ -473,6 +474,11 @@ def get_per_core_span(
 ) -> int:
     """Compute per-core memory span in bytes for a tensor under the given splits.
 
+    This is a pre-placement split-selection estimate.  LX capacity checks use
+    the finalized stick-aligned device layout instead; the two calculations
+    must not be merged unless they are proved equal for aligned shapes.  Track
+    that possible consolidation under #3049.
+
     coordinate expressions from compute_coordinates() in views.py are sums of
     independent single-variable terms, so max of the full expression equals the
     sum of per-variable maxima obtained by zeroing out all other variables.
@@ -659,7 +665,7 @@ def must_split_vars(
             best = best_within or best_above
 
             if best is None:
-                logger.warning(
+                logger.info(
                     f"No valid split combo found for tensor {td.dep.name} "
                     f"coord={coord} under accumulated_splits={accumulated_splits}. "
                     f"Skipping."
@@ -1771,12 +1777,23 @@ def _cost_model_matmul_planner(
     n_divs = factors(n_dim, n_sticks)
     k_divs = factors(k_dim, k_sticks)
 
+    is_fp8_bmm = op.data.reduction_type == BATCH_MATMUL_FP8_OP
+    # The batchmatmulfp8 KERNEL tensor 'out'-dim always uses core_fold=4 regardless
+    # of N. Production Granite FP8 SDSCs confirm this across all shapes (N=512, 1024,
+    # 2048, 4096). Pinning work_slices[n_dim] to this constant ensures compute_ops.py
+    # emits the correct SDSC coordInfo (alpha = N//4, factor = 4).
+    _FP8_BMM_N_SPLIT = 4
+
     best = None
     best_cost = math.inf
     for b_combo in b_combos:
         b_prod = math.prod(b_combo)
+        if is_fp8_bmm and b_prod != 1:
+            continue
         for mm in m_divs:
             for nn in n_divs:
+                if is_fp8_bmm and nn != _FP8_BMM_N_SPLIT:
+                    continue
                 for kk in k_divs:
                     if b_prod * mm * nn * kk > max_cores:
                         continue
@@ -1807,8 +1824,11 @@ def _cost_model_matmul_planner(
     if math.prod(new_splits.values()) < math.prod(splits.values()):
         if not has_qfp8wt_tensor(input_tds + [output_td]):
             return splits
-        # For QFP8WT, force k_dim = 1 regardless of core count
+        # For QFP8WT, force k_dim = 1 and, for batchmatmulfp8, n_dim to the
+        # required constant split regardless of core count.
         new_splits[k_dim] = 1
+        if is_fp8_bmm:
+            new_splits[n_dim] = _FP8_BMM_N_SPLIT
 
     logger.debug(
         f"cost_model work_division {op.get_name()}: "
@@ -1894,10 +1914,13 @@ def _apply_input_layout_overrides(
     The same tag is also used by SpyreKernel.create_tensor_arg, so work
     division and codegen agree on the input layout.
     """
-    overrides: dict[str, FixedTiledLayout] = getattr(op, "_input_layout_overrides", {})
-    if not overrides:
-        return args
-    return [SchedNodeArg(a.dep, overrides.get(a.dep.name, a.layout)) for a in args]
+    return [
+        SchedNodeArg(
+            arg.dep,
+            input_layout_for_operation(op, arg.dep.name, arg.layout),
+        )
+        for arg in args
+    ]
 
 
 def span_reduction(graph: GraphLowering) -> None:
@@ -1947,7 +1970,7 @@ def _cost_model_divide_op(op: ComputedBuffer, max_cores: int) -> bool:
     """
     if not isinstance(op.data, Reduction):
         return False
-    if op.data.reduction_type != BATCH_MATMUL_OP:
+    if op.data.reduction_type not in (BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP):
         return False
     if not config.ignore_work_division_hints and _has_work_div_hint(op):
         # User hints take ownership of the split decision; do not override them.
