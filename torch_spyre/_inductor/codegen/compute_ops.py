@@ -355,8 +355,6 @@ def gen_coord_info_value(
     is_stick_reduction: bool = False,
     conv_params=None,
     padding: str = "nopad",
-    is_fp8_stick: bool = False,
-    stick_idx: int = -1,
     tensor_idx: int = -1,
     opfunc: str = "",
     core_stride: int | None = None,
@@ -420,31 +418,6 @@ def gen_coord_info_value(
                         "factor_": elem_arr_factor,
                         "label_": "elem_arr_0",
                     },
-                ],
-            },
-        }
-    elif is_stick_dim and is_fp8_stick and not (stick_idx == 0):
-        return {
-            "spatial": 3,
-            "temporal": 0,
-            "elemArr": 3,
-            "padding": "nopad",
-            "folds": {
-                "dim_prop_func": [
-                    {"Affine": {"alpha_": size, "beta_": 0}},
-                    {"Affine": {"alpha_": 0, "beta_": 0}},
-                    {"Affine": {"alpha_": 0, "beta_": 0}},
-                    {"Affine": {"alpha_": (size // 8), "beta_": 0}},
-                    {"Affine": {"alpha_": 8, "beta_": 0}},
-                    {"Affine": {"alpha_": 1, "beta_": 0}},
-                ],
-                "dim_prop_attr": [
-                    {"factor_": nsplits, "label_": "core_fold"},
-                    {"factor_": 1, "label_": "corelet_fold"},
-                    {"factor_": 1, "label_": "row_fold"},
-                    {"factor_": 64, "label_": "elem_arr_2"},
-                    {"factor_": 2, "label_": "elem_arr_1"},
-                    {"factor_": 1, "label_": "elem_arr_0"},
                 ],
             },
         }
@@ -1271,8 +1244,6 @@ def generate_sdsc(
                 elems_per_stick=tensor.data_format.elems_per_stick(),
                 is_stick_dim=(dim in stick_dim_order),
                 is_stick_reduction=(scale == -2),
-                is_fp8_stick=is_fp8,
-                stick_idx=st_idx,
                 tensor_idx=tensor_idx,
                 opfunc=sdsc_spec.opfunc,
                 padding=_coord_padding(dim_str, is_input),
