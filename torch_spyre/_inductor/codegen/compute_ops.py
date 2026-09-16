@@ -321,32 +321,6 @@ def _layout_info_for_tensor(sdsc_spec, tensor, tensor_idx: int) -> dict:
     return layout_info
 
 
-def _compute_fp8_coord_params(
-    tensor, dim, sdsc_spec, tensor_idx: int
-) -> tuple[bool, int]:
-    """Compute FP8 2D stick coordinate parameters for a dimension.
-
-    Returns tuple: (is_fp8_stick, stick_idx)
-    """
-    layout_info = _layout_info_for_tensor(sdsc_spec, tensor, tensor_idx)
-    stick_size_list = layout_info["stick_size"]
-    stick_dim_order = layout_info["stick_dim_order"]
-
-    is_fp8_stick = (
-        tensor.data_format == DataFormats.SEN143_FP8 and len(stick_size_list) > 1
-    )
-
-    if dim in stick_dim_order and len(stick_size_list) > 1:
-        stick_idx = stick_dim_order.index(dim)
-    else:
-        stick_idx = -1
-
-    return (
-        bool(is_fp8_stick),
-        int(stick_idx),
-    )
-
-
 def gen_coord_info_value(
     size: int,
     nsplits: int,
@@ -1222,9 +1196,6 @@ def generate_sdsc(
             # depthwise and every other op.
             dim_size = _coord_size(dim_str, sdsc_spec.iteration_space[dim], is_input)
             size = _coord_per_core_size(dim, is_input, nsplits) if is_tiled else 1
-            is_fp8, st_idx = _compute_fp8_coord_params(
-                tensor, dim, sdsc_spec, tensor_idx
-            )
             conv_params = (
                 get_conv_params(
                     tensor_idx,
