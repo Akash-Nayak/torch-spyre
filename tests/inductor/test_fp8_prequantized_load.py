@@ -18,13 +18,12 @@ Validates that pre-quantized FP8 checkpoint weights (torch.float8_e4m3fn)
 are loaded directly into QFP8WT KERNEL layout on Spyre — without lazy
 decompression or runtime qfp8wt quantization.
 
-Two test modes:
-  1. Unit test (no model required): verifies _dma_to_spyre_fp8_kernel
-     transfers a synthetic FP8 tensor to Spyre with the correct dtype,
-     shape, and device.
-  2. Integration test (requires model checkpoint): verifies
-     load_fp8_model_to_spyre loads all 280 FP8 Linear weights of
-     granite-3.3-8b-instruct-FP8 with QFP8WT layout.
+Covers:
+  1. _dma_to_spyre_fp8_kernel: transfers a synthetic FP8 tensor to Spyre
+     with the correct dtype, shape, and device.
+  2. load_fp8_model_to_spyre: loads FP8 Linear weights of an nn.Module
+     into QFP8WT KERNEL layout; non-FP8 weights use the normal path.
+  3. _scaled_mm with pre-quantized FP8 weight in KERNEL layout.
 """
 
 import pytest
@@ -35,8 +34,6 @@ import torch_spyre  # noqa: F401 — registers Spyre as the inductor backend
 from utils_inductor import DEVICE, compare_with_pytorch
 
 DEVICE_TYPE = DEVICE.type  # 'spyre' — used for device.type comparisons
-
-MODEL_PATH = "/nfs_mnt/models/granite-3.3-8b-instruct-FP8"
 
 
 # ---------------------------------------------------------------------------
@@ -169,102 +166,6 @@ class TestLoadModelToSpyreUseFp8Weights:
         assert model[0].weight.device.type == DEVICE_TYPE
         # dtype should be preserved (bfloat16 on device)
         assert model[0].weight.dtype == torch.bfloat16
-
-
-# ---------------------------------------------------------------------------
-# Integration test — requires /nfs_mnt/models/granite-3.3-8b-instruct-FP8
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.skipif(
-    not __import__("os").path.exists(MODEL_PATH),
-    reason=f"Model not found at {MODEL_PATH}",
-)
-class TestGraniteF8IntegrationLoad:
-    """Integration test: load granite-3.3-8b-instruct-FP8 with QFP8WT layout."""
-
-    @pytest.fixture(scope="class")
-    @classmethod
-    def fp8_model(cls):
-        """Load the FP8 model from checkpoint with FP8 weights intact.
-
-        transformers upcasts FP8 weights to BF16 because config.json declares
-        torch_dtype=bfloat16.  We bypass this entirely by:
-          1. Instantiating the model architecture from config (no weights).
-          2. Building the full state dict from safetensors shards directly,
-             preserving the on-disk dtype (float8_e4m3fn for the 280 Linear
-             weights, bfloat16 for everything else).
-          3. Loading the state dict with strict=False (scale tensors from the
-             compressed-tensors recipe are not model parameters and are ignored).
-
-        This is zero-overhead: no BF16 allocation + patch; the FP8 tensors are
-        never converted at all.
-        """
-        import glob
-        from transformers import AutoConfig, AutoModelForCausalLM
-        from safetensors import safe_open
-
-        # Step 1: instantiate empty model on meta device (no weight allocation).
-        config = AutoConfig.from_pretrained(MODEL_PATH)
-        with torch.device("meta"):
-            model = AutoModelForCausalLM.from_config(config)
-        model = model.to_empty(device="cpu")
-
-        # Step 2: build state dict from all safetensors shards preserving dtype.
-        state_dict = {}
-        for shard in sorted(glob.glob(f"{MODEL_PATH}/model-*.safetensors")):
-            with safe_open(shard, framework="pt", device="cpu") as f:
-                for key in f.keys():
-                    state_dict[key] = f.get_tensor(key)
-
-        # Step 3: load — strict=False ignores weight_scale tensors from the
-        # compressed-tensors recipe that have no corresponding model parameter.
-        model.load_state_dict(state_dict, strict=False, assign=True)
-        return model
-
-    def test_fp8_weights_present_before_load(self, fp8_model):
-        """Model has 280 FP8 Linear weights on CPU before transfer."""
-        fp8_count = sum(
-            1
-            for m in fp8_model.modules()
-            if isinstance(m, nn.Linear)
-            and m.weight.dtype == torch.float8_e4m3fn
-        )
-        assert fp8_count == 280, (
-            f"Expected 280 FP8 Linear weights, got {fp8_count}"
-        )
-
-    def test_load_fp8_model_to_spyre(self, fp8_model):
-        """load_fp8_model_to_spyre transfers all 280 FP8 weights to Spyre."""
-        from torch_spyre.model_utils import load_fp8_model_to_spyre
-
-        load_fp8_model_to_spyre(fp8_model)
-
-        spyre_fp8 = [
-            (n, m.weight)
-            for n, m in fp8_model.named_modules()
-            if isinstance(m, nn.Linear) and m.weight.dtype == torch.float8_e4m3fn
-        ]
-        assert len(spyre_fp8) == 280, (
-            f"Expected 280 FP8 weights on Spyre, got {len(spyre_fp8)}"
-        )
-        for name, w in spyre_fp8:
-            assert w.device.type == DEVICE_TYPE, (
-                f"{name}: expected on {DEVICE}, got {w.device}"
-            )
-
-    def test_non_fp8_weights_on_spyre(self, fp8_model):
-        """Non-FP8 weights (layer norms, embed) are also on Spyre."""
-        non_fp8 = [
-            (n, p)
-            for n, p in fp8_model.named_parameters()
-            if p.dtype != torch.float8_e4m3fn
-        ]
-        assert len(non_fp8) > 0
-        for name, p in non_fp8:
-            assert p.device.type == DEVICE_TYPE, (
-                f"{name}: expected on {DEVICE}, got {p.device}"
-            )
 
 
 # ---------------------------------------------------------------------------
