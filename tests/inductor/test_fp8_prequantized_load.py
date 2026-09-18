@@ -28,10 +28,10 @@ Covers:
 
 import pytest
 import torch
-import torch.nn as nn
+from torch import nn
+from utils_inductor import DEVICE, compare_with_pytorch
 
 import torch_spyre  # noqa: F401 — registers Spyre as the inductor backend
-from utils_inductor import DEVICE, compare_with_pytorch
 
 DEVICE_TYPE = DEVICE.type  # 'spyre' — used for device.type comparisons
 
@@ -58,12 +58,20 @@ class TestDmaToSpyreFp8Kernel:
         assert list(dev.shape) == [128, 256], f"Shape mismatch: {list(dev.shape)}"
 
     def test_non_contiguous_input(self):
-        """Non-contiguous FP8 weight is handled (made contiguous internally)."""
+        """Non-contiguous FP8 weight is transferred correctly without a CPU copy.
+
+        The QFP8WT DCI path in spyre_mem.cpp derives host strides analytically
+        from K and N, so it ignores the CPU tensor's actual strides. A transposed
+        (non-contiguous) view can be passed directly without calling .contiguous().
+        """
         from torch_spyre.model_utils import _dma_to_spyre_fp8_kernel
 
+        # t() produces a non-contiguous [128, 256] view with strides [1, 128]
         weight = torch.randn(256, 128, dtype=torch.float16).t().to(torch.float8_e4m3fn)
-        # t() produces a non-contiguous view [128, 256]
-        dev = _dma_to_spyre_fp8_kernel(weight.contiguous())
+        assert not weight.is_contiguous(), (
+            "pre-condition: weight must be non-contiguous"
+        )
+        dev = _dma_to_spyre_fp8_kernel(weight)
 
         assert dev.device.type == DEVICE_TYPE
         assert dev.dtype == torch.float8_e4m3fn
@@ -108,10 +116,15 @@ class TestLoadModelToSpyreUseFp8Weights:
     """Unit tests for load_model_to_spyre(use_fp8_weights=True) with a tiny model."""
 
     def _make_tiny_fp8_model(self):
-        """Build a tiny 2-layer model with pre-quantized FP8 Linear weights."""
+        """Build a tiny 2-layer model with pre-quantized FP8 Linear weights.
+
+        Shapes must satisfy the QFP8WT alignment constraints:
+          - in_features (K after transpose) divisible by 2 (si=2)
+          - out_features (N after transpose) divisible by 64 (so=64)
+        """
         model = nn.Sequential(
             nn.Linear(128, 64, bias=False),
-            nn.Linear(64, 32, bias=False),
+            nn.Linear(64, 64, bias=False),
         )
         # Simulate pre-quantized FP8 weights
         for module in model.modules():
@@ -366,4 +379,82 @@ class TestScaledMmPrequantizedClosedOver:
         cpu_ref = (q_a @ q_b.T) * 1.0
 
         out_cpu = result.to("cpu").to(torch.float16)
+        # atol=4.0: both paths quantize to FP8 E4M3 (max spacing ~0.5 in the
+        # range used here) and accumulate K terms. For K=4096 the worst-case
+        # absolute error is O(K * fp8_spacing) ≈ 4096 * 0.5 * eps_fp16 ≈ 2–4.
+        torch.testing.assert_close(out_cpu, cpu_ref, atol=4.0, rtol=0.1)
+
+
+# ---------------------------------------------------------------------------
+# End-to-end: quantscalepertokenfp8 + pre-quantized KERNEL weight
+# ---------------------------------------------------------------------------
+
+
+class TestQuantScalePerTokenFp8WithPrequantizedWeight:
+    """End-to-end test for the full FP8 inference pipeline:
+
+        quantscalepertokenfp8(act)
+          → quantize_fp8_with_scale(act, scale)
+          → _scaled_mm(q_act, q_weight_prequantized, ...)
+
+    The pre-quantized weight is loaded via _dma_to_spyre_fp8_kernel and closed
+    over as a frozen constant in the compiled function — the production pattern
+    for FP8 checkpoint inference.
+    """
+
+    @pytest.mark.parametrize(
+        "m, k, n",
+        [
+            (1, 512, 512),
+            (4, 4096, 512),
+            (4, 4096, 1024),
+        ],
+    )
+    def test_full_fp8_pipeline(self, m, k, n):
+        """quantscalepertokenfp8 + pre-loaded KERNEL weight produces correct output."""
+        from torch_spyre.model_utils import _dma_to_spyre_fp8_kernel
+
+        torch.manual_seed(0)
+        act_cpu = torch.randn(m, k, dtype=torch.float16)
+        weight_cpu = torch.randn(n, k, dtype=torch.float16)
+
+        # Simulate checkpoint: quantize [n, k], transpose to [k, n] for matmul
+        weight_fp8_T = (
+            weight_cpu.clamp(-448.0, 448.0).to(torch.float8_e4m3fn).T.contiguous()
+        )
+        q_w_spyre = _dma_to_spyre_fp8_kernel(weight_fp8_T)
+
+        torch._dynamo.reset()
+
+        @torch.compile(backend="inductor")
+        def spyre_fn(act):
+            # Step 1: compute per-token scale from activation amax
+            scale = torch.ops.spyre.quantscalepertokenfp8(act)
+            # Step 2: quantize activation using computed scale
+            q_act = torch.ops.spyre.quantize_fp8_with_scale(act, scale)
+            # Step 3: matmul with pre-loaded KERNEL weight
+            return torch.ops.aten._scaled_mm(
+                q_act,
+                q_w_spyre,
+                scale_a=scale,
+                scale_b=torch.tensor(1.0, dtype=torch.float16, device=act.device),
+                bias=None,
+                out_dtype=torch.float16,
+            )
+
+        result = spyre_fn(act_cpu.to(DEVICE))
+
+        # CPU reference: quantize both inputs, dequantize, matmul
+        amax = act_cpu.abs().amax(dim=-1, keepdim=True).clamp(min=1e-5)
+        scale_ref = amax / 448.0
+        q_a = (act_cpu / scale_ref).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+        q_a_fp16 = q_a.to(torch.float16) * scale_ref
+        q_b_fp16 = (
+            weight_cpu.clamp(-448.0, 448.0).to(torch.float8_e4m3fn).to(torch.float16)
+        )
+        cpu_ref = q_a_fp16 @ q_b_fp16.T
+
+        out_cpu = result.to("cpu").to(torch.float16)
+        # atol=4.0: FP8 quantization error accumulated over K terms (see
+        # test_prequantized_closed_over for tolerance justification).
         torch.testing.assert_close(out_cpu, cpu_ref, atol=4.0, rtol=0.1)

@@ -497,6 +497,8 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
     const int64_t K = cpu_shape[1];
 
     // Expanded device shape: [si, so, K/si, N/so]
+    TORCH_CHECK(K % si == 0, "QFP8WT K=", K, " must be divisible by si=", si);
+    TORCH_CHECK(N % so == 0, "QFP8WT N=", N, " must be divisible by so=", so);
     const int64_t dim2 = K / si;
     const int64_t dim3 = N / so;
 

@@ -73,11 +73,8 @@ Usage::
 
 import warnings
 
-from torch_spyre._inductor.logging_utils import get_inductor_logger
-
-
 import torch
-import torch.nn as nn
+from torch import nn
 
 from torch_spyre._C import (
     DataFormats,
@@ -87,6 +84,7 @@ from torch_spyre._C import (
     get_device_dtype,
     spyre_empty_with_layout,
 )
+from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre.constants import DEVICE_NAME
 
 logger = get_inductor_logger("model_utils")
@@ -266,6 +264,12 @@ def _dma_to_spyre_fp8_kernel(
     assert weight.ndim == 2, "FP8 KERNEL layout is for 2D weights only"
     assert weight.dtype == torch.float8_e4m3fn, (
         f"Weight must be torch.float8_e4m3fn, got {weight.dtype}"
+    )
+    assert weight.shape[0] % 2 == 0, (
+        f"FP8 KERNEL K={weight.shape[0]} must be divisible by 2 (si=2)"
+    )
+    assert weight.shape[1] % 64 == 0, (
+        f"FP8 KERNEL N={weight.shape[1]} must be divisible by 64 (so=64)"
     )
 
     _ensure_spyre_runtime()
