@@ -51,7 +51,9 @@ class TestDmaToSpyreFp8Kernel:
         weight = torch.randn(128, 256, dtype=torch.float16).to(torch.float8_e4m3fn)
         dev = _dma_to_spyre_fp8_kernel(weight)
 
-        assert dev.device.type == DEVICE_TYPE, f"Expected device {DEVICE}, got {dev.device}"
+        assert dev.device.type == DEVICE_TYPE, (
+            f"Expected device {DEVICE}, got {dev.device}"
+        )
         assert dev.dtype == torch.float8_e4m3fn, f"Expected fp8, got {dev.dtype}"
         assert list(dev.shape) == [128, 256], f"Shape mismatch: {list(dev.shape)}"
 
@@ -87,13 +89,15 @@ class TestDmaToSpyreFp8Kernel:
         from torch_spyre.model_utils import _dma_to_spyre_fp8_kernel
 
         shapes = [
-            (4096, 4096),   # q_proj, o_proj
-            (1024, 4096),   # k_proj, v_proj (GQA)
+            (4096, 4096),  # q_proj, o_proj
+            (1024, 4096),  # k_proj, v_proj (GQA)
             (12800, 4096),  # gate_proj, up_proj
             (4096, 12800),  # down_proj
         ]
         for out_f, in_f in shapes:
-            weight = torch.randn(out_f, in_f, dtype=torch.float16).to(torch.float8_e4m3fn)
+            weight = torch.randn(out_f, in_f, dtype=torch.float16).to(
+                torch.float8_e4m3fn
+            )
             dev = _dma_to_spyre_fp8_kernel(weight)
             assert dev.device.type == DEVICE_TYPE
             assert dev.dtype == torch.float8_e4m3fn
@@ -142,9 +146,7 @@ class TestLoadModelToSpyreUseFp8Weights:
         load_fp8_model_to_spyre(model)
 
         fp8_weights = [
-            (n, m.weight)
-            for n, m in model.named_modules()
-            if isinstance(m, nn.Linear)
+            (n, m.weight) for n, m in model.named_modules() if isinstance(m, nn.Linear)
         ]
         assert len(fp8_weights) == 2
         for name, w in fp8_weights:
@@ -255,9 +257,12 @@ class TestScaledMmWithPrequantizedWeight:
         def spyre_fn(act, q_weight, scale_a, scale_b):
             q_act = torch.ops.spyre.quantize_fp8_with_scale(act, scale_a)
             return torch.ops.aten._scaled_mm(
-                q_act, q_weight,
-                scale_a=scale_a, scale_b=scale_b,
-                bias=None, out_dtype=torch.float16,
+                q_act,
+                q_weight,
+                scale_a=scale_a,
+                scale_b=scale_b,
+                bias=None,
+                out_dtype=torch.float16,
             )
 
         def pytorch_fn(act, q_weight, scale_a, scale_b):
@@ -267,14 +272,20 @@ class TestScaledMmWithPrequantizedWeight:
             return (a_f32 @ b_f32.T).to(torch.float16)
 
         compare_with_pytorch(
-            spyre_fn, pytorch_fn, act, q_weight, scale_a_t, scale_b_t,
-            atol=1.0, rtol=0.1,
+            spyre_fn,
+            pytorch_fn,
+            act,
+            q_weight,
+            scale_a_t,
+            scale_b_t,
+            atol=1.0,
+            rtol=0.1,
         )
 
     @pytest.mark.parametrize(
         "m, k, n, scale_a, scale_b",
         [
-            (1,  128,  128, 1.0, 1.0),
+            (1, 128, 128, 1.0, 1.0),
             (2, 4096, 4096, 1.0, 1.0),
             (4, 4096, 4096, 2.0, 0.5),
         ],
@@ -307,29 +318,47 @@ class TestScaledMmWithPrequantizedWeight:
         # Start from FP16 weight — exactly mirrors test_fp8_scaled_mm_cpu.
         # The Spyre path quantizes it to FP8 via quantize_weight_fp8_with_scale;
         # the CPU reference also quantizes to FP8 then dequantizes for the matmul.
-        act      = torch.randn(m, k, dtype=torch.float16)
-        weight   = torch.randn(k, n, dtype=torch.float16)   # [k, n] already
+        act = torch.randn(m, k, dtype=torch.float16)
+        weight = torch.randn(k, n, dtype=torch.float16)  # [k, n] already
         scale_a_t = torch.tensor(scale_a, dtype=torch.float16)
         scale_b_t = torch.tensor(scale_b, dtype=torch.float16)
 
         def spyre_fn(act, weight, scale_a_in, scale_b_in):
             q_act = torch.ops.spyre.quantize_fp8_with_scale(act, scale_a_in)
-            q_w   = torch.ops.spyre.quantize_weight_fp8_with_scale(weight, scale_b_in)
+            q_w = torch.ops.spyre.quantize_weight_fp8_with_scale(weight, scale_b_in)
             return torch.ops.aten._scaled_mm(
-                q_act, q_w,
-                scale_a=scale_a_in, scale_b=scale_b_in,
-                bias=None, out_dtype=torch.float16,
+                q_act,
+                q_w,
+                scale_a=scale_a_in,
+                scale_b=scale_b_in,
+                bias=None,
+                out_dtype=torch.float16,
             )
 
         def pytorch_fn(act, weight, scale_a_in, scale_b_in):
-            q_a = (act   / scale_a).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).to(torch.float16)
-            q_b = (weight / scale_b).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).to(torch.float16)
+            q_a = (
+                (act / scale_a)
+                .clamp(-448.0, 448.0)
+                .to(torch.float8_e4m3fn)
+                .to(torch.float16)
+            )
+            q_b = (
+                (weight / scale_b)
+                .clamp(-448.0, 448.0)
+                .to(torch.float8_e4m3fn)
+                .to(torch.float16)
+            )
             return (q_a @ q_b) * (scale_a * scale_b)
 
         compare_with_pytorch(
-            spyre_fn, pytorch_fn,
-            act, weight, scale_a_t, scale_b_t,
-            atol=4.0, rtol=0.1,
+            spyre_fn,
+            pytorch_fn,
+            act,
+            weight,
+            scale_a_t,
+            scale_b_t,
+            atol=4.0,
+            rtol=0.1,
         )
 
 
@@ -360,13 +389,13 @@ class TestScaledMmPrequantizedClosedOver:
         "m, k, n",
         [
             # Square (K == N): passed before fixes (self-consistent wrong encoding)
-            (4,  512,  512),
+            (4, 512, 512),
             (4, 4096, 4096),
             # Non-square (K ≠ N): failed before fixes — now the primary regression guard
-            (4, 4096,  512),   # K > N  (e.g. k_proj/v_proj in Granite GQA)
-            (4,  512, 1024),   # K < N
-            (4, 4096, 1024),   # K > N  (e.g. k_proj/v_proj)
-            (4, 2048, 4096),   # K < N  (e.g. down_proj)
+            (4, 4096, 512),  # K > N  (e.g. k_proj/v_proj in Granite GQA)
+            (4, 512, 1024),  # K < N
+            (4, 4096, 1024),  # K > N  (e.g. k_proj/v_proj)
+            (4, 2048, 4096),  # K < N  (e.g. down_proj)
         ],
     )
     def test_prequantized_closed_over(self, m, k, n):
@@ -379,10 +408,10 @@ class TestScaledMmPrequantizedClosedOver:
         from torch_spyre.model_utils import _dma_to_spyre_fp8_kernel
 
         torch.manual_seed(42)
-        act_cpu    = torch.randn(m, k, dtype=torch.float16)
-        weight_cpu = torch.randn(n, k, dtype=torch.float16)   # [n, k] → T → [k, n]
-        scale_a    = torch.tensor(1.0, dtype=torch.float16)
-        scale_b    = torch.tensor(1.0, dtype=torch.float16)
+        act_cpu = torch.randn(m, k, dtype=torch.float16)
+        weight_cpu = torch.randn(n, k, dtype=torch.float16)  # [n, k] → T → [k, n]
+        scale_a = torch.tensor(1.0, dtype=torch.float16)
+        scale_b = torch.tensor(1.0, dtype=torch.float16)
 
         # Simulate a checkpoint FP8 weight: quantize [n,k], transpose to [k,n] for matmul
         weight_fp8_T = (
@@ -398,9 +427,12 @@ class TestScaledMmPrequantizedClosedOver:
             q_act = torch.ops.spyre.quantize_fp8_with_scale(act, sa)
             # q_w_spyre is a frozen constant from the enclosing scope
             return torch.ops.aten._scaled_mm(
-                q_act, q_w_spyre,
-                scale_a=sa, scale_b=sb,
-                bias=None, out_dtype=torch.float16,
+                q_act,
+                q_w_spyre,
+                scale_a=sa,
+                scale_b=sb,
+                bias=None,
+                out_dtype=torch.float16,
             )
 
         result = spyre_fn(
