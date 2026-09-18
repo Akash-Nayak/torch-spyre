@@ -274,10 +274,10 @@ def _dma_to_spyre_fp8_kernel(
         weight = weight.contiguous()
 
     layout = SpyreTensorLayout(
-        list(weight.shape),   # host_size: (out_features, in_features)
+        list(weight.shape),  # host_size: (out_features, in_features)
         list(weight.stride()),  # host_strides: row-major (out, 1)
         torch.float8_e4m3fn,
-        [0, 1],               # dim_order: identity, matches _qfp8wt_stl in propagate_layouts
+        [0, 1],  # dim_order: identity, matches _qfp8wt_stl in propagate_layouts
         ElementArrangement.QFP8WT,  # 2D stick [2, 64] for KERNEL tensor
     )
     dst = spyre_empty_with_layout(
@@ -362,6 +362,7 @@ def dma_moe_per_expert_scale_to_spyre(
     copy_tensor(widened, dst, non_blocking=False)
     return dst
 
+
 # --- Model loading ---------------------------------------------------
 
 
@@ -393,9 +394,11 @@ def _transfer_module(
     """
     if _module_overrides_apply(module):
         module._apply(
-            lambda t: _dma_to_spyre_default(t, target_dtype=dtype)
-            if t is not None and t.device.type != DEVICE_NAME
-            else t
+            lambda t: (
+                _dma_to_spyre_default(t, target_dtype=dtype)
+                if t is not None and t.device.type != DEVICE_NAME
+                else t
+            )
         )
         return
 
