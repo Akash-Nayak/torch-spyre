@@ -502,10 +502,12 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
 
     // Host strides for the expanded layout
     // stride_map[0] = K stride in host elements
-    const int64_t dst2 = si * so;      // = eps = 128 (one full [2,64] stick)
-    const int64_t dst3 = dim2 * eps;   // = (K/si) * si * so = K * so (one N-strip of sticks)
+    const int64_t dst2 = si * so;  // = eps = 128 (one full [2,64] stick)
+    const int64_t dst3 =
+        dim2 * eps;  // = (K/si) * si * so = K * so (one N-strip of sticks)
 
-    // Host (row-major) strides in the expanded 4D index space [si, so, dim2, dim3]:
+    // Host (row-major) strides in the expanded 4D index space [si, so, dim2,
+    // dim3]:
     //   element [k,n]: k = d2*si + a,  n = d3*so + b
     //   host byte = k*N + n = (d2*si + a)*N + (d3*so + b)
     //             = a*N + b*1 + d2*(si*N) + d3*so
@@ -514,8 +516,8 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
 
     // Device (QFP8WT [2,64] stick) strides in the expanded 4D index space:
     //   physical byte = a*1 + b*si + d2*dst2 + d3*dst3
-    //   (within a stick: si dimension innermost at stride=1, so dimension at stride=si)
-    //   → stride = [1, si, dst2, dst3]
+    //   (within a stick: si dimension innermost at stride=1, so dimension at
+    //   stride=si) → stride = [1, si, dst2, dst3]
     const std::vector<int64_t> device_strides = {1, si, dst2, dst3};
 
     DataConversionStrideInfo dcsi;

@@ -270,12 +270,13 @@ def _dma_to_spyre_fp8_kernel(
 
     _ensure_spyre_runtime()
 
-    if not weight.is_contiguous():
-        weight = weight.contiguous()
-
+    # Note: contiguity is NOT required here. The QFP8WT branch in generate_dci
+    # (spyre_mem.cpp) derives host strides analytically from K and N — it does
+    # not use the CPU tensor's actual strides. This means a non-contiguous view
+    # (e.g. p.t()) is safe to pass directly, avoiding a CPU memcpy.
     layout = SpyreTensorLayout(
-        list(weight.shape),  # host_size: (out_features, in_features)
-        list(weight.stride()),  # host_strides: row-major (out, 1)
+        list(weight.shape),  # host_size: [K, N] = [in_features, out_features]
+        list(weight.stride()),  # host_strides: row-major [N, 1]
         torch.float8_e4m3fn,
         [0, 1],  # dim_order: identity, matches _qfp8wt_stl in propagate_layouts
         ElementArrangement.QFP8WT,  # 2D stick [2, 64] for KERNEL tensor
@@ -426,13 +427,17 @@ def _transfer_module(
             and p.dtype == torch.float8_e4m3fn
         ):
             logger.debug(
-                "  %s.%s: shape=%s dtype=%s -> Spyre FP8 KERNEL layout (2D stick)",
+                "  %s.%s: shape=%s dtype=%s -> Spyre FP8 KERNEL layout (2D stick) [transposed to K,N]",
                 prefix,
                 name,
                 list(p.shape),
                 p.dtype,
             )
-            dev = _dma_to_spyre_fp8_kernel(p)
+            # nn.Linear stores weight as [out_features, in_features] = [N, K].
+            # The fp8_linear_kernel expects [K, N] on Spyre (see _kernel_weight_splits).
+            # Pass p.t() directly — no .contiguous() needed since the QFP8WT DMA
+            # path ignores the CPU tensor's actual strides (see _dma_to_spyre_fp8_kernel).
+            dev = _dma_to_spyre_fp8_kernel(p.t())
             counts["fp8_kernel"] += 1
         elif is_linear and name == "weight" and p.ndim == 2:
             logger.debug(
