@@ -2307,6 +2307,14 @@ def expand_sparse(in_stl, output: FixedLayout) -> tuple[bool, SpyreTensorLayout]
     return False, out_stl
 
 
+# ReStickifyOpHBM supports these device formats. IEEE_FP32 and other non-DL16
+# formats are not supported: do not advertise an edge as feasible when codegen
+# cannot lower it.
+_RESTICKIFY_SUPPORTED_DTYPES = frozenset(
+    (DataFormats.SEN169_FP16, DataFormats.SEN143_FP8)
+)
+
+
 def compute_restickify_needed(
     in_stl: SpyreTensorLayout,
     in_host: FixedLayout,
@@ -2370,14 +2378,11 @@ def compute_restickify_needed(
     ):
         return False, None
 
-    # ReStickifyOpHBM supports the native FP16 device format (SEN169_FP16) and
-    # FP8 (SEN143_FP8). IEEE_FP32 and other non-DL16 formats are not supported.
     # Do not advertise an edge as feasible when codegen cannot lower it: this
     # is especially important for fp32-upcast graphs, where a later IEEE_FP32
     # restick can otherwise tie with and displace the valid FP16 restick before
     # the conversion. This also deliberately precedes the factorized-layout
     # target below: a concrete target is not actionable for a non-DL16 input.
-    _RESTICKIFY_SUPPORTED_DTYPES = (DataFormats.SEN169_FP16, DataFormats.SEN143_FP8)
     if in_stl.device_dtype not in _RESTICKIFY_SUPPORTED_DTYPES:
         return True, None
 
