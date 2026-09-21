@@ -9244,7 +9244,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             differentiation=("w", b, m, k, n),
             scale=0.1,
         )
-        sa = sw = torch.full((1,), 1.0, dtype=torch.float16)
+        # Use non-unity scales to exercise FP8 range behaviour (scale=1.0 makes
+        # quantization a numerical pass-through and masks range-boundary errors).
+        sa = torch.full((1,), 0.5, dtype=torch.float16)
+        sw = torch.full((1,), 0.25, dtype=torch.float16)
 
         def spyre_fn(a_3d, w, sa, sw):
             a_2d = a_3d.reshape(a_3d.shape[0] * a_3d.shape[1], a_3d.shape[2])
@@ -9258,17 +9261,21 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         def pytorch_fn(a_3d, w, sa, sw):
             a_2d = a_3d.reshape(a_3d.shape[0] * a_3d.shape[1], a_3d.shape[2])
             a_fp8 = (
-                (a_2d / sa).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn).to(torch.float16)
+                (a_2d / sa)
+                .clamp(-FP8_MAX, FP8_MAX)
+                .to(torch.float8_e4m3fn)
+                .to(torch.float16)
             )
             w_fp8 = (
-                (w / sw).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn).to(torch.float16)
+                (w / sw)
+                .clamp(-FP8_MAX, FP8_MAX)
+                .to(torch.float8_e4m3fn)
+                .to(torch.float16)
             )
             out = (a_fp8 @ w_fp8) * (sa * sw)
             return out.reshape(a_3d.shape[0], a_3d.shape[1], n)
 
-        compare_with_pytorch(
-            spyre_fn, pytorch_fn, a_3d, w, sa, sw, atol=2.0, rtol=0.2
-        )
+        compare_with_pytorch(spyre_fn, pytorch_fn, a_3d, w, sa, sw, atol=2.0, rtol=0.2)
 
     def test_is_nonzero_cpu(self, *args):
         """Test torch.is_nonzero on Spyre tensors"""
