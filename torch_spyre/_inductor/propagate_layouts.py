@@ -239,6 +239,8 @@ def _project_pointwise_dim_order(
     # buffer. Its extra leading axes are fixed by the loop, while the body
     # operates on the trailing axes. Keep those backing axes in the layout
     # permutation and shift the body's order onto the trailing dimensions.
+    # The trailing -1 is the sparse-stick marker and must be preserved as-is,
+    # not shifted (it is not a dimension index).
     leading = list(range(-rank_diff))
     return leading + [(d - rank_diff if d != -1 else d) for d in dim_order]
 
