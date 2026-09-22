@@ -12,112 +12,77 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
-"""The hw_failure_diagnostics table: its column order and its self-migration.
-
-Deliberately NOT a schema.Table. That model is for the four v2 tables: it rejects any row whose
-keys do not match `columns` exactly and validates a `status` column against STATUS_VALUES. This
-table is v1-generation and discovers its own columns at runtime via ADD COLUMN IF NOT EXISTS
-(tolerated failures), and its verdict column is `outcome`, a different vocabulary -- so a frozen
-Table would either validate nothing or turn a tolerated ALTER into a hard row-build error.
-
-The table name is a parameter everywhere: the ingest exposes --table, and hardcoding it in the
-dedup query while honouring the flag elsewhere made that flag a half-truth.
-"""
-
-import sys
-
-# Column names — must match build_row() order and hw_failure_diagnostics DDL
-HW_COLUMN_NAMES = (
-    # Identity
-    "run_id",
-    "workflow",
-    "branch",
-    "commit_sha",
-    "run_link",
-    "suite_name",
-    "attempt",
-    "total_attempts",
-    "pod_level_retry",
-    "ingested_at",
-    # Outcome
-    "outcome",
-    "exit_code",
-    # Failure classification
-    "failure_reason",
-    "failure_phase",
-    "retry_trigger",
-    "failure_reason_detail",
-    # RAS
-    "ras_code",
-    "ras_name",
-    "ras_description",
-    "ras_action",
-    "ras_category",
-    "ras_severity",
-    "ras_message",
-    "ras_events_json",
-    # Hardware
-    "node_name",
-    "pci_device",
-    "aiu_world_rank0",
-    "card_serial",
-    "chip_ecid_raw",
-    "chip_wafer_id",
-    "chip_mfg_x",
-    "chip_mfg_y",
-    "chip_chipy",
-    "chip_chipx",
-    # Timestamps
-    "first_error_ts",
-    "attempt_start_ts",
-    # Pytest stats
-    "tests_collected",
-    "tests_passed",
-    "tests_failed",
-    "tests_error",
-    # Stall
-    "stall_max_secs",
-)
-
-# Columns absent from older deployments of this table. ADD COLUMN IF NOT EXISTS is idempotent,
-# so this runs on every ingest and is the only migration path this table has.
-EXTRA_COLUMNS = (
-    ("workflow", "LowCardinality(String) DEFAULT ''"),
-    ("branch", "LowCardinality(String) DEFAULT ''"),
-    ("commit_sha", "String DEFAULT ''"),
-    ("run_link", "String DEFAULT ''"),
-    ("failure_reason_detail", "String DEFAULT '{}'"),
-    ("ras_category", "LowCardinality(String) DEFAULT ''"),
-    ("ras_severity", "LowCardinality(String) DEFAULT ''"),
-    ("ras_message", "String DEFAULT ''"),
-    ("ras_events_json", "String DEFAULT '[]'"),
-    # True when the row came from a pod-level-retry job (a fresh-pod re-run), not the original.
-    ("pod_level_retry", "Bool DEFAULT false"),
-)
-
-DEFAULT_TABLE = "hw_failure_diagnostics"
+"""hw_failure_diagnostics: v1-generation, self-migrating -- NOT a schema.Table."""
 
 
-def already_ingested(
-    client, run_id: str, workflow: str, table: str = DEFAULT_TABLE
-) -> bool:
-    """True when this (run_id, workflow) pair already has rows, so a re-run does not double-insert."""
-    result = client.query(
-        f"SELECT count() FROM {table} "
-        "WHERE run_id = {run_id:String} AND workflow = {workflow:String}",
-        parameters={"run_id": run_id, "workflow": workflow},
+class HwFailureDiagnostics:
+    """Column order and dedup check for the self-migrating table."""
+
+    DEFAULT_TABLE = "hw_failure_diagnostics"
+    NIL_UUID = "00000000-0000-0000-0000-000000000000"
+
+    # Must match build_row() order and the live DDL; the table name is a parameter
+    # everywhere, since hardcoding it here while honouring --table elsewhere would make
+    # that flag a half-truth.
+    COLUMN_NAMES = (
+        "run_id",
+        "artifact_id",
+        "component",
+        "arch",
+        "suite_name",
+        "attempt",
+        "total_attempts",
+        "pod_level_retry",
+        "ingested_at",
+        "outcome",
+        "exit_code",
+        "failure_reason",
+        "failure_phase",
+        "retry_trigger",
+        "failure_reason_detail",
+        "ras_code",
+        "ras_name",
+        "ras_description",
+        "ras_action",
+        "ras_category",
+        "ras_severity",
+        "ras_message",
+        "ras_events_json",
+        "node_name",
+        "pci_device",
+        "aiu_world_rank0",
+        "card_serial",
+        "chip_ecid_raw",
+        "chip_wafer_id",
+        "chip_mfg_x",
+        "chip_mfg_y",
+        "chip_chipy",
+        "chip_chipx",
+        "first_error_ts",
+        "attempt_start_ts",
+        "tests_collected",
+        "tests_passed",
+        "tests_failed",
+        "tests_error",
+        "stall_max_secs",
+        "props",  # external_run_id (the raw run_id hash input) and run_url
     )
-    return result.result_rows[0][0] > 0
+
+    @classmethod
+    def already_ingested(
+        cls, client, run_id: str, component: str, table: str = ""
+    ) -> bool:
+        """True when this (component, run_id) already has rows -- guards against double-insert."""
+        result = client.query(
+            f"SELECT count() FROM {table or cls.DEFAULT_TABLE} "
+            "WHERE component = {component:String} AND run_id = {run_id:UUID}",
+            parameters={"run_id": run_id, "component": component},
+        )
+        return result.result_rows[0][0] > 0
 
 
-def ensure_extra_columns(client, table: str = DEFAULT_TABLE) -> None:
-    """Add any missing EXTRA_COLUMNS. Non-fatal per column: the usual cause is that it already
-    exists, and a failure here must not cost the run its rows."""
-    for col_name, col_type in EXTRA_COLUMNS:
-        try:
-            client.command(
-                f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col_name} {col_type}"
-            )
-        except Exception as exc:
-            print(f"  [warn] Could not add column {col_name}: {exc}", file=sys.stderr)
+# Constant/function API, kept so installed consumers import one definition, not a copy.
+HW_COLUMN_NAMES = HwFailureDiagnostics.COLUMN_NAMES
+NIL_UUID = HwFailureDiagnostics.NIL_UUID
+DEFAULT_TABLE = HwFailureDiagnostics.DEFAULT_TABLE
+already_ingested = HwFailureDiagnostics.already_ingested
