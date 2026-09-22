@@ -237,9 +237,11 @@ class TestScaledMmWithPrequantizedWeight:
 
     @pytest.mark.xfail(
         reason=(
-            "Weight as compiled-graph input causes device mismatch (cpu vs spyre:0) "
-            "during tracing. Pre-loaded KERNEL weights must be closed over as frozen "
-            "constants, not passed as graph inputs. See class docstring."
+            "Pre-loaded KERNEL weight passed as a compiled-graph input is unsupported: "
+            "the weight is already on spyre:0 before tracing, so Dynamo treats it as a "
+            "graph input rather than a frozen constant, producing incorrect results. "
+            "Pre-loaded KERNEL weights must be closed over, not passed as graph inputs. "
+            "See class docstring."
         ),
         strict=True,
     )
@@ -279,7 +281,8 @@ class TestScaledMmWithPrequantizedWeight:
         def pytorch_fn(act, q_weight, scale_a, scale_b):
             q_a = (act / scale_a).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
             a_f32 = q_a.to(torch.float32) * scale_a.item()
-            b_f32 = q_weight.to(torch.float32) * scale_b.item()
+            # Use the original CPU weight_fp8, not q_weight (which is on spyre:0)
+            b_f32 = weight_fp8.to(torch.float32) * scale_b.item()
             return (a_f32 @ b_f32.T).to(torch.float16)
 
         compare_with_pytorch(
