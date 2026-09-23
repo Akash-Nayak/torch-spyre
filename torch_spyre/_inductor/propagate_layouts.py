@@ -1116,17 +1116,24 @@ def find_stick_compatible_input_layout(
         if result is not None:
             return result
 
-    # Pass 3 (BATCH_MATMUL_OP only): all candidates were factorized (reduction_var
-    # on outer axes), so Pass 2 found nothing.  Build the canonical STL directly
-    # from the host geometry, collapsing mixed-radix dims if needed.
+    # Pass 3 (BATCH_MATMUL_OP and BATCH_MATMUL_FP8_OP): all candidates were
+    # factorized (reduction_var on outer axes), so Pass 2 found nothing.  Build
+    # the canonical STL directly from the host geometry, collapsing mixed-radix
+    # dims if needed.
     # This fires for:
     #   Case A: single host dim but only factorized STL candidates — Pass 2
     #           correctly skipped them; derive from host geometry instead.
     #   Case B: multiple host dims (mixed-radix view) — collapse and construct.
+    #   Case C (FP8): the QFP8CH activation arrives with the N-dim on the stick
+    #           but the second batchmatmulfp8 needs the M-dim as K-reduction.
+    #           This occurs when the FP8 intermediate is transposed or reshaped
+    #           so that the reduction variable is not accessible from the device
+    #           coordinates of any candidate.  The canonical target is derived
+    #           from host geometry and the restickify will adjust the layout.
     # Does NOT fire when Pass 2 returned successfully (normal weight tensors where
     # the generated var is on the stick and reduction_var is only on outer axes in
     # a non-factorized sense).
-    if reduction_type == BATCH_MATMUL_OP:
+    if reduction_type in (BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP):
         canonical = _canonical_stl_from_collapsed_host(
             arg, reduction_var, reduction_type, label
         )
