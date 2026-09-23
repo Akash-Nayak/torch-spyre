@@ -3121,6 +3121,32 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        # Fused RMSNorm + per-token FP8 quantization scale (issue #4468).
+        # rms_norm_quantscale_fp8 decomposes into layernormnorm + quantscalepertokenfp8;
+        # both outputs (norm_out, scale_out) must match the unfused reference.
+        ("test_rms_norm_quantscale_fp8", "test_rms_norm_quantscale_fp8_cpu"): {
+            "param_sets": {
+                "2d_256": (
+                    cached_randn((64, 256), dtype=torch.float16),
+                    cached_randn((64, 1), abs=True, dtype=torch.float16),   # exx2_out
+                    cached_randn((64, 1), abs=True, dtype=torch.float16),   # lns_out
+                    cached_randn((256,), dtype=torch.float16),               # weight
+                ),
+                "3d_128": (
+                    cached_randn((4, 64, 128), dtype=torch.float16),
+                    cached_randn((4, 64, 1), abs=True, dtype=torch.float16),
+                    cached_randn((4, 64, 1), abs=True, dtype=torch.float16),
+                    cached_randn((128,), dtype=torch.float16),
+                ),
+                "2d_4096": (
+                    # Granite-3.3-8B hidden dim (mb=1 for unit test speed)
+                    cached_randn((1, 4096), dtype=torch.float16),
+                    cached_randn((1, 1), abs=True, dtype=torch.float16),
+                    cached_randn((1, 1), abs=True, dtype=torch.float16),
+                    cached_randn((4096,), dtype=torch.float16),
+                ),
+            },
+        },
         # TODO: aten::native_batch_norm not implemented for the 'spyre' backend
         # (runtime NotImplementedError before compilation) (issue #1889)
         ("test_batch_norm_functional", "test_batch_norm_functional_cpu"): {
@@ -7723,6 +7749,56 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return x / rms * weight
 
         self.compare_with_cpu(fn, x, weight)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_rms_norm_quantscale_fp8_cpu(self, x, exx2_out, lns_out, weight):
+        """
+        Test the fused rms_norm_quantscale_fp8 op (issue #4468).
+
+        The fused op decomposes into layernormnorm + quantscalepertokenfp8.
+        We verify both outputs — the normalized activations (norm_out) and the
+        per-token FP8 scale (scale_out) — against a plain PyTorch reference.
+
+        Reference arithmetic (FP32 for precision):
+          norm_out  = x * lns_out * weight
+          scale_out = clip(absmax(norm_out, dim=-1) * mulConst, clipMin, clipMax)
+        """
+        from torch_spyre._inductor.constants import (
+            QUANTSCALEPERTOKENFP8_CLIP_MAX,
+            QUANTSCALEPERTOKENFP8_CLIP_MIN,
+        )
+
+        scale_ub = float(torch.finfo(torch.float8_e4m3fn).max)  # 448.0
+        mul_const = float(torch.tensor(1.0 / scale_ub, dtype=torch.float16))
+
+        def fn_fused(x, exx2_out, lns_out, weight):
+            norm_out, scale_out = torch.ops.spyre.rms_norm_quantscale_fp8(
+                x, exx2_out, lns_out, weight, scale_ub
+            )
+            return norm_out, scale_out
+
+        def fn_ref(x, exx2_out, lns_out, weight):
+            # Phase 1: LayerNormNorm — hardware computes:
+            #   PE FNMS: tmp = lns_out * exx2_out  (negate-mul: -a*b+0 = -a*b?)
+            #   PE FMA:  pe_out = x * lns_out + (-lns_out * exx2_out)
+            #                   = lns_out * (x - exx2_out)
+            #   SFP FMA: out = pe_out * weight + bias  (bias=0 for RMSNorm)
+            x_f32 = x.float()
+            norm_out = (
+                (x_f32 - exx2_out.float()) * lns_out.float() * weight.float()
+            ).to(x.dtype)
+            # Phase 2: QuantScalePerTokenFp8
+            amax = norm_out.float().abs().amax(dim=-1, keepdim=True)
+            scale = amax * mul_const
+            scale = scale.clamp(
+                min=QUANTSCALEPERTOKENFP8_CLIP_MIN,
+                max=QUANTSCALEPERTOKENFP8_CLIP_MAX,
+            ).to(x.dtype)
+            return norm_out, scale
+
+        compare_with_pytorch(fn_fused, fn_ref, x, exx2_out, lns_out, weight)
+
+
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_batch_norm_functional_cpu(

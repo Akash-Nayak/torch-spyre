@@ -914,6 +914,68 @@ def _(input: torch.Tensor, scale_ub: float = FP8_E4M3FN_MAX) -> torch.Tensor:
     return torch.empty(out_shape, dtype=input.dtype, device=input.device)
 
 
+
+@torch.library.custom_op(
+    "spyre::rms_norm_quantscale_fp8", mutates_args=(), device_types="spyre"
+)
+def rms_norm_quantscale_fp8(
+    x: torch.Tensor,
+    exx2_out: torch.Tensor,
+    lns_out: torch.Tensor,
+    weight: torch.Tensor,
+    scale_ub: float = FP8_E4M3FN_MAX,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Fused RMSNorm normalization + per-token FP8 quantization scale.
+
+    Combines ``spyre.layernormnorm`` and ``spyre.quantscalepertokenfp8`` into a
+    single pass over the hidden dimension, saving one full HBM read of the
+    ``[mb, hidden]`` activation tensor per transformer layer.
+
+    Phase 1 (mirrors ``layernormnorm``):
+        ``norm_out[i, j] = (x[i, j] - exx2_out[i]) * lns_out[i] * weight[j]``
+
+    Phase 2 (mirrors ``quantscalepertokenfp8``, reading ``norm_out`` from LX):
+        ``scale_out[i] = clip(absmax(norm_out[i, :]) * mulConst, clipMin, clipMax)``
+
+    Args:
+        x:         Input activations (FP16), shape ``[*, hidden]``.
+        exx2_out:  Exx2 output (mean of x² per token), shape ``[*, 1]``.
+        lns_out:   LayerNormScale output (rsqrt(exx2+eps)), shape ``[*, 1]``.
+        weight:    RMSNorm weight (gamma), shape ``[hidden]``.
+        scale_ub:  Upper bound for scaling; ``mulConst = 1 / scale_ub`` is
+                   FP16-encoded before use on device.
+                   Default: ``FP8_E4M3FN_MAX`` (448.0).
+
+    Returns:
+        A tuple ``(norm_out, scale_out)`` where:
+        - ``norm_out``   (FP16): normalized activations, shape ``[*, hidden]``.
+        - ``scale_out``  (FP16): per-token FP8 scale,   shape ``[*, 1]``.
+    """
+    pass
+
+
+@rms_norm_quantscale_fp8.register_fake
+def _(
+    x: torch.Tensor,
+    exx2_out: torch.Tensor,
+    lns_out: torch.Tensor,
+    weight: torch.Tensor,
+    scale_ub: float = FP8_E4M3FN_MAX,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if x.ndim < 1:
+        raise ValueError(
+            "rms_norm_quantscale_fp8 requires input with at least 1 dimension "
+            "(the hidden dim), got a scalar (ndim=0)."
+        )
+    norm_out = x.new_empty(x.shape)
+    scale_shape = list(x.shape)
+    scale_shape[-1] = 1
+    scale_out = x.new_empty(scale_shape)
+    return norm_out, scale_out
+
+
+
 @torch.library.custom_op(
     "spyre::quantize_fp8_with_scale", mutates_args=(), device_types="spyre"
 )

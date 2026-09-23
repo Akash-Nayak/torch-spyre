@@ -304,6 +304,16 @@ class SpyreOpFuncs:
         return ReductionOp("quantscalepertokenfp8", [x])
 
     @staticmethod
+    def rms_norm_quantscale_fp8(x, exx2_out, lns_out, weight, scale_ub):
+        # scale_ub is intentionally unused here (baked into op_info.constants
+        # at lowering time).  The decomposition expands this op into
+        # layernormnorm + quantscalepertokenfp8 before reaching codegen, so
+        # this method is a forward-compatibility hook for if/when the fused
+        # single-SDSC path is implemented.
+        _ = scale_ub
+        return ReductionOp("rmsnormquantscalefp8", [x, exx2_out, lns_out, weight])
+
+    @staticmethod
     def relu(x):
         return PointwiseOp("relufwd", [x])
 

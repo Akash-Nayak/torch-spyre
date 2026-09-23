@@ -202,6 +202,11 @@ QUANTSCALEPERTOKENFP8_CLIP_MAX = float(torch.finfo(torch.float32).max)
 # produce or consume FP8 tensors.
 QUANTSCALEPERTOKENFP8_OP = "quantscalepertokenfp8"
 
+# Fused RMSNorm + per-token FP8 scale: combines LayerNormNorm and
+# QuantScalePerTokenFp8 into a single pass over the hidden dimension, saving
+# one full HBM read of the hidden tensor per token per transformer layer.
+RMS_NORM_QUANTSCALE_FP8_OP = "rmsnormquantscalefp8"
+
 # Operations that directly handle FP8 dtypes (SEN143_FP8)
 SPYRE_FP8_OPS = {
     "qfp8ch",  # Channel-wise FP8 quantization (output: FP8)

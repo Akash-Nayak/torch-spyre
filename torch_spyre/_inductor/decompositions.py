@@ -1596,6 +1596,36 @@ def spyre_layer_norm(
     return torch.ops.spyre.layernormnorm(input, mean, norm_mean, weight, bias)
 
 
+@register_spyre_decompositions([torch.ops.spyre.rms_norm_quantscale_fp8.default])
+def spyre_rms_norm_quantscale_fp8(
+    x: torch.Tensor,
+    exx2_out: torch.Tensor,
+    lns_out: torch.Tensor,
+    weight: torch.Tensor,
+    scale_ub: float = FP8_E4M3FN_MAX,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Decompose rms_norm_quantscale_fp8 into layernormnorm + quantscalepertokenfp8.
+
+    This decomposition expands the fused op into its two constituent phases so
+    that each can be compiled and lowered independently.  At the deeptools level
+    (dbo-opt DSM pass) the sequential LayerNormNorm → QuantScalePerTokenFp8
+    pattern is re-fused into a single ``rmsnormquantscalefp8`` SDSC, recovering
+    the HBM savings without requiring a dual-output SDSC at the torch-spyre
+    codegen layer.
+    """
+    # Phase 1: LayerNormNorm.  Zero bias = no additive shift (RMSNorm).
+    zero_bias = x.new_zeros(weight.shape)
+    norm_out = torch.ops.spyre.layernormnorm(x, exx2_out, lns_out, weight, zero_bias)
+
+    # Phase 2: QuantScalePerTokenFp8 operating on the freshly computed norm_out.
+    scale_out = torch.ops.spyre.quantscalepertokenfp8(norm_out, scale_ub)
+
+    return norm_out, scale_out
+
+
+
+
 @register_spyre_decompositions([torch.ops.aten.silu.default])
 def silu(input: torch.Tensor) -> torch.Tensor:
     return torch.ops.spyre.silu(input)

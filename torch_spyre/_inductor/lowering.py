@@ -44,6 +44,7 @@ from .constants import (
     QUANTSCALEPERTOKENFP8_CLIP_MAX,
     QUANTSCALEPERTOKENFP8_CLIP_MIN,
     QUANTSCALEPERTOKENFP8_OP,
+    RMS_NORM_QUANTSCALE_FP8_OP,
 )
 from .errors import Unsupported
 from .ir import (
@@ -2036,6 +2037,7 @@ def lower_quantscalepertokenfp8(x, scale_ub=FP8_E4M3FN_MAX):
 
     result.realize()
     return result
+
 
 
 @register_spyre_lowering(
