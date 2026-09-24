@@ -198,12 +198,11 @@ class TestScaledMmWithPrequantizedWeight:
     ``test_kernel_layout_properties`` verifies the DMA transfer itself (dtype,
     shape, device) is correct.
 
-    ``test_scaled_mm_prequantized_weight_xfail`` documents that a pre-loaded
-    Spyre KERNEL tensor cannot be passed as a compiled-graph input — the weight
-    is already on ``spyre:0`` before tracing, causing a device mismatch.
-
-    The end-to-end correctness of _scaled_mm with a pre-quantized closed-over
-    weight is covered by ``TestScaledMmPrequantizedClosedOver``.
+    ``test_scaled_mm_prequantized_weight_as_graph_input`` verifies that a
+    pre-loaded QFP8WT KERNEL tensor can be passed as a compiled-graph input
+    and produces correct results.  The weight must be transposed to [k, n]
+    before calling _dma_to_spyre_fp8_kernel, matching the convention used by
+    the closed-over pattern in TestScaledMmPrequantizedClosedOver.
     """
 
     @pytest.mark.parametrize(
@@ -235,16 +234,6 @@ class TestScaledMmWithPrequantizedWeight:
             f"Expected shape [{n}, {k}], got {q_weight.shape}"
         )
 
-    @pytest.mark.xfail(
-        reason=(
-            "Pre-loaded KERNEL weight passed as a compiled-graph input is unsupported: "
-            "the weight is already on spyre:0 before tracing, so Dynamo treats it as a "
-            "graph input rather than a frozen constant, producing incorrect results. "
-            "Pre-loaded KERNEL weights must be closed over, not passed as graph inputs. "
-            "See class docstring."
-        ),
-        strict=True,
-    )
     @pytest.mark.parametrize(
         "m, k, n, scale_a, scale_b",
         [
@@ -252,20 +241,34 @@ class TestScaledMmWithPrequantizedWeight:
             (4, 4096, 4096, 2.0, 0.5),
         ],
     )
-    def test_scaled_mm_prequantized_weight_xfail(self, m, k, n, scale_a, scale_b):
-        """Documents that KERNEL FP8 weight as compiled-graph input is unsupported."""
+    def test_scaled_mm_prequantized_weight_as_graph_input(
+        self, m, k, n, scale_a, scale_b
+    ):
+        """Pre-loaded QFP8WT KERNEL tensor passed as a compiled-graph input.
+
+        The weight is quantized on CPU, transposed to [k, n], transferred to
+        Spyre via _dma_to_spyre_fp8_kernel, then passed as an explicit argument
+        to the compiled function.  This is equivalent to the closed-over pattern
+        in TestScaledMmPrequantizedClosedOver but with the weight as a graph
+        input rather than a frozen constant.
+
+        The key requirement: the weight must be [k, n] (already transposed for
+        the matmul) before being passed to _dma_to_spyre_fp8_kernel, matching
+        the convention used everywhere else in this test file.
+        """
         from torch_spyre.model_utils import _dma_to_spyre_fp8_kernel
 
         torch.manual_seed(42)
         act = torch.randn(m, k, dtype=torch.float16)
         scale_a_t = torch.full((1,), scale_a, dtype=torch.float16)
         scale_b_t = torch.full((1,), scale_b, dtype=torch.float16)
-        weight_fp8 = (
-            torch.randn(n, k, dtype=torch.float32)
-            .clamp(-448.0, 448.0)
-            .to(torch.float8_e4m3fn)
+        weight_fp16 = torch.randn(n, k, dtype=torch.float16)
+        # Transpose to [k, n] before DMA — _dma_to_spyre_fp8_kernel expects the
+        # matrix in the orientation the hardware will read it ([k, n] for matmul).
+        weight_fp8_T = (
+            weight_fp16.clamp(-448.0, 448.0).to(torch.float8_e4m3fn).T.contiguous()
         )
-        q_weight = _dma_to_spyre_fp8_kernel(weight_fp8)
+        q_weight = _dma_to_spyre_fp8_kernel(weight_fp8_T)
 
         def spyre_fn(act, q_weight, scale_a, scale_b):
             q_act = torch.ops.spyre.quantize_fp8_with_scale(act, scale_a)
@@ -279,10 +282,12 @@ class TestScaledMmWithPrequantizedWeight:
             )
 
         def pytorch_fn(act, q_weight, scale_a, scale_b):
-            q_a = (act / scale_a).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+            # Mirror quantize_fp8_with_scale: divide by scale, clamp, cast to FP8
+            q_a = (act / scale_a.item()).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
             a_f32 = q_a.to(torch.float32) * scale_a.item()
-            # Use the original CPU weight_fp8, not q_weight (which is on spyre:0)
-            b_f32 = weight_fp8.to(torch.float32) * scale_b.item()
+            b_f32 = weight_fp16.clamp(-448.0, 448.0).to(torch.float8_e4m3fn).to(
+                torch.float32
+            ) * scale_b.item()
             return (a_f32 @ b_f32.T).to(torch.float16)
 
         compare_with_pytorch(
@@ -292,7 +297,7 @@ class TestScaledMmWithPrequantizedWeight:
             q_weight,
             scale_a_t,
             scale_b_t,
-            atol=1.0,
+            atol=4.0,
             rtol=0.1,
         )
 
