@@ -918,7 +918,6 @@ class SpyreKernel(Kernel[CSEVariable]):
                     and arg.device_dtype
                     in [DataFormats.SEN143_FP8, DataFormats.SEN152_FP8]
                 )
-                or (op == RESTICKIFY_OP and arg.device_dtype == DataFormats.SEN143_FP8)
             ):
                 raise Unsupported(f"{op} on {arg.device_dtype}")
 
