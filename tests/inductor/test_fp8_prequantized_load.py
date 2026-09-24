@@ -285,9 +285,12 @@ class TestScaledMmWithPrequantizedWeight:
             # Mirror quantize_fp8_with_scale: divide by scale, clamp, cast to FP8
             q_a = (act / scale_a.item()).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
             a_f32 = q_a.to(torch.float32) * scale_a.item()
-            b_f32 = weight_fp16.clamp(-448.0, 448.0).to(torch.float8_e4m3fn).to(
-                torch.float32
-            ) * scale_b.item()
+            b_f32 = (
+                weight_fp16.clamp(-448.0, 448.0)
+                .to(torch.float8_e4m3fn)
+                .to(torch.float32)
+                * scale_b.item()
+            )
             return (a_f32 @ b_f32.T).to(torch.float16)
 
         compare_with_pytorch(
