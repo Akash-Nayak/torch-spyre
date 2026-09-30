@@ -14,6 +14,7 @@
 
 """The v2 write path: one writer class per table pair, all sharing `RunWriter`."""
 
+import math
 import sys
 
 from . import schema
@@ -171,9 +172,11 @@ class TestResultWriter(RunWriter):
         if not cases:
             return 0
         ident_rows, run_rows = {}, []
-        skipped = 0
+        skipped = ignored = 0
         for c in cases:
-            tags = CaseId.tags_for(c)
+            tags, run_tags, results = CaseId.split_tags(CaseId.tags_for(c))
+            measured, recorded, unrouted = cls._recorded(c)
+            ignored += unrouted
             classname, name = c.get("classname", ""), c.get("name", "")
             tcid = CaseId.derive(component, classname, name, tags)
             if not tcid:
@@ -201,15 +204,45 @@ class TestResultWriter(RunWriter):
                 # carries the original executor's), the filter for "how much did we
                 # execute"; source_file is the shard discriminator the dedup reads.
                 "props": {
+                    **results,
+                    **recorded,
                     "ran_in": run_id,
                     **({"source_file": source_file} if source_file else {}),
                     **({"run_attempt": str(attempt)} if attempt else {}),
                 },
+                "tags": run_tags,
+                "measurements": measured,
             }
             run_rows.append(run_row)
         written = cls._flush(client, db, ident_rows, run_rows)
         cls._warn(skipped, "case(s) skipped -- identity not derivable")
+        cls._warn(ignored, "property value(s) ignored -- not tag, metric.* or result.*")
         return written
+
+    @staticmethod
+    def _recorded(case: dict) -> tuple:
+        """(measurements, result props, count ignored) from the case's JUnit properties.
+
+        `metric.<name>` must be a finite number and lands in measurements under `<name>`;
+        `result.<name>` lands in props verbatim. Tag properties are read by CaseId.tags_for.
+        """
+        measured, recorded, ignored = {}, {}, 0
+        for pname, pvalue in case.get("properties", []) or []:
+            if pname == "tag" or "__" in pname:
+                continue
+            if pname.startswith("metric.") and len(pname) > len("metric."):
+                try:
+                    v = float(pvalue)
+                except (TypeError, ValueError):
+                    v = math.nan
+                if math.isfinite(v):
+                    measured[pname[len("metric.") :]] = v
+                    continue
+            elif pname.startswith("result."):
+                recorded[pname] = str(pvalue)
+                continue
+            ignored += 1
+        return measured, recorded, ignored
 
 
 class BenchmarkWriter(RunWriter):
@@ -550,7 +583,7 @@ class ArtifactWriter:
                 ),
             }
             cls.artifact_table.insert(client, [row], db=db)
-        method, ref_kind = cls.REF_SHAPE[identity.kind]
+        method, ref_kind = cls.ref_shape(identity.kind)
         if identity.ref:
             # ReplacingMergeTree on (artifact_id, method, ref): a repeat insert collapses.
             ref_row: schema.ArtifactRefRow = {
@@ -564,20 +597,45 @@ class ArtifactWriter:
             }
             cls.ref_table.insert(client, [ref_row], db=db)
         for tag, family, tag_props in tags:
-            if not tag or cls.tag_recorded(client, db, tag, aid):
-                continue
-            tag_row: schema.ArtifactTagRow = {
-                "tag": tag,
-                "tag_family": family,
-                "artifact_id": aid,
-                "refs": [(method, ref_kind, cls._index_uri(identity.ref), identity.ref)]
-                if identity.ref
-                else [],
-                "published_refs": [],
-                "props": cls._props({"id12": identity.id12, **(tag_props or {})}),
-            }
-            cls.tag_table.insert(client, [tag_row], db=db)
+            cls.insert_tag(client, db, identity, tag, family, props=tag_props)
         return aid
+
+    @classmethod
+    def ref_shape(cls, kind: str) -> tuple:
+        """(method, ref_kind) for an artifact kind; an unknown kind is a plain download."""
+        return cls.REF_SHAPE.get(kind, cls.REF_SHAPE["generic"])
+
+    @classmethod
+    def insert_tag(
+        cls,
+        client,
+        db: str,
+        identity: ArtifactIdentity,
+        tag: str,
+        family: str,
+        *,
+        ref: str | None = None,
+        props=None,
+    ) -> bool:
+        """Point `tag` at `identity`, once. `ref` is the address the tag names, which may be a
+        moving one (`:amd64`) rather than the artifact's own; it defaults to the latter."""
+        aid = identity.artifact_id
+        if not (tag and aid):
+            return False
+        if cls.tag_recorded(client, db, tag, aid):
+            return True
+        ref = identity.ref if ref is None else ref
+        method, ref_kind = cls.ref_shape(identity.kind)
+        tag_row: schema.ArtifactTagRow = {
+            "tag": tag,
+            "tag_family": family,
+            "artifact_id": aid,
+            "refs": [(method, ref_kind, cls._index_uri(ref), ref)] if ref else [],
+            "published_refs": [],
+            "props": cls._props({"id12": identity.id12, **(props or {})}),
+        }
+        cls.tag_table.insert(client, [tag_row], db=db)
+        return True
 
     @classmethod
     def insert_result(
