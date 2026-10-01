@@ -1744,7 +1744,13 @@ def _multi_arg_pointwise_layouts(
             )
             c_in_size = [concretize_expr(s) for s in arg.layout.size]
             c_in_stride = [concretize_expr(s) for s in arg.layout.stride]
-            if len(c_in_size) < len(dim_order) and dim_order[-1] == -1:
+            # When the projected order carries the sparse-stick marker (-1 last)
+            # but c_in_size only covers the real dims, append a dummy entry so
+            # SpyreTensorLayout receives parallel size/stride/order lists.
+            # This happens whenever dim_order itself ends with -1 (rank_diff >= 0
+            # and rank_diff == -1 cases) OR when the projection re-introduces the
+            # marker for rank_diff < -1 inputs (where input_rank > output_rank+1).
+            if projected_dim_order and projected_dim_order[-1] == -1 and len(c_in_size) < len(projected_dim_order):
                 c_in_size.append(0)
                 c_in_stride.append(0)
             assert len(c_in_size) == len(projected_dim_order)
