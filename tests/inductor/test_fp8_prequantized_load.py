@@ -411,8 +411,8 @@ class TestTransferModuleFp8Buffer:
     ``_dma_to_spyre_default``, which attempted ``float8_e4m3fn → bfloat16``
     and crashed in DCI.
 
-    The fix (commit 1bde9a81) removes the ``is_linear`` guard from the buffer
-    branch and detects the FP8 weight purely by
+    The fix removes the ``is_linear`` guard from the buffer branch and detects
+    the FP8 weight purely by
     ``name == "weight" and buf.ndim == 2 and buf.dtype == float8_e4m3fn``.
 
     This test class verifies:

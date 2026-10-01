@@ -1750,7 +1750,11 @@ def _multi_arg_pointwise_layouts(
             # This happens whenever dim_order itself ends with -1 (rank_diff >= 0
             # and rank_diff == -1 cases) OR when the projection re-introduces the
             # marker for rank_diff < -1 inputs (where input_rank > output_rank+1).
-            if projected_dim_order and projected_dim_order[-1] == -1 and len(c_in_size) < len(projected_dim_order):
+            if (
+                projected_dim_order
+                and projected_dim_order[-1] == -1
+                and len(c_in_size) < len(projected_dim_order)
+            ):
                 c_in_size.append(0)
                 c_in_stride.append(0)
             assert len(c_in_size) == len(projected_dim_order)
