@@ -991,11 +991,11 @@ def test_reshape_split_untracked_dim_tolerated():
 def test_reshape_1d_to_2d_exp():
     """1-D tensor [4096] annotated ['A'] -> reshape(64,64) assigns _untracked_ dims.
 
-    Prior to commit 1bde9a81 this raised ``Unsupported("reshape split a named
-    dim")``.  The fix extends the _untracked_ fallback to *all* reshape-split
-    dims (not just those already _untracked_): the compiler uses shape-based
-    heuristics for work partitioning, so losing the symbolic name degrades hint
-    quality but does not affect correctness.
+    Previously this raised ``Unsupported("reshape split a named dim")``.  The
+    fix extends the _untracked_ fallback to *all* reshape-split dims (not just
+    those already _untracked_): the compiler uses shape-based heuristics for
+    work partitioning, so losing the symbolic name degrades hint quality but
+    does not affect correctness.
 
     After the reshape both output dims are 64, so each loop var is assigned
     ``_untracked_64``.  Compilation must succeed and the exp op's propagated
@@ -1013,9 +1013,9 @@ def test_reshape_1d_to_2d_exp():
         named_dims={"A": _A},
         tensor_dims={x: ["A"]},
     )
-    assert all(
-        n.startswith("_untracked_") for n in result.propagated_dims
-    ), f"expected all _untracked_ dims after reshape-split, got: {result.propagated_dims}"
+    assert all(n.startswith("_untracked_") for n in result.propagated_dims), (
+        f"expected all _untracked_ dims after reshape-split, got: {result.propagated_dims}"
+    )
 
 
 def test_constant_indexed_dim_is_consumed_without_mapping():

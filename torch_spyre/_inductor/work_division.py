@@ -36,8 +36,7 @@ from torch._inductor.ir import (
     Reduction,
 )
 
-from torch_spyre._C import ElementArrangement
-
+from torch_spyre._C import DataFormats, ElementArrangement
 from . import config
 from .constants import BATCH_MATMUL_FP8_OP, BATCH_MATMUL_OP, DEVICE_NAME
 from .errors import Unsupported
@@ -1448,7 +1447,8 @@ def _minmax(sympy_fn, builtin_fn, args, kwargs):
     Accepts both the variadic (``max(a, b)``) and single-iterable
     (``max([a, b])``) forms. Dispatches to ``sympy_fn`` when any value is a
     sympy expression and no ``key`` is given (``sympy.Max`` has no ``key``);
-    otherwise defers to ``builtin_fn``, which also handles ``default``."""
+    otherwise defers to ``builtin_fn``, which also handles ``default``.
+    """
     if len(args) == 1:
         values = args[0]
     else:
@@ -1517,6 +1517,8 @@ _PEAK_MACS_US_CORE = (98.304e12 / 2 / 32) / 1e6  # DL16 peak / 32 cores, MACs/us
 _HBM_BW_GBS = 204.8  # LPDDR5 aggregate peak bandwidth
 _DTYPE_BYTES = 2  # fp16
 _STICK_BYTES = 128  # fixed HW stick size in bytes for every DataFormats
+# FP8 dtypes that carry 128 elements/stick; used in _cost_model_matmul_planner.
+_FP8_DTYPES = (DataFormats.SEN143_FP8, DataFormats.SEN152_FP8)
 _PSUM_PER_CORE_ELEM_US = 1.0e-3
 _BMM_PSUM_PER_CORE_ELEM_US = 1.0e-4
 _COHORT_LIMIT = 8  # cores sharing a broadcast before it contends for bandwidth
@@ -1866,14 +1868,12 @@ def _cost_model_matmul_planner(
     # time.  Fall back to any FP8 input td (SEN143/SEN152), then to the output
     # td — the stick count is the same (128) for all E4M3 dtypes.
     if op.data.reduction_type == BATCH_MATMUL_FP8_OP:
-        from torch_spyre._C import DataFormats as _DataFormats
-
-        _FP8_DTYPES = (_DataFormats.SEN143_FP8, _DataFormats.SEN152_FP8)
         fp8_weight_td = next(
             (
                 td
                 for td in input_tds
-                if td.layout.device_layout.element_arrangement == ElementArrangement.QFP8WT
+                if td.layout.device_layout.element_arrangement
+                == ElementArrangement.QFP8WT
             ),
             None,
         )
@@ -1894,7 +1894,9 @@ def _cost_model_matmul_planner(
         else:
             # No FP8 td found — use output as last resort (should not happen
             # for a well-formed BATCH_MATMUL_FP8_OP graph).
-            elems_per_stick = output_td.layout.device_layout.device_dtype.elems_per_stick()
+            elems_per_stick = (
+                output_td.layout.device_layout.device_dtype.elems_per_stick()
+            )
     else:
         elems_per_stick = output_td.layout.device_layout.device_dtype.elems_per_stick()
     M_e = concretize_expr(it_space_adjusted[m_dim])
