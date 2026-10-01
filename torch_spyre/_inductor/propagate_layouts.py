@@ -239,10 +239,19 @@ def _project_pointwise_dim_order(
     # buffer. Its extra leading axes are fixed by the loop, while the body
     # operates on the trailing axes. Keep those backing axes in the layout
     # permutation and shift the body's order onto the trailing dimensions.
-    # The trailing -1 is the sparse-stick marker and must be preserved as-is,
-    # not shifted (it is not a dimension index).
+    #
+    # The trailing -1 sparse-stick marker must NOT be counted among the body
+    # dims: it is not a dimension index and including it before the prepend
+    # would produce a list of length (input_rank + 1), breaking the
+    # `assert len(c_in_size) == len(projected_dim_order)` check in
+    # `_is_supported_layout` (triggered by 280-FP8Linear direct-load path).
+    has_marker = dim_order[-1] == -1
+    body = dim_order[:-1] if has_marker else dim_order
     leading = list(range(-rank_diff))
-    return leading + [(d - rank_diff if d != -1 else d) for d in dim_order]
+    result = leading + [(d - rank_diff) for d in body]
+    if has_marker:
+        result.append(-1)
+    return result
 
 
 def _pick_stick_dim(stick_expr, out_coords) -> int:
