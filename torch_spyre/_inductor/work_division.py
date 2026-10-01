@@ -1861,14 +1861,40 @@ def _cost_model_matmul_planner(
     # elements so its byte and MAC counts are physical. BATCH_MATMUL_FP8_OP's
     # output is FP16 (64 elems/stick) while N/K count FP8 sticks (128), so
     # source elems_per_stick from the QFP8WT weight input instead (issue #4466).
+    # With the direct prequantized-weight load path the weight arrives in QFP8WT
+    # from the DMA step; its td may not yet carry QFP8WT arrangement at planning
+    # time.  Fall back to any FP8 input td (SEN143/SEN152), then to the output
+    # td — the stick count is the same (128) for all E4M3 dtypes.
     if op.data.reduction_type == BATCH_MATMUL_FP8_OP:
+        from torch_spyre._C import DataFormats as _DataFormats
+
+        _FP8_DTYPES = (_DataFormats.SEN143_FP8, _DataFormats.SEN152_FP8)
         fp8_weight_td = next(
-            td
-            for td in input_tds
-            if td.layout.device_layout.element_arrangement == ElementArrangement.QFP8WT
+            (
+                td
+                for td in input_tds
+                if td.layout.device_layout.element_arrangement == ElementArrangement.QFP8WT
+            ),
+            None,
         )
-        fp8_device_dtype = fp8_weight_td.layout.device_layout.device_dtype
-        elems_per_stick = fp8_device_dtype.elems_per_stick()
+        if fp8_weight_td is None:
+            # Direct-load path: weight already in QFP8WT before planning; fall
+            # back to any FP8 input td for elems_per_stick (all E4M3 == 128).
+            fp8_weight_td = next(
+                (
+                    td
+                    for td in input_tds
+                    if td.layout.device_layout.device_dtype in _FP8_DTYPES
+                ),
+                None,
+            )
+        if fp8_weight_td is not None:
+            fp8_device_dtype = fp8_weight_td.layout.device_layout.device_dtype
+            elems_per_stick = fp8_device_dtype.elems_per_stick()
+        else:
+            # No FP8 td found — use output as last resort (should not happen
+            # for a well-formed BATCH_MATMUL_FP8_OP graph).
+            elems_per_stick = output_td.layout.device_layout.device_dtype.elems_per_stick()
     else:
         elems_per_stick = output_td.layout.device_layout.device_dtype.elems_per_stick()
     M_e = concretize_expr(it_space_adjusted[m_dim])
