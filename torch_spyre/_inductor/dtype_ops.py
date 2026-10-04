@@ -124,6 +124,7 @@ class DtypeOpTable:
 
     _FP8_TO_FP16_DTYPES = [
         (torch.float8_e4m3fn, torch.float16),
+        (torch.float8_e4m3fn, torch.bfloat16),
     ]
 
     _FP32_TO_INT32_DTYPES = [
