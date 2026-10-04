@@ -447,6 +447,28 @@ def _get_device_dim_order(
                 if window_sym not in dim_order:
                     dim_order.insert(0, window_sym)
 
+    # For matmul operands, ensure all non-stick and stick dimensions that appear in coordinates are in dim_order.
+    # When tensor_position is 0 (INPUT / activation), the contraction stick coordinate (e.g. Mod(c3, 128))
+    # maps to "in". Even if its outer part floor(c3/128) evaluated to 0, "in" is the stick_dim.
+    # Backend scheduler (L3DlOpsScheduler::getMinParamBmm) requires layoutDimOrder_
+    # to contain contraction ('in') and generated ('out') dims for reuse calculation.
+    if (
+        op_spec is not None
+        and _is_matmul(op_spec.op)
+        and stick_dim is not None
+        and stick_dim not in dim_order
+    ):
+        dim_order.append(stick_dim)
+
+    logger.warning(
+        "_get_device_dim_order: op=%s, pos=%s, stick_dim=%s, dim_order=%s, coords=%s",
+        op_spec.op if op_spec else None,
+        tensor_position,
+        stick_dim,
+        dim_order,
+        [str(c) for c in arg.device_coordinates],
+    )
+
     return dim_order, stick_dim
 
 
@@ -456,6 +478,7 @@ def _get_layout_label(
     stick_dim_order: list,
     stick_size: list,
     layout_labels: list[str],
+    preferred_label: str | None = None,
 ) -> str:
     for label, layout in layouts.items():
         if (
@@ -464,7 +487,10 @@ def _get_layout_label(
             and layout["stick_size"] == stick_size
         ):
             return label
-    label = layout_labels[len(layouts)]
+    if preferred_label is not None and preferred_label not in layouts:
+        label = preferred_label
+    else:
+        label = layout_labels[len(layouts)]
     layouts[label] = {
         "dim_order": dim_order,
         "stick_dim_order": stick_dim_order,
@@ -636,6 +662,72 @@ def _ordered_arg_symbols(arg, exclude: tuple = ()) -> list[Symbol]:
                 ordered.append(sym)
     return ordered
 
+
+def _match_matmul_labels_by_structure(op_spec: "OpSpec") -> dict | None:
+    """Map matmul iteration symbols to SDSC labels based on tensor roles.
+
+    For a matmul (batchmatmul / batchmatmulfp8):
+    - Reduction/Contraction symbol (K) appears in input0 and input1, absent from output -> 'in'
+    - Generated/Column symbol (N) appears in input1 and output, absent from input0 -> 'out'
+    - Row symbol (M) appears in input0 and output, absent from input1 -> 'mb'
+    - Remaining shared batch symbols -> 'y', 'x'
+    """
+    inputs = [a for a in op_spec.args if a.is_input]
+    outputs = [a for a in op_spec.args if not a.is_input]
+    if len(inputs) < 2 or len(outputs) < 1:
+        return None
+
+    x_arg, y_arg = inputs[0], inputs[1]
+    out_arg = outputs[0]
+
+    out_syms = set()
+    for arg in outputs:
+        for c in arg.device_coordinates:
+            out_syms.update(c.free_symbols)
+
+    x_syms = set()
+    for c in x_arg.device_coordinates:
+        x_syms.update(c.free_symbols)
+
+    y_syms = set()
+    for c in y_arg.device_coordinates:
+        y_syms.update(c.free_symbols)
+
+    logger.warning(
+        "_match_matmul_labels_by_structure: op=%s, x_syms=%s, y_syms=%s, out_syms=%s, iter_space=%s, x_coords=%s, y_coords=%s, out_coords=%s",
+        op_spec.op,
+        x_syms,
+        y_syms,
+        out_syms,
+        list(op_spec.iteration_space.keys()),
+        [str(c) for c in x_arg.device_coordinates],
+        [str(c) for c in y_arg.device_coordinates],
+        [str(c) for c in out_arg.device_coordinates],
+    )
+
+    k_candidates = (x_syms & y_syms) - out_syms
+    n_candidates = (y_syms & out_syms) - x_syms
+    m_candidates = (x_syms & out_syms) - y_syms
+
+    mapping = {}
+    if k_candidates:
+        mapping[min(k_candidates, key=str)] = Symbol("in")
+    if n_candidates:
+        mapping[min(n_candidates, key=str)] = Symbol("out")
+    if m_candidates:
+        mapping[min(m_candidates, key=str)] = Symbol("mb")
+
+    batch_syms = [s for s in op_spec.iteration_space if s not in mapping]
+    batch_labels = ["y", "x", "ki", "kj"]
+    for i, s in enumerate(batch_syms):
+        mapping[s] = Symbol(batch_labels[i] if i < len(batch_labels) else f"b{i}")
+
+    logger.warning(
+        "_match_matmul_labels_by_structure: resolved mapping=%s",
+        mapping,
+    )
+
+    return mapping
 
 def _match_labels_by_structure(op_spec: "OpSpec") -> dict | None:
     """Map each conv2d iteration symbol to its SDSC dim label, structurally.
@@ -1590,12 +1682,14 @@ def _create_sdsc_tensors(
                 logger,
             )
         else:
+            preferred_lbl = layout_labels[i] if (is_matmul or _is_conv(op_spec.op)) and i < len(layout_labels) else None
             label = _get_layout_label(
                 layouts,
                 dim_order,
                 effective_stick,
                 layout_stick_size,
                 layout_labels,
+                preferred_label=preferred_lbl,
             )
 
         # Index tensors carry 32-bit integer indices; re-label as SENUINT32 since
@@ -1753,30 +1847,31 @@ def _extend_matmul_k_to_padded(
     layout-position agnostic: it works regardless of how MATMUL_DIM_LABELS maps the
     iteration symbols for this particular ndim.
     """
-    # y is always args[1]; output is always args[-1] for matmul.
-    y_arg = op_spec.args[1]
-    out_arg = op_spec.args[-1]
-
-    # Collect non-stick symbols in y's device_coordinates (after symbol_mapping).
-    y_dim_order, y_stick_dim = _get_device_dim_order(y_arg, symbol_mapping)
-    # y_stick_dim is the within-stick symbol; the remaining dims include K.
-    y_non_stick_syms: set = set(y_dim_order) - ({y_stick_dim} if y_stick_dim else set())
-
-    # Collect all symbols in the output's device_coordinates.
-    out_dim_order, _ = _get_device_dim_order(out_arg, symbol_mapping)
-    out_syms: set = set(out_dim_order)
-
-    # K is in y but not in the output (it's reduced).
-    k_candidates = y_non_stick_syms - out_syms
-    if not k_candidates:
-        logger.warning(
-            "_extend_matmul_k_to_padded: could not identify K symbol "
-            "(y_non_stick=%s, out_syms=%s), skipping",
-            y_non_stick_syms,
-            out_syms,
+    # Directly look up the reduction dimension Symbol("in") in symbol_mapping
+    k_sym = Symbol("in")
+    if k_sym not in sdsc_iteration_space:
+        # Fallback to candidate deduction if "in" is not present
+        y_arg = op_spec.args[1]
+        out_arg = op_spec.args[-1]
+        y_dim_order, y_stick_dim = _get_device_dim_order(
+            y_arg, symbol_mapping, op_spec=op_spec, tensor_position=1
         )
-        return
-    k_sym = min(k_candidates, key=str)
+        y_non_stick_syms: set = set(y_dim_order) - ({y_stick_dim} if y_stick_dim else set())
+        out_dim_order, _ = _get_device_dim_order(
+            out_arg, symbol_mapping, op_spec=op_spec, tensor_position=len(op_spec.args) - 1
+        )
+        out_syms: set = set(out_dim_order)
+        k_candidates = y_non_stick_syms - out_syms
+        if not k_candidates:
+            logger.warning(
+                "_extend_matmul_k_to_padded: could not identify K symbol "
+                "(y_non_stick=%s, out_syms=%s), skipping",
+                y_non_stick_syms,
+                out_syms,
+            )
+            return
+        k_sym = min(k_candidates, key=str)
+    y_arg = op_spec.args[1]
 
     if k_sym not in sdsc_iteration_space:
         logger.warning(
@@ -1816,8 +1911,12 @@ def _matmul_reuse_dims(
     """
     y_arg = op_spec.args[1]
     out_arg = op_spec.args[-1]
-    y_dim_order, y_stick = _get_device_dim_order(y_arg, symbol_mapping)
-    out_dim_order, out_stick = _get_device_dim_order(out_arg, symbol_mapping)
+    y_dim_order, y_stick = _get_device_dim_order(
+        y_arg, symbol_mapping, op_spec=op_spec, tensor_position=1
+    )
+    out_dim_order, out_stick = _get_device_dim_order(
+        out_arg, symbol_mapping, op_spec=op_spec, tensor_position=len(op_spec.args) - 1
+    )
     if y_stick is None:
         return []
     if y_stick in set(x_dim_order):
@@ -1966,22 +2065,12 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
 
     symbol_mapping = None
     if op_spec.op == CONV2D_FWD_OP:
-        # Forward conv2d (#3284) is a Reduction whose iteration space appends its
-        # reduction axes (in/ki/kj) in data-dependent read-dep access order, so
-        # the contraction dim and the kernel taps cannot be told apart
-        # positionally.  Recover each dim's role from what the args' access
-        # expressions already carry -- set membership and co-occurrence
-        # (_match_labels_by_structure) -- rather than from a size snapshot.  This
-        # needs no live IR ranges, drops squeezed size-1 dims for free, and has
-        # no C_in-vs-tap size-collision constraint.  Falls back to the positional
-        # mapping below only if the arg structure is unexpected.
         dim_labels = [label for _role, label in _CONV_ROLE_LABELS][-ndim:]
         symbol_mapping = _match_labels_by_structure(op_spec)
+    elif is_matmul:
+        symbol_mapping = _match_matmul_labels_by_structure(op_spec)
+        dim_labels = _get_op_dim_labels(ndim, is_matmul, is_conv2d)
     elif is_pool:
-        # Pool survival is read from the node's live output ranges (NCHW); the
-        # lowering supplies no size snapshot.  Positional mapping (below) is
-        # correct because pool is a single-input reduction with a fixed
-        # iteration-space order.
         dim_labels = _align_pool_dim_labels(op_spec.node_output_ranges, ndim)
     else:
         dim_labels = _get_op_dim_labels(ndim, is_matmul, is_conv2d)
@@ -2068,7 +2157,9 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     )
 
     ref_arg = _ref_arg(op_spec)
-    op_dim_order, op_stick_dim = _get_device_dim_order(ref_arg, symbol_mapping)
+    op_dim_order, op_stick_dim = _get_device_dim_order(
+        ref_arg, symbol_mapping, op_spec=op_spec
+    )
 
     # On-device type-conversion ops (DL16TOFP32/FP32TODL16, not identity)
     # require at least one outer spatial dim beyond the stick; inject a

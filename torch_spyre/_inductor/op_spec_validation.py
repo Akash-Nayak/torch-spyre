@@ -40,6 +40,7 @@ import textwrap
 import regex
 from typing import NoReturn
 import sympy
+from torch_spyre._C import ElementArrangement
 
 from . import config, constants
 from .core_mapping import owner_slots, transfer_edges
@@ -831,6 +832,12 @@ def _check_stick_matmul(op_spec: OpSpec, stage: str) -> None:
 
     a_syms = _arg_free_syms(inputs[0])
     b_syms = _arg_free_syms(inputs[1])
+
+    # If input2 is in a non-STANDARD element arrangement (such as QFP8WT or QFP8CH),
+    # the hardware kernel consumes its elements according to its specialized element arrangement
+    # where reduction and generated axes are packed into the stick. Skip the strict 1D stick check.
+    if inputs[1].element_arrangement != ElementArrangement.STANDARD:
+        return
 
     gen_from_b = (b_syms & out_syms) - a_syms
 

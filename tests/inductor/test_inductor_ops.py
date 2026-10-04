@@ -6595,6 +6595,32 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
         },
         (
+            "test_fp8_scaled_mm_3d_batched",
+            "test_fp8_scaled_mm_3d_batched_cpu",
+        ): {
+            # Regression for spyre.scaled_mm register_fake returning wrong 2D shape
+            # for 3D×3D inputs.  The FP8 KV cache calls scaled_mm directly with
+            # [B*H, S, D] × [B*H, D, L] → [B*H, S, L] without a 2D reshape, so
+            # the fake must return rank-3.  Previously returned [B*H, L] (missing S).
+            # Shapes: (batch_heads, seq_len, head_dim, cache_len)
+            # All dims must be multiples of the FP8 stick size (128 elements).
+            # xfail: ReStickifyOpHBM on DataFormats.SEN143_FP8 is not yet supported
+            # — the .contiguous() on the transposed FP8 K tensor triggers a FP8
+            # restickify that the compiler cannot lower.  Tracked as a known gap for
+            # the FP8 KV cache; this test documents the register_fake fix and the
+            # remaining compiler work needed.
+            "param_sets": {
+                "bh8_s8_d128_l128": (8, 8, 128, 128),
+                "bh4_s1_d128_l256": (4, 1, 128, 256),
+                "bh16_s4_d128_l128": (16, 4, 128, 128),
+            },
+            "expect_fail": [
+                "bh8_s8_d128_l128",
+                "bh4_s1_d128_l256",
+                "bh16_s4_d128_l128",
+            ],
+        },
+        (
             "test_multiops_split",
             "test_view_permute_mul",
         ): {
@@ -9999,6 +10025,81 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return out.reshape(a_3d.shape[0], a_3d.shape[1], n)
 
         compare_with_pytorch(spyre_fn, pytorch_fn, a_3d, w, sa, sw, atol=2.0, rtol=0.2)
+
+    def test_fp8_scaled_mm_3d_batched_cpu(self, bh, s, d, l):
+        """Regression test for spyre.scaled_mm register_fake 3D×3D output shape.
+
+        The FP8 KV cache uses spyre.scaled_mm with 3D inputs directly:
+          [B*H, S, D] × [B*H, D, L] → [B*H, S, L]
+        without the 2D reshape that every existing caller performs.  The
+        register_fake previously returned shape [B*H, L] (2D, missing S),
+        which would cause the subsequent .reshape(B, H, S, L) to fail during
+        torch.compile tracing.
+
+        This test compiles spyre.scaled_mm with 3D×3D inputs and checks:
+          1. The output shape is correct: [B*H, S, L].
+          2. The numerical result matches a plain float16 matmul reference.
+
+        Mirrors fp8_attn_core: Q is [B*H, S, D], K^T is [B*H, D, L] (already
+        transposed), scales are applied as pointwise multiplies after scaled_mm.
+        """
+        FP8_MAX = 448.0
+        SCALE_EPS = 1e-4
+
+        # Q: [B*H, S, D],  K^T: [B*H, D, L]  (cache already stores K transposed)
+        q = cached_randn(
+            (bh, s, d),
+            dtype=torch.float16,
+            differentiation=("q3d", bh, s, d, l),
+            scale=0.1,
+        )
+        k = cached_randn(
+            (bh, l, d),
+            dtype=torch.float16,
+            differentiation=("k3d", bh, s, d, l),
+            scale=0.1,
+        )
+
+        def spyre_fn(q, k):
+            # Per-token Q scale: [B*H, S, 1]
+            q_scale = (q.abs().amax(dim=-1, keepdim=True) * (1.0 / FP8_MAX)).clamp(
+                min=SCALE_EPS
+            )
+            # Per-token K scale: [B*H, L, 1]
+            k_scale = (k.abs().amax(dim=-1, keepdim=True) * (1.0 / FP8_MAX)).clamp(
+                min=SCALE_EPS
+            )
+            q_fp8 = torch.ops.spyre.quantize_fp8_with_scale(
+                q.reshape(bh * s, d), q_scale.reshape(bh * s, 1)
+            ).reshape(bh, s, d)
+            k_fp8 = torch.ops.spyre.quantize_fp8_with_scale(
+                k.reshape(bh * l, d), k_scale.reshape(bh * l, 1)
+            ).reshape(bh, l, d)
+            # scaled_mm: [B*H, S, D] × [B*H, D, L] → [B*H, S, L]
+            kt_fp8 = k_fp8.transpose(1, 2).contiguous()
+            out = torch.ops.spyre.scaled_mm(q_fp8, kt_fp8, out_dtype=torch.float16)
+            # scale compensation: q_scale [B*H, S, 1] × k_scale^T [B*H, 1, L]
+            return out * q_scale * k_scale.transpose(1, 2)
+
+        def pytorch_fn(q, k):
+            q_scale = (q.abs().amax(dim=-1, keepdim=True) * (1.0 / FP8_MAX)).clamp(
+                min=SCALE_EPS
+            )
+            k_scale = (k.abs().amax(dim=-1, keepdim=True) * (1.0 / FP8_MAX)).clamp(
+                min=SCALE_EPS
+            )
+            q_dq = (
+                (q / q_scale).clamp(-FP8_MAX, FP8_MAX)
+                .to(torch.float8_e4m3fn).to(torch.float16)
+            )
+            k_dq = (
+                (k / k_scale).clamp(-FP8_MAX, FP8_MAX)
+                .to(torch.float8_e4m3fn).to(torch.float16)
+            )
+            # bmm: [B*H, S, D] × [B*H, D, L] → [B*H, S, L]
+            return torch.bmm(q_dq, k_dq.transpose(1, 2)) * q_scale * k_scale.transpose(1, 2)
+
+        compare_with_pytorch(spyre_fn, pytorch_fn, q, k, atol=2.0, rtol=0.2)
 
     def test_is_nonzero_cpu(self, *args):
         """Test torch.is_nonzero on Spyre tensors"""

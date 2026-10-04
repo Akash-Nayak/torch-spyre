@@ -1033,7 +1033,13 @@ def scaled_mm(
 def _(
     mat1: torch.Tensor, mat2: torch.Tensor, out_dtype: torch.dtype = None
 ) -> torch.Tensor:
-    output_shape = [mat1.shape[0], mat2.shape[-1]]
+    # 2D: [M, K] × [K, N] → [M, N]
+    # 3D×2D: [B, M, K] × [K, N] → [B, M, N]
+    # 3D×3D: [B, M, K] × [B, K, N] → [B, M, N]
+    if mat1.dim() == 2:
+        output_shape = [mat1.shape[0], mat2.shape[-1]]
+    else:
+        output_shape = [mat1.shape[0], mat1.shape[1], mat2.shape[-1]]
     return mat1.new_empty(output_shape, dtype=out_dtype or torch.float16)
 
 

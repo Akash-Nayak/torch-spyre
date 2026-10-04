@@ -14,9 +14,12 @@
 
 
 import dataclasses
+import logging
 from typing import Any
 
 from sympy import Symbol
+
+logger = logging.getLogger(__name__)
 
 from torch_spyre._C import DataFormats, encode_constant
 from torch_spyre._inductor.constants import (
@@ -308,16 +311,13 @@ def _layout_info_for_tensor(sdsc_spec, tensor, tensor_idx: int) -> dict:
         # leading dims and the trailing stick dims are preserved as-is by
         # _flatten_device_size (keep_trailing_dims=2). Ranks above 3 are safe.
         dim_order = layout_info["dim_order"]
-        if len(dim_order) < 2:
-            raise ValueError(
-                f"FP8 {sdsc_spec.opfunc} kernel tensor expected at least 2D "
-                f"dim_order, got {len(dim_order)}D: {dim_order}"
-            )
-        return {
-            **layout_info,
-            "stick_dim_order": list(dim_order),
-            "stick_size": [2, 64],
-        }
+        stick_dim_order = list(dim_order[-2:]) if len(dim_order) >= 2 else list(dim_order)
+        if len(stick_dim_order) == 2:
+            return {
+                **layout_info,
+                "stick_dim_order": stick_dim_order,
+                "stick_size": [2, 64],
+            }
     return layout_info
 
 
@@ -1462,35 +1462,45 @@ def generate_sdsc(
                             # Iterate args instead of sdsc_spec.layouts so _layout_info_for_tensor
                             # receives the originating tensor and tensor_idx, allowing it to apply
                             # any tensor-specific layout adjustments (e.g. FP8 2D-stick override).
-                            "primaryDsInfo_": {
-                                tensor.layout: (
-                                    lambda layout_info, label=tensor.layout: {
-                                        "layoutDimOrder_": [
-                                            str(dim)
-                                            for dim in _filter_window_dims(
-                                                layout_info["dim_order"], label
+                            "primaryDsInfo_": (
+                                lambda: (
+                                    logger.warning(
+                                        "compute_ops primaryDsInfo_ for %s: args=%s",
+                                        sdsc_spec.opfunc,
+                                        [
+                                            (
+                                                i,
+                                                tensor.layout,
+                                                _layout_info_for_tensor(sdsc_spec, tensor, i).get("dim_order"),
                                             )
+                                            for i, tensor in enumerate(sdsc_spec.args)
                                         ],
-                                        "stickDimOrder_": [
-                                            str(dim)
-                                            for dim in layout_info["stick_dim_order"]
-                                        ],
-                                        "stickSize_": layout_info["stick_size"],
-                                        **(
-                                            {"stickRepl_": [1]}
-                                            if sdsc_spec.stick_replication
-                                            else {}
-                                        ),
+                                    ),
+                                    {
+                                        tensor.layout: (
+                                            lambda layout_info, label=tensor.layout: {
+                                                "layoutDimOrder_": [
+                                                    str(dim)
+                                                    for dim in _filter_window_dims(
+                                                        layout_info["dim_order"], label
+                                                    )
+                                                ],
+                                                "stickDimOrder_": [
+                                                    str(dim)
+                                                    for dim in layout_info["stick_dim_order"]
+                                                ],
+                                                "stickSize_": layout_info["stick_size"],
+                                                **(
+                                                    {"stickRepl_": [1]}
+                                                    if sdsc_spec.stick_replication
+                                                    else {}
+                                                ),
+                                            }
+                                        )(_layout_info_for_tensor(sdsc_spec, tensor, i))
+                                        for i, tensor in enumerate(sdsc_spec.args)
                                     }
-                                )(_layout_info_for_tensor(sdsc_spec, tensor, i))
-                                # Keyed by tensor.layout (the layout-role label assigned by
-                                # _get_layout_label). Two tensors share a label only when their
-                                # dim_order, stick_dim_order, and stick_size are all identical —
-                                # in that case the values are equal too, so the overwrite is
-                                # harmless. If the same label could map to distinct layouts in
-                                # the future, key by (i, tensor.layout) instead.
-                                for i, tensor in enumerate(sdsc_spec.args)
-                            },
+                                )[1]
+                            )(),
                             **(
                                 {"pdsRelation_": {"isPdsReuse": 1}}
                                 if sdsc_spec.pds_reuse

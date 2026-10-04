@@ -452,9 +452,11 @@ def _no_feasible_layout_error(op) -> NotImplementedError:
         host_layout = V.graph.get_buffer(ec.dep.name).get_layout()
         lines.append(f"    {ec.dep.name}:  {_fmt_buf(host_layout, ec.dep)}")
         for j, stl in enumerate(ec._in_layouts):
-            lines.append(
-                f"      STL {j}:  {_fmt_stl(device_coordinates(stl, ec.dep, None), stl)}"
-            )
+            try:
+                coords = device_coordinates(stl, ec.dep, None)
+                lines.append(f"      STL {j}:  {_fmt_stl(coords, stl)}")
+            except Exception as e:
+                lines.append(f"      STL {j}:  <error evaluating coords: {e}> (device_size={stl.device_size}, eps={stl.elems_per_stick()})")
         lines.append("")
 
     lines.append(f"  Output:  {_fmt_buf(out_layout, out_dep)}")
@@ -469,12 +471,19 @@ def _no_feasible_layout_error(op) -> NotImplementedError:
         if blocking_ec is None:
             analysis.append(f"    STL {i}: no blocking input identified")
         else:
-            out_stick = device_coordinates(candidate_stl, out_dep, None)[-1]
+            try:
+                out_stick = device_coordinates(candidate_stl, out_dep, None)[-1]
+            except Exception as e:
+                out_stick = f"<error: {e}>"
             for j, in_stl in enumerate(blocking_ec._in_layouts):
                 if blocking_ec.cost(in_stl, candidate_stl) == INF:
-                    in_stick = device_coordinates(in_stl, blocking_ec.dep, None)[-1]
-                    reason = _stick_incompatibility_reason(in_stick, out_stick)
-                    reason_str = f": {reason}" if reason else ""
+                    try:
+                        in_stick = device_coordinates(in_stl, blocking_ec.dep, None)[-1]
+                        reason = _stick_incompatibility_reason(in_stick, out_stick)
+                        reason_str = f": {reason}" if reason else ""
+                    except Exception as e:
+                        in_stick = f"<error: {e}>"
+                        reason_str = f": in_stick error: {e}"
                     analysis.append(
                         f"    {blocking_ec.dep.name} STL {j} --> Out STL {i}{reason_str}"
                     )
