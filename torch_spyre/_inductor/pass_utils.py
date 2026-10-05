@@ -1865,8 +1865,26 @@ def iter_var_id(stick_expr) -> int:
 
 def iteration_space(n: SchedulerNode) -> dict[sympy.Symbol, sympy.Expr]:
     if isinstance(n.node.data, Pointwise):
-        # The iteration space of a Pointwise is that of its output
-        return next(iter(n.read_writes.writes)).ranges.copy()
+        write_dep = next(iter(n.read_writes.writes))
+        result = write_dep.ranges.copy()
+        # Scatter (indirect-write) Pointwise nodes: the write dep's index
+        # contains an indirect symbol (tmp*/indirect*) because the destination
+        # position is selected at runtime via an index buffer.  The source
+        # iteration dimensions (e.g. the position axis of a 3-D scale cache
+        # scatter) only appear in the read dep ranges, not in the write dep
+        # ranges.  Without them, iteration_space() returns fewer symbols than
+        # snode._sizes has entries, which causes the ranges_from_index_vars
+        # assertion to fire (index_vars=[[c0],[]] vs _sizes with 2 entries).
+        # Fix: for indirect-write Pointwise nodes, append missing read dep
+        # symbols — identical to what the Reduction branch already does.
+        if isinstance(write_dep, MemoryDep) and write_dep.is_indirect():
+            for dep in n.read_writes.reads:
+                if not isinstance(dep, MemoryDep):
+                    continue
+                for sym, size in dep.ranges.items():
+                    if sym not in result:
+                        result[sym] = size
+        return result
     elif isinstance(n.node.data, Reduction):
         # Output dims from the write dep; reduction dims appended from read deps.
         # Inductor shares sympy symbols across all tensor accesses in a Reduction's
@@ -1891,7 +1909,18 @@ def iteration_space_from_op(op: ComputedBuffer) -> dict[sympy.Symbol, sympy.Expr
     of SchedulerNode.read_writes."""
     rw = op_read_writes(op)
     if isinstance(op.data, Pointwise):
-        return next(iter(rw.writes)).ranges.copy()
+        write_dep = next(iter(rw.writes))
+        result = write_dep.ranges.copy()
+        # Mirror the scatter fix from iteration_space(): indirect-write Pointwise
+        # nodes need read dep symbols to fully represent their iteration space.
+        if isinstance(write_dep, MemoryDep) and write_dep.is_indirect():
+            for dep in rw.reads:
+                if not isinstance(dep, MemoryDep):
+                    continue
+                for sym, size in dep.ranges.items():
+                    if sym not in result:
+                        result[sym] = size
+        return result
     elif isinstance(op.data, Reduction):
         # Output dims from write dep; reduction dims appended from read deps.
         # Inductor shares sympy symbols across all tensor accesses in a Reduction's
