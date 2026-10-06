@@ -1324,10 +1324,9 @@ def _create_sdsc_tensors(
         # with a 1D slot_mapping has N_ = {mb:T, out:KV, y:64}, but the
         # KERNEL_IDX device coordinates only carry "mb" (the scatter iteration)
         # while "out" (KV_heads) is a regular loop variable the index broadcasts
-        # over.  The L3DlOpsScheduler requires every HBM-pinned tensor's
-        # layoutDimOrder_ to cover all dims in N_ it is used in; omitting "out"
-        # from the KERNEL_IDX layout causes the crash:
-        #   "Expect valid alloc users." L3DlOpsScheduler.cpp:5305
+        # over.  Every HBM-pinned tensor's layoutDimOrder_ must cover all dims in
+        # N_ where it is referenced; omitting "out" from the KERNEL_IDX layout causes
+        # a dimension mismatch.
         # Adding "out" as a reduced (scale=-1 broadcast) dim to the KERNEL_IDX
         # layout fixes this — the index tensor is broadcast across KV heads.
         if (
@@ -1410,9 +1409,9 @@ def _create_sdsc_tensors(
                 # iteration space by compile_op_spec (e.g. "y":64).  Use it directly
                 # as the stick dim for value/destination tensors.  The first-missing-dim
                 # fallback below would wrongly pick the outer loop variable (e.g. mb=T)
-                # as the stick, causing dbo-opt to treat the token loop as the stick
-                # and padding it up to stick size — which then mismatches the physical
-                # device layout and triggers "Expect valid alloc users" in the scheduler.
+                # as the stick, causing the token loop to be treated as the stick
+                # and padded up to stick size — which then mismatches the physical
+                # device layout and triggers a dimension mismatch.
                 stick_dim = indirect_stick_sym
             else:
                 stick_dim = next((d for d in dims if d not in op_dim_order), None)
