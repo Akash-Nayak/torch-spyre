@@ -1867,17 +1867,16 @@ def iteration_space(n: SchedulerNode) -> dict[sympy.Symbol, sympy.Expr]:
     if isinstance(n.node.data, Pointwise):
         write_dep = next(iter(n.read_writes.writes))
         result = write_dep.ranges.copy()
-        # Scatter (indirect-write) Pointwise nodes: the write dep's index
-        # contains an indirect symbol (tmp*/indirect*) because the destination
-        # position is selected at runtime via an index buffer.  The source
-        # iteration dimensions (e.g. the position axis of a 3-D scale cache
-        # scatter) only appear in the read dep ranges, not in the write dep
-        # ranges.  Without them, iteration_space() returns fewer symbols than
-        # snode._sizes has entries, which causes the ranges_from_index_vars
-        # assertion to fire (index_vars=[[c0],[]] vs _sizes with 2 entries).
-        # Fix: for indirect-write Pointwise nodes, append missing read dep
-        # symbols — identical to what the Reduction branch already does.
-        if isinstance(write_dep, MemoryDep) and write_dep.is_indirect():
+        # Two classes of scatter Pointwise need read-dep symbols appended:
+        #   1. Indirect-write (general scatter via index buffer): write_dep carries
+        #      an indirect symbol, and the source iteration dims (e.g. the position
+        #      axis of a 3D scale-cache scatter) are only in read dep ranges.
+        #      Without them, ranges_from_index_vars asserts (index_vars=[[c0],[]]
+        #      vs _sizes with 2 entries).
+        #   2. Sub-stick indirect scatter: the write dep ranges may be entirely
+        #      empty when the mutation target's last dim is size-1 (constant coord).
+        #      The fallback covers this case even when is_indirect() is False.
+        if (isinstance(write_dep, MemoryDep) and write_dep.is_indirect()) or not result:
             for dep in n.read_writes.reads:
                 if not isinstance(dep, MemoryDep):
                     continue
