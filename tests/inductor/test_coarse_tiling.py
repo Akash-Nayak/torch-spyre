@@ -2166,6 +2166,67 @@ class TestDivideRanges(unittest.TestCase):
         self.assertEqual(list(result.device_size), [32, 256, 8, 1, 64])
         self.assertEqual(list(result.stride_map), [512, 16384, 64, -1, 1])
 
+    def test_divide_ranges_trip_axis_does_not_corrupt_stride(self):
+        """Regression: contracting a trip-axis dim must not pollute running_tile_count.
+
+        Scenario: KV cache with position-first device layout, prefill_kv_len=1536
+        (3 SDPA tiles of 512).  After WhileLoop splicing the identity buffer has
+        layout.size=[3, 512, 1, 8, 128] where dim 0 is the trip axis (size=3).
+        _divide_ranges is called with loop_count=3 and tiled_dims=[0] to contract
+        dim 0 from 3 → 1.
+
+        Before the fix, compute_tile_stride received layout.size=[3,...] as its
+        'size' argument.  Dim 0 (trip axis, size=3, tile=1) was included in
+        running_tile_count, multiplying it by 3.  The n_kv stride 262144 is not
+        divisible by 3, so the subsequent divisibility check raised:
+          Unsupported: stride 262144 at dim 3 is not divisible by
+                       cumulative tile count 3
+
+        The fix passes new_size=[1,...] as 'size' so dim 0 is irregular (size==1)
+        and excluded — running_tile_count stays 1 when dim 0 is processed.
+        """
+        from torch._inductor.ir import ComputedBuffer, FixedLayout, Pointwise
+
+        # Reproduces the exact layout seen in the KV-sweep crash
+        # (max_input_tokens=1088, prefill_kv_len=1536, max_cache_len=2048,
+        #  n_kv=8, head_dim=128, B=1, FP8 key cache — position-first device layout
+        #  pre-tiled into [trip=3, tile=512, sticks=1, n_kv=8, eps=128]).
+        trip_count = 3
+        layout_size   = [3, 512, 1, 8, 128]
+        layout_stride = [65536, 128, 2097152, 262144, 1]
+
+        data = Pointwise(
+            device=torch.device("cpu"),
+            dtype=torch.float16,
+            inner_fn=lambda index: sympy.Integer(0),
+            ranges=list(layout_size),
+        )
+        op = ComputedBuffer(
+            name="kv_trip_axis_regression",
+            layout=FixedLayout(
+                torch.device("cpu"),
+                torch.float16,
+                list(layout_size),
+                list(layout_stride),
+            ),
+            data=data,
+        )
+
+        # Must not raise — before the fix this crashed with:
+        #   Unsupported: stride 262144 at dim 3 is not divisible by
+        #                cumulative tile count 3
+        _divide_ranges(op, sympy.Integer(trip_count), tiled_dims=[0])
+
+        # After contraction: dim 0 becomes 1, all other dims unchanged.
+        self.assertEqual(list(op.layout.size), [1, 512, 1, 8, 128])
+        # Stride for dim 0 (now irregular size==1): must be 0 (excluded by
+        # compute_tile_stride's irregular-dim guard).
+        self.assertEqual(int(op.layout.stride[0]), 0)
+        # Strides for the remaining dims must be unchanged (running_tile_count=1).
+        self.assertEqual(int(op.layout.stride[1]), 128)    # tile dim
+        self.assertEqual(int(op.layout.stride[3]), 262144) # n_kv dim — was failing
+
+
 
 def _mock_op_out_coords(op):
     """Return pre-built coords stored on op by _make_hinted_op, or empty list."""

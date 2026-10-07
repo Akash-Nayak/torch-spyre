@@ -2796,8 +2796,16 @@ def _divide_ranges(
     for i in tiled_dims:
         new_size[i] = ranges[i]
 
-    # Recompute strides for the smaller buffer preserving the order of dimensions
-    layout.stride = compute_tile_stride(layout.size, old_stride, new_size)
+    # Recompute strides for the smaller buffer preserving the order of dimensions.
+    # Pass new_size (not layout.size) as the 'size' argument so that contracted
+    # dimensions (new_size[i] == 1 after dividing by loop_count) are treated as
+    # irregular (size == 1) and excluded from the running_tile_count accumulation
+    # in compute_tile_stride.  Using layout.size (the pre-contraction size, e.g.
+    # trip_count=3) as 'size' caused the trip-axis extent to be multiplied into
+    # running_tile_count, making every subsequent dimension's stride divisibility
+    # check fail when the trip count does not divide those strides (e.g. n_kv
+    # device stride 262144 is not divisible by trip_count=3).
+    layout.stride = compute_tile_stride(new_size, old_stride, new_size)
 
     layout.size = new_size
 
