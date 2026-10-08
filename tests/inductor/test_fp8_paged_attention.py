@@ -667,10 +667,16 @@ class TestFp8PagedAttentionPrefill:
         v_sc_paged = v_scale.reshape(num_kv_blocks, BLOCK_SIZE, NUM_KV_HEADS, 1)
 
         torch.testing.assert_close(
-            k_result.cpu(), _cpu_quantize_dequantize(k_paged, k_sc_paged), atol=2.0, rtol=0.0
+            k_result.cpu(),
+            _cpu_quantize_dequantize(k_paged, k_sc_paged),
+            atol=2.0,
+            rtol=0.0,
         )
         torch.testing.assert_close(
-            v_result.cpu(), _cpu_quantize_dequantize(v_paged, v_sc_paged), atol=2.0, rtol=0.0
+            v_result.cpu(),
+            _cpu_quantize_dequantize(v_paged, v_sc_paged),
+            atol=2.0,
+            rtol=0.0,
         )
 
 
@@ -1075,7 +1081,7 @@ class TestFp8MultiBlockDecodeOnlineSoftmax:
     and scale pages, dequantizing each block, and updating running online-softmax
     carry state (max, sum, output) with scale adjustment across blocks.
 
-    This covers the core decode loop that all §4 single-block tests leave untested:
+    This covers the core decode loop that the single-block decode tests leave untested:
     the rescale step when block i+1's logit maximum exceeds block i's running max.
     """
 
@@ -1107,7 +1113,16 @@ class TestFp8MultiBlockDecodeOnlineSoftmax:
         k_scales_d = k_scale.to(DEVICE).reshape(num_blocks, BLOCK_SIZE, NUM_KV_HEADS, 1)
         v_scales_d = v_scale.to(DEVICE).reshape(num_blocks, BLOCK_SIZE, NUM_KV_HEADS, 1)
 
-        return k_pages_d, v_pages_d, k_scales_d, v_scales_d, k_fp16, v_fp16, k_scale, v_scale
+        return (
+            k_pages_d,
+            v_pages_d,
+            k_scales_d,
+            v_scales_d,
+            k_fp16,
+            v_fp16,
+            k_scale,
+            v_scale,
+        )
 
     @pytest.mark.parametrize("num_blocks", [2, 4])
     def test_fp8_decode_attention_multi_block_online_softmax(self, num_blocks):
@@ -1157,8 +1172,7 @@ class TestFp8MultiBlockDecodeOnlineSoftmax:
             # the same buffer is updated across loop iterations from two differently-
             # shaped producers.
             running_max = torch.full(
-                (NUM_KV_HEADS, gqa), float("-inf"),
-                dtype=torch.float16, device=q.device
+                (NUM_KV_HEADS, gqa), float("-inf"), dtype=torch.float16, device=q.device
             )
             running_sum = torch.zeros(
                 (NUM_KV_HEADS, gqa), dtype=torch.float16, device=q.device
@@ -1182,19 +1196,18 @@ class TestFp8MultiBlockDecodeOnlineSoftmax:
                 scores = torch.matmul(q_gqa, kv_k.transpose(-1, -2)) * attn_scale
 
                 # Per-block softmax components — no keepdim to stay [KV, gqa].
-                block_max = scores.amax(dim=-1)           # [KV, gqa]
+                block_max = scores.amax(dim=-1)  # [KV, gqa]
                 block_exp = torch.exp(scores - block_max.unsqueeze(-1))  # [KV, gqa, B]
-                block_sum = block_exp.sum(dim=-1)         # [KV, gqa]
-                block_out = torch.matmul(block_exp, kv_v) # [KV, gqa, D]
+                block_sum = block_exp.sum(dim=-1)  # [KV, gqa]
+                block_out = torch.matmul(block_exp, kv_v)  # [KV, gqa, D]
 
                 # Online softmax rescale (all ops on [KV, gqa] scalars).
                 new_max = torch.maximum(running_max, block_max)
                 alpha = torch.exp(running_max - new_max)  # [KV, gqa]
-                beta = torch.exp(block_max - new_max)     # [KV, gqa]
+                beta = torch.exp(block_max - new_max)  # [KV, gqa]
 
                 running_out = (
-                    alpha.unsqueeze(-1) * running_out
-                    + beta.unsqueeze(-1) * block_out
+                    alpha.unsqueeze(-1) * running_out + beta.unsqueeze(-1) * block_out
                 )
                 running_sum = alpha * running_sum + beta * block_sum
                 running_max = new_max
@@ -1238,7 +1251,7 @@ class TestFp8MultiBlockDecodeOnlineSoftmax:
 class TestFp8PrefillAttentionEndToEnd:
     """Full prefill attention pipeline: T>1 query tokens over multi-block FP8 KV cache.
 
-    Exercises the path that existing §5 tests do not cover:
+    Exercises the path that existing prefill gather/dequantize tests do not cover:
       Q [T, H, D] × gathered FP8 K → scores [H, T, N*B] → causal mask →
       softmax → scores × gathered FP8 V → output [T, H, D].
 
@@ -1289,8 +1302,12 @@ class TestFp8PrefillAttentionEndToEnd:
         v_pages_d = _device_write_read_fp8(
             v_fp16, v_scale, (num_kv_tokens, NUM_KV_HEADS, HEAD_SIZE), slot_idx
         ).reshape(num_kv_blocks, BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE)
-        k_scales_d = k_scale.to(DEVICE).reshape(num_kv_blocks, BLOCK_SIZE, NUM_KV_HEADS, 1)
-        v_scales_d = v_scale.to(DEVICE).reshape(num_kv_blocks, BLOCK_SIZE, NUM_KV_HEADS, 1)
+        k_scales_d = k_scale.to(DEVICE).reshape(
+            num_kv_blocks, BLOCK_SIZE, NUM_KV_HEADS, 1
+        )
+        v_scales_d = v_scale.to(DEVICE).reshape(
+            num_kv_blocks, BLOCK_SIZE, NUM_KV_HEADS, 1
+        )
 
         q_d = query_fp16.to(DEVICE)
         attn_scale = float(HEAD_SIZE**-0.5)
@@ -1353,15 +1370,19 @@ class TestFp8PrefillAttentionEndToEnd:
         k_cpu = k_dq.permute(1, 0, 2).float()  # [KV, N*B, D]
         v_cpu = v_dq.permute(1, 0, 2).float()
         q_f_cpu = query_fp16.reshape(num_query_tokens, NUM_KV_HEADS, gqa, HEAD_SIZE)
-        q_f_cpu = q_f_cpu.permute(1, 0, 2, 3).reshape(
-            NUM_KV_HEADS, num_query_tokens * gqa, HEAD_SIZE
-        ).float()
+        q_f_cpu = (
+            q_f_cpu.permute(1, 0, 2, 3)
+            .reshape(NUM_KV_HEADS, num_query_tokens * gqa, HEAD_SIZE)
+            .float()
+        )
         sc_cpu = torch.matmul(q_f_cpu, k_cpu.transpose(-1, -2)) * attn_scale
         sc_cpu = sc_cpu.masked_fill(causal_mask.unsqueeze(0), float("-inf"))
         pr_cpu = torch.softmax(sc_cpu, dim=-1)
         out_cpu = torch.matmul(pr_cpu, v_cpu)  # [KV, T*gqa, D]
         out_cpu = out_cpu.reshape(NUM_KV_HEADS, num_query_tokens, gqa, HEAD_SIZE)
-        out_cpu = out_cpu.permute(1, 0, 2, 3).reshape(num_query_tokens, NUM_HEADS, HEAD_SIZE)
+        out_cpu = out_cpu.permute(1, 0, 2, 3).reshape(
+            num_query_tokens, NUM_HEADS, HEAD_SIZE
+        )
         expected = out_cpu.to(torch.float16)
 
         # atol=6e-2: fp16 device matmul vs fp32 CPU reference; causal masking on
@@ -1377,7 +1398,7 @@ class TestFp8PrefillAttentionEndToEnd:
 class TestFp8HeadMajorPagedAttention:
     """Head-major cache read path: per-head page gather + dequantize + decode attention.
 
-    §7 (TestFp8HeadMajorReshapeAndCache) only tests the write side.  This class
+    TestFp8HeadMajorReshapeAndCache only tests the write side.  This class
     tests the read side: gather per-head pages from the folded head-major cache
     [num_blocks * num_kv_heads, block_size, head_size], dequantize, and compute
     decode GQA attention.
@@ -1435,23 +1456,31 @@ class TestFp8HeadMajorPagedAttention:
         # Reshape [T, KV, D] → [T*KV, D] so per-head rows are contiguous.
         # Scattering a non-contiguous strided column slice (k_fp8[:, h]) loses
         # the QFP8CH ElementArrangement; contiguous rows preserve it.
-        k_flat = k_fp16.reshape(num_tokens * NUM_KV_HEADS, HEAD_SIZE)   # [T*KV, D]
+        k_flat = k_fp16.reshape(num_tokens * NUM_KV_HEADS, HEAD_SIZE)  # [T*KV, D]
         v_flat = v_fp16.reshape(num_tokens * NUM_KV_HEADS, HEAD_SIZE)
 
         # Build flat scatter indices: head h occupies rows [h*B .. h*B+T).
         # With num_tokens == BLOCK_SIZE this is just [0 .. total_rows).
-        flat_row_idx = torch.cat([
-            torch.arange(h * BLOCK_SIZE, h * BLOCK_SIZE + num_tokens, dtype=torch.int32)
-            for h in range(NUM_KV_HEADS)
-        ])
+        flat_row_idx = torch.cat(
+            [
+                torch.arange(
+                    h * BLOCK_SIZE, h * BLOCK_SIZE + num_tokens, dtype=torch.int32
+                )
+                for h in range(NUM_KV_HEADS)
+            ]
+        )
 
         k_flat_d = k_flat.to(DEVICE)
         v_flat_d = v_flat.to(DEVICE)
         flat_idx_d = flat_row_idx.to(DEVICE)
         q_d = query_fp16.to(DEVICE)
 
-        k_rows = torch.zeros((total_rows, HEAD_SIZE), dtype=torch.float8_e4m3fn).to(DEVICE)
-        v_rows = torch.zeros((total_rows, HEAD_SIZE), dtype=torch.float8_e4m3fn).to(DEVICE)
+        k_rows = torch.zeros((total_rows, HEAD_SIZE), dtype=torch.float8_e4m3fn).to(
+            DEVICE
+        )
+        v_rows = torch.zeros((total_rows, HEAD_SIZE), dtype=torch.float8_e4m3fn).to(
+            DEVICE
+        )
         k_scale_rows = torch.zeros((total_rows, 1), dtype=torch.float16, device=DEVICE)
         v_scale_rows = torch.zeros((total_rows, 1), dtype=torch.float16, device=DEVICE)
 
@@ -1459,11 +1488,11 @@ class TestFp8HeadMajorPagedAttention:
         # Return the mutated cache tensors so the QFP8CH EA flows through
         # the return value into the next compiled graph.
         def write_hm_flat(k_f, v_f, k_r, v_r, k_sc, v_sc, flat_idx):
-            sk = torch.ops.spyre.quantscalepertokenfp8(k_f)   # [T*KV, 1]
+            sk = torch.ops.spyre.quantscalepertokenfp8(k_f)  # [T*KV, 1]
             sv = torch.ops.spyre.quantscalepertokenfp8(v_f)
             k_fp8 = torch.ops.spyre.quantize_fp8_with_scale(k_f, sk)
             v_fp8 = torch.ops.spyre.quantize_fp8_with_scale(v_f, sv)
-            k_r.index_copy_(0, flat_idx, k_fp8)   # scatter all heads in one call
+            k_r.index_copy_(0, flat_idx, k_fp8)  # scatter all heads in one call
             v_r.index_copy_(0, flat_idx, v_fp8)
             k_sc.index_copy_(0, flat_idx, sk)
             v_sc.index_copy_(0, flat_idx, sv)
@@ -1501,11 +1530,16 @@ class TestFp8HeadMajorPagedAttention:
             )
             scores = torch.matmul(q_gqa, kv_k.transpose(-1, -2)) * attn_scale
             probs = torch.softmax(scores, dim=-1)
-            out = torch.matmul(probs, kv_v)           # [KV, gqa, D]
+            out = torch.matmul(probs, kv_v)  # [KV, gqa, D]
             return out.reshape(1, NUM_HEADS, HEAD_SIZE)
 
         result = torch.compile(read_and_attend, dynamic=False)(
-            q_d, folded_k, folded_v, folded_k_sc, folded_v_sc, all_head_idx,
+            q_d,
+            folded_k,
+            folded_v,
+            folded_k_sc,
+            folded_v_sc,
+            all_head_idx,
         )
 
         # CPU reference: fp8-round-tripped KV (using per-token scales on flat view)
@@ -1521,10 +1555,16 @@ class TestFp8HeadMajorPagedAttention:
         # After head-major scatter, head h occupies rows [h*B .. (h+1)*B).
         # Reconstruct [KV, B, D] by reading those row ranges.
         kv_k_cpu = torch.stack(
-            [k_flat_dq[h * BLOCK_SIZE: h * BLOCK_SIZE + num_tokens] for h in range(NUM_KV_HEADS)]
+            [
+                k_flat_dq[h * BLOCK_SIZE : h * BLOCK_SIZE + num_tokens]
+                for h in range(NUM_KV_HEADS)
+            ]
         ).float()  # [KV, T, D]
         kv_v_cpu = torch.stack(
-            [v_flat_dq[h * BLOCK_SIZE: h * BLOCK_SIZE + num_tokens] for h in range(NUM_KV_HEADS)]
+            [
+                v_flat_dq[h * BLOCK_SIZE : h * BLOCK_SIZE + num_tokens]
+                for h in range(NUM_KV_HEADS)
+            ]
         ).float()
         q_gqa_cpu = query_fp16.reshape(NUM_KV_HEADS, gqa, HEAD_SIZE).float()
         sc_cpu = torch.matmul(q_gqa_cpu, kv_k_cpu.transpose(-1, -2)) * attn_scale
@@ -1559,7 +1599,9 @@ class TestFp8IndexSelectRobustness:
         pages_d = _device_write_read_fp8(
             pages_fp16, scales_cpu, (total, NUM_KV_HEADS, HEAD_SIZE), slot_idx
         ).reshape(NUM_BLOCKS, BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE)
-        scales_d = scales_cpu.to(DEVICE).reshape(NUM_BLOCKS, BLOCK_SIZE, NUM_KV_HEADS, 1)
+        scales_d = scales_cpu.to(DEVICE).reshape(
+            NUM_BLOCKS, BLOCK_SIZE, NUM_KV_HEADS, 1
+        )
         return pages_d, scales_d, pages_fp16, scales_cpu
 
     def test_fp8_index_select_repeated_indices(self):
@@ -1596,7 +1638,9 @@ class TestFp8IndexSelectRobustness:
         torch.testing.assert_close(result.cpu(), expected, atol=2.0, rtol=0.0)
         # Explicitly verify the duplicate rows are numerically identical.
         torch.testing.assert_close(
-            result.cpu()[0], result.cpu()[1],
-            atol=0.0, rtol=0.0,
+            result.cpu()[0],
+            result.cpu()[1],
+            atol=0.0,
+            rtol=0.0,
             msg="Repeated page index must produce identical rows in the gathered output.",
         )
