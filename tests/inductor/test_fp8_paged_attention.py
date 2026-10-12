@@ -1657,7 +1657,7 @@ class TestFp84DBroadcastDecodeAttention:
     This test exercises the attention matmul block body directly, without
     involving index_copy_ or the KV cache scatter path.
 
-    Requires torch.ops.spyre.scaled_bmm (PR #5158).
+    Requires ``torch.ops.spyre.scaled_bmm``.
     """
 
     def test_fp8_decode_attention_4d_broadcast_matmul(self):
@@ -1776,8 +1776,8 @@ class TestFp8KvCacheWriteQFP8WT:
     The CPU reference mirrors the same FP8 round-trip: ``k [BLOCK_SIZE, KV, D]``
     → permute → clamp → fp8 → fp32, then ``q @ k * scale``.
 
-    Requires ``torch.ops.spyre.scaled_bmm`` (PR #5158) and the QFP8WT
-    batch-DCI enhancement in ``spyre_mem.cpp``.
+    Requires ``torch.ops.spyre.scaled_bmm`` and the QFP8WT batch-DCI
+    enhancement in ``spyre_mem.cpp``.
     """
 
     def test_fp8_kv_cache_write_qfp8wt_roundtrip(self):

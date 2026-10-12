@@ -2293,13 +2293,11 @@ def lower_qfp8ch(x):
 @register_spyre_lowering(torch.ops.spyre.qfp8wt)
 def lower_qfp8wt(x):
     """
-    Lower qfp8wt operation - weight FP8 format conversion.
+    Lower qfp8wt operation — weight FP8 format conversion.
 
-    Pointwise format conversion only (no scaling).  The QFP8WT STL is built
-    by ``_qfp8wt_stl`` in ``propagate_layouts.py`` using the standard N-inner
-    path: the last host dimension becomes the innermost device dimension with
-    stride=1.  Callers must pass a contiguous input (e.g. ``.contiguous()``
-    after ``permute``) so that ``output.stride`` reflects the intended layout.
+    Pointwise format conversion only (no scaling).  Callers must pass a
+    contiguous input (e.g. ``.contiguous()`` after ``permute``) so that the
+    output stride reflects the intended layout.
     """
     fn = lowering.ops_wrapper(torch.ops.spyre.qfp8wt.__name__)
     x_loader = x.make_loader()

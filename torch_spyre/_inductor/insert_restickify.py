@@ -753,13 +753,6 @@ def finalize_layouts(graph: GraphLowering) -> None:
             restick_target = _fixed_tiled(in_layout, restick_stl)
             occurrence = edge_occurrences.get(key, 0)
             edge_occurrences[key] = occurrence + 1
-            import sys
-
-            print(
-                f"[DBG_RESTICK] op={op.get_name()} input={edge.dep.name} in_stl EA={in_stl.element_arrangement} in_size={list(in_stl.device_size)} -> target EA={target_stl.element_arrangement} target_size={list(target_stl.device_size)} restick_size={list(restick_stl.device_size)}",
-                file=sys.stderr,
-                flush=True,
-            )
             logger.info(
                 f"Injecting restickify on {op.get_name()} input {edge.dep.name}: "
                 f"{list(in_stl.stride_map)} -> {list(target_stl.stride_map)}"

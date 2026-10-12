@@ -2365,7 +2365,7 @@ def _align_single_source_producer(
     # Do not overwrite a producer whose layout already carries a non-STANDARD
     # element arrangement (e.g. QFP8WT 2D-stick from qfp8wt).  The alt_stl for
     # the mutation target is always STANDARD; forcing it onto the producer strips
-    # the arrangement and causes the backend to misread the HBM layout.
+    # the arrangement and causes the codegen to misread the HBM layout.
     if any(
         getattr(stl, "element_arrangement", ElementArrangement.STANDARD)
         != ElementArrangement.STANDARD
