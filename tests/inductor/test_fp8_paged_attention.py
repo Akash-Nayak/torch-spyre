@@ -15,23 +15,71 @@
 """Tests for torch-spyre primitives supporting FP8 paged attention.
 
 FP8 paged attention introduces quantized KV caches: KV tokens are quantized to
-FP8 before being stored and dequantized before attention computation. These
-tests exercise each compiler primitive in the shape and layout configurations
-dictated by paged-cache geometry:
+FP8 before being stored, and at decode time the cache is read back for the
+attention matmul.  These tests exercise each compiler primitive in the shape
+and layout configurations dictated by paged-cache geometry.
 
-  1. Stick alignment for FP8 KV cache pages
-  2. Per-token scale computation via quantscalepertokenfp8
-  3. KV write: quantize FP16 KV token → FP8, store into page slots
-  4. KV read (decode): gather an FP8 page, dequantize → FP16, run online-softmax
-  5. KV read (prefill): multi-block gather and dequantize
-  6. Compiled quantize-on-device + index_copy_ write path
-  7. Compiled index_select gather of FP8 pages after device write
+Two decode strategies
+---------------------
+The tests cover two approaches for handling K at decode time:
+
+**Dequantize-K strategy** (§TestFp8PagedAttentionDecode and related classes):
+  K is stored in the cache as QFP8CH (channel-wise FP8, produced by
+  ``quantize_fp8_with_scale``).  At decode time, K is gathered and immediately
+  dequantized to FP16 via ``dequantize_fp8_with_scale``, then the attention
+  matmul runs in FP16::
+
+      k_page  = k_cache.index_select(0, page_idx)        # QFP8CH
+      k_fp16  = dequantize_fp8_with_scale(k_page, scale) # → FP16
+      scores  = torch.matmul(q_fp16, k_fp16.transpose(-1, -2))
+
+  V follows the same path.  All test classes up to
+  ``TestFp8IndexSelectRobustness`` exercise this strategy.
+
+**Direct-FP8-matmul strategy** (``TestFp8ScaledBmmQKT``,
+  ``TestFp8KvCacheWriteQFP8WT``, ``TestFp8KvCacheQFP8WTDecodeEndToEnd``):
+  K is stored in the cache as QFP8WT (2D-stick weight format, produced by
+  ``quantize_weight_fp8_with_scale``).  The QFP8WT layout is required by the
+  ``batchmatmulfp8`` hardware kernel.  At decode time K is fed directly to
+  ``spyre.scaled_bmm`` without a dequantize step; scale compensation is applied
+  to the output scores::
+
+      k_page  = k_cache.index_select(0, page_idx)               # QFP8WT
+      sq      = quantscalepertokenfp8(q_fp16)
+      q_fp8   = quantize_fp8_with_scale(q_fp16, sq)             # QFP8CH
+      scores  = spyre.scaled_bmm(q_fp8, k_page, out_dtype=fp16) # FP8×FP8→FP16
+      scores  = scores * sq * sk * attn_scale                   # scale compensation
+
+  V is still stored as QFP8CH and dequantized to FP16 for the P·V matmul.
+
+  This requires ``spyre.scaled_bmm`` (``torch.ops.spyre.scaled_bmm``) and the
+  QFP8WT 2D-stick scatter fix in the compiler (``index_copy_`` emits 2D-stick
+  HBM layout for QFP8WT destinations).
+
+Test classes
+------------
+  1.  ``TestFp8KvCacheStickAlignment``     — FP8 stick depth and tensor allocation
+  2.  ``TestFp8PerTokenScale``             — quantscalepertokenfp8 correctness
+  3.  ``TestFp8KvCacheWrite``              — quantize + index_copy_ write path
+  4.  ``TestFp8PagedAttentionDecode``      — gather + dequant + decode attention (dequantize-K)
+  5.  ``TestFp8PagedAttentionPrefill``     — multi-block gather + dequant (dequantize-K)
+  6.  ``TestFp8ReshapeAndCache``           — fused quantize-and-store kernel body
+  7.  ``TestFp8HeadMajorReshapeAndCache``  — head-major cache write path
+  8.  ``TestFp8IndexSelect``               — index_select on FP8 page caches
+  9.  ``TestFp8MultiBlockDecodeOnlineSoftmax`` — multi-block online softmax (dequantize-K)
+  10. ``TestFp8PrefillAttentionEndToEnd``  — full prefill pipeline (dequantize-K)
+  11. ``TestFp8HeadMajorPagedAttention``   — head-major cache read + decode (dequantize-K)
+  12. ``TestFp8IndexSelectRobustness``     — repeated-index gather
+  13. ``TestFp8ScaledBmmQKT``             — FP8 Q·Kᵀ matmul with calibrated scale schemes
+  14. ``TestFp8KvCacheWriteQFP8WT``       — QFP8WT cache write + gather + score
+  15. ``TestFp8KvCacheQFP8WTDecodeEndToEnd`` — full fill-and-decode pipeline (direct-FP8-matmul)
 
 Stick-alignment rules
 ---------------------
 Spyre's 128-byte stick holds:
-  - 64 FP16/BF16 elements  → block_size/head_size must be multiples of 64
-  - 128 FP8 elements       → block_size/head_size must be multiples of 128
+
+- 64 FP16/BF16 elements  → block_size/head_size must be multiples of 64
+- 128 FP8 elements       → block_size/head_size must be multiples of 128
 
 All page shapes here use block_size=128 and head_size=128, satisfying the FP8
 alignment constraint while keeping tests fast.
@@ -43,22 +91,27 @@ EA (ElementArrangement) semantics for the KV read path
 is stamped by the on-device ``qfp8ch`` op (``quantize_fp8_with_scale``).
 
 A CPU-quantized FP8 tensor moved to device via H2D transfer lands with
-``ElementArrangement.STANDARD``. Tensors dequantized on device must originate
+``ElementArrangement.STANDARD``.  Tensors dequantized on device must originate
 from on-device ``qfp8ch`` operations.
 
-In the standard KV cache workflow:
-  - ``quantize_fp8_with_scale`` runs on device, producing ``QFP8CH`` byte layouts.
-  - ``index_copy_`` scatters into the FP8 cache buffer (re-stamping the buffer
-    metadata as STANDARD while preserving the underlying QFP8CH bit pattern).
-  - ``index_select`` gathers the page slots.
-  - ``dequantize_fp8_with_scale`` successfully converts gathered FP8 pages to FP16.
+In the dequantize-K workflow::
 
-The canonical execution flow is:
     q_fp8 = quantize_fp8_with_scale(key, scale)
     cache.index_copy_(0, idx, q_fp8)
     ...
-    page = cache.index_select(0, page_idx)
+    page   = cache.index_select(0, page_idx)
     kv_fp16 = dequantize_fp8_with_scale(page, scale)
+
+In the direct-FP8-matmul workflow::
+
+    k_perm = key.permute(1, 2, 0).contiguous()          # [KV, D, BS]
+    sk     = quantscalepertokenfp8(k_perm).amax()        # per-tensor scalar
+    k_fp8  = quantize_weight_fp8_with_scale(k_perm, sk)  # QFP8WT
+    cache.index_copy_(0, idx, k_fp8.unsqueeze(0))
+    ...
+    k_page = cache.index_select(0, page_idx)             # QFP8WT preserved
+    scores = spyre.scaled_bmm(q_fp8, k_page, out_dtype=torch.float16)
+    scores = scores * sq * sk * attn_scale
 """
 
 import pytest
@@ -1646,22 +1699,53 @@ class TestFp8IndexSelectRobustness:
         )
 
 
-class TestFp84DBroadcastDecodeAttention:
-    """Decode attention via 4D FP8 batched matmul: Q·K^T in FP8, P·V in fp16.
+class TestFp8ScaledBmmQKT:
+    """FP8 Q·Kᵀ via ``spyre.scaled_bmm`` with three scale schemes.
 
     K is pre-quantized as QFP8WT [KV, gqa, D, B] using
-    quantize_weight_fp8_with_scale. Q is quantized per-token as QFP8CH
-    [KV, gqa, 1, D]. The Q·K^T matmul runs in FP8 via spyre.scaled_bmm;
-    V is dequantized to fp16 for the P·V matmul.
+    ``quantize_weight_fp8_with_scale``. Q is quantized as QFP8CH
+    [KV, gqa, 1, D]. The Q·Kᵀ matmul runs in FP8 via ``spyre.scaled_bmm``;
+    the score result is compensated with ``scores × scale_q × scale_k``.
 
-    This test exercises the attention matmul block body directly, without
-    involving index_copy_ or the KV cache scatter path.
+    This test exercises the matmul block body and scale compensation directly,
+    without involving ``index_copy_`` or the KV cache scatter path.
+
+    Three scale schemes are tested — all are numerically correct for
+    ``batchmatmulfp8``'s post-multiply ``scores × scale_q × scale_k``:
+
+    ``per_tensor_amax``
+        scale_q = 1.0 (Q was quantized by the preceding linear with its own
+        output scale already folded in, so scaled_bmm receives scale=1).
+        scale_k = max(|K_fp8|, all dims) / FP8_MAX — dynamic per-tensor
+        amax computed from the already-quantized FP8 K values at runtime.
+
+    ``per_token_q_per_tensor_k``
+        scale_q = quantscalepertokenfp8(Q_fp16) — dynamic per-token amax
+        from the fp16 Q values before quantization.
+        scale_k = max(|K_fp8|, all dims) / FP8_MAX — same as above for K.
+
+    ``per_token_both``
+        scale_q = quantscalepertokenfp8(Q_fp16).
+        scale_k = quantscalepertokenfp8(K_fp16_flat) broadcast to [KV,gqa,D,B].
+        Both scales derived from fp16 pre-quantization values.
+
+    The CPU reference in all cases dequantizes Q and K with their respective
+    scales and runs fp32 matmul — it does not use a bare FP8 round-trip.
 
     Requires ``torch.ops.spyre.scaled_bmm``.
     """
 
-    def test_fp8_decode_attention_4d_broadcast_matmul(self):
-        """Q_fp8ch [KV,gqa,1,D] × K_fp8wt [KV,gqa,D,B] → fp16 scores → softmax → P·V_fp16."""
+    @pytest.mark.parametrize(
+        "scale_scheme",
+        ["per_tensor_amax", "per_token_q_per_tensor_k", "per_token_both"],
+    )
+    def test_fp8_scaled_bmm_qkt_scale_schemes(self, scale_scheme):
+        """Q_fp8ch [KV,gqa,1,D] × K_fp8wt [KV,gqa,D,B] → fp16 scores via scaled_bmm.
+
+        The CPU reference dequantizes Q and K with their actual scales and
+        computes fp32 matmul, confirming that scale compensation
+        ``scores × scale_q × scale_k`` recovers the correct fp16 result.
+        """
         gqa = NUM_HEADS // NUM_KV_HEADS
         attn_scale = float(HEAD_SIZE**-0.5)
 
@@ -1669,23 +1753,20 @@ class TestFp84DBroadcastDecodeAttention:
             (BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE),
             dtype=torch.float16,
             scale=0.5,
-            differentiation="4d_k",
+            differentiation=f"4d_k_{scale_scheme}",
         )
         v_fp16 = cached_randn(
             (BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE),
             dtype=torch.float16,
             scale=0.5,
-            differentiation="4d_v",
+            differentiation=f"4d_v_{scale_scheme}",
         )
         query_fp16 = cached_randn(
             (1, NUM_HEADS, HEAD_SIZE),
             dtype=torch.float16,
             scale=0.5,
-            differentiation="4d_q",
+            differentiation=f"4d_q_{scale_scheme}",
         )
-        sq = torch.tensor([1.0], dtype=torch.float16)
-        sk = torch.tensor([1.0], dtype=torch.float16)
-        sv = torch.tensor([1.0], dtype=torch.float16)
 
         # Arrange K → [KV, gqa, D, B]  (weight layout for scaled_bmm mat2)
         # Arrange V → [KV, gqa, B, D]  (activation layout for dequant + matmul)
@@ -1705,44 +1786,156 @@ class TestFp84DBroadcastDecodeAttention:
         q_d = query_fp16.to(DEVICE)
         k_4d_d = k_4d.to(DEVICE)
         v_4d_d = v_4d.to(DEVICE)
-        sq_d, sk_d, sv_d = sq.to(DEVICE), sk.to(DEVICE), sv.to(DEVICE)
 
-        def attn_4d_mixed(q, k, v, sq, sk, sv):
-            # Q: [1, H, D] → [KV, gqa, 1, D] QFP8CH
-            q_4d = q.reshape(NUM_KV_HEADS, gqa, HEAD_SIZE).unsqueeze(2)
-            q_fp8 = torch.ops.spyre.quantize_fp8_with_scale(q_4d, sq)
-            # K: [KV, gqa, D, B] → QFP8WT
-            k_fp8 = torch.ops.spyre.quantize_weight_fp8_with_scale(k, sk)
-            # V: [KV, gqa, B, D] QFP8CH → dequantize to fp16 for P·V
-            v_fp8 = torch.ops.spyre.quantize_fp8_with_scale(v, sv)
-            # Q·K^T in FP8 → [KV, gqa, 1, B] fp16 scores
-            scores = torch.ops.spyre.scaled_bmm(q_fp8, k_fp8, out_dtype=torch.float16)
-            scores = scores * (sq * sk) * attn_scale
-            probs = torch.softmax(scores, dim=-1)
-            # P·V in fp16 → [KV, gqa, 1, D]
-            v_dl16 = torch.ops.spyre.dequantize_fp8_with_scale(v_fp8, sv)
-            out = torch.matmul(probs, v_dl16)
-            return out.squeeze(2).reshape(1, NUM_HEADS, HEAD_SIZE)
+        # ── per_tensor_amax: scale_q=1.0 (Q was quantized by the preceding
+        # linear layer and its output scale is already folded into the FP8
+        # encoding, so scaled_bmm receives scale_q=1); scale_k = amax(|K_fp8|,
+        # all dims) / FP8_MAX computed at runtime from the already-quantized K.
+        if scale_scheme == "per_tensor_amax":
+            sq_scalar = torch.tensor([1.0], dtype=torch.float16)
+            # v_fp16: [BLOCK_SIZE, KV, HEAD_SIZE]; per-token scale → [BLOCK_SIZE, KV, 1].
+            # v_4d: [KV, gqa, BLOCK_SIZE, HEAD_SIZE]; reshape scale to broadcast over it.
+            sv_cpu = (
+                _cpu_per_token_scale(v_fp16)  # [B, KV, 1]
+                .permute(1, 0, 2)  # [KV, B, 1]
+                .unsqueeze(1)  # [KV, 1, B, 1]
+                .expand(NUM_KV_HEADS, gqa, BLOCK_SIZE, 1)
+                .contiguous()
+            )  # [KV, gqa, B, 1]
 
-        result = torch.compile(attn_4d_mixed, dynamic=False)(
-            q_d, k_4d_d, v_4d_d, sq_d, sk_d, sv_d
-        )
+            sq_d = sq_scalar.to(DEVICE)
+            sv_d = sv_cpu.to(DEVICE)
 
-        # CPU reference: FP8 round-trip → fp32 matmul
-        def _fp8_rt(x):
-            return (
-                x.clamp(-FP8_E4M3FN_MAX, FP8_E4M3FN_MAX)
-                .to(torch.float8_e4m3fn)
-                .to(torch.float32)
+            def attn_4d_mixed(q, k, v, sq, sv):
+                q_4d = q.reshape(NUM_KV_HEADS, gqa, HEAD_SIZE).unsqueeze(
+                    2
+                )  # [KV,gqa,1,D]
+                # Q quantized with unit scale — the linear output scale is already
+                # folded into the FP8 bit pattern; scaled_bmm sees scale_q=1.
+                q_fp8 = torch.ops.spyre.quantize_fp8_with_scale(q_4d, sq)
+                # K quantized to QFP8WT with unit input scale (same as Q path).
+                k_fp8 = torch.ops.spyre.quantize_weight_fp8_with_scale(k, sq)
+                # scale_k: per-tensor amax recovery scale derived from the FP8
+                # K values themselves — amax(|K_fp8|) / FP8_MAX.
+                sk = torch.amax(torch.abs(k_fp8.to(torch.float16))) / FP8_E4M3FN_MAX
+                v_fp8 = torch.ops.spyre.quantize_fp8_with_scale(v, sv)
+                scores = torch.ops.spyre.scaled_bmm(
+                    q_fp8, k_fp8, out_dtype=torch.float16
+                )
+                scores = scores * (sq * sk) * attn_scale
+                probs = torch.softmax(scores, dim=-1)
+                v_dl16 = torch.ops.spyre.dequantize_fp8_with_scale(v_fp8, sv)
+                out = torch.matmul(probs, v_dl16)
+                return out.squeeze(2).reshape(1, NUM_HEADS, HEAD_SIZE)
+
+            result = torch.compile(attn_4d_mixed, dynamic=False)(
+                q_d, k_4d_d, v_4d_d, sq_d, sv_d
             )
 
-        q_ref = _fp8_rt(query_fp16.reshape(NUM_KV_HEADS, gqa, HEAD_SIZE)).unsqueeze(2)
-        k_ref = _fp8_rt(k_4d)
-        v_ref = _fp8_rt(v_4d)
-        sc_ref = torch.matmul(q_ref, k_ref) * attn_scale
-        pr_ref = torch.softmax(sc_ref.to(torch.float16), dim=-1)
-        out_ref = torch.matmul(pr_ref.to(torch.float32), v_ref)
-        expected = out_ref.squeeze(2).reshape(1, NUM_HEADS, HEAD_SIZE).to(torch.float16)
+            # CPU reference: Q and K quantized with unit scale (same as device
+            # path), then dequantized and multiplied in fp32. scale_q * scale_k
+            # on the device side recovers the same range as dequantize here.
+            unit = torch.tensor([1.0])
+            q_dq = _cpu_dequantize(
+                _cpu_quantize(
+                    query_fp16.reshape(NUM_KV_HEADS, gqa, HEAD_SIZE).unsqueeze(2), unit
+                ),
+                unit,
+            ).float()  # [KV, gqa, 1, D]
+            # k_4d: [KV, gqa, D, B] — quantize with unit scale, dequantize.
+            k_dq = _cpu_dequantize(_cpu_quantize(k_4d, unit), unit).float()
+            # V: per-token scale (one per [KV, gqa, B] row).
+            v_dq = _cpu_dequantize(_cpu_quantize(v_4d, sv_cpu), sv_cpu).float()
+            sc_ref = torch.matmul(q_dq, k_dq) * attn_scale  # [KV, gqa, 1, B]
+            pr_ref = torch.softmax(sc_ref.to(torch.float16), dim=-1)
+            out_ref = torch.matmul(pr_ref.to(torch.float32), v_dq)
+            expected = (
+                out_ref.squeeze(2).reshape(1, NUM_HEADS, HEAD_SIZE).to(torch.float16)
+            )
+
+        else:
+            # ── per_token_q_per_tensor_k and per_token_both: compute Q scale via
+            # quantscalepertokenfp8 on the fp16 query values.
+            # K scale: per-token for per_token_both, per-tensor amax for per_token_q_per_tensor_k.
+            sq_cpu = _cpu_per_token_scale(
+                query_fp16.reshape(NUM_KV_HEADS, gqa, HEAD_SIZE)
+            )  # [KV, gqa, 1] — one scale per query head
+            sq_cpu = sq_cpu.unsqueeze(2)  # [KV, gqa, 1, 1] for quantize_fp8_with_scale
+
+            if scale_scheme == "per_token_both":
+                # Per-token K scale from fp16 pre-quantization values.
+                # k_4d is [KV, gqa, D, B]; token dimension is B (last).
+                # Per-token = per B-column = per output of K^T row.
+                # Flatten to [KV*gqa*B, D], compute per-row amax, reshape back.
+                k_4d_t = k_4d.permute(0, 1, 3, 2)  # [KV, gqa, B, D]
+                sk_cpu = _cpu_per_token_scale(k_4d_t)  # [KV, gqa, B, 1]
+                # For quantize_weight_fp8_with_scale the scale must broadcast over K;
+                # use a single per-tensor amax instead (per-token for weight format
+                # requires scale shape matching N dim — use scalar here for simplicity).
+                sk_scalar = torch.tensor(
+                    [torch.amax(sk_cpu).item()], dtype=torch.float16
+                )
+            else:
+                # per_token_q_per_tensor_k: per-tensor K scale from K_fp8 amax.
+                # Pre-quantize K with unit scale to get FP8 values, then compute amax.
+                k_fp8_unit = _cpu_quantize(k_4d, torch.tensor([1.0]))
+                sk_scalar = torch.tensor(
+                    [
+                        torch.amax(torch.abs(k_fp8_unit.to(torch.float16))).item()
+                        / FP8_E4M3FN_MAX
+                    ],
+                    dtype=torch.float16,
+                )
+
+            sv_cpu = _cpu_per_token_scale(v_4d)  # [KV, gqa, B, 1] — per-token V scale
+
+            sq_d = sq_cpu.to(DEVICE)
+            sk_d = sk_scalar.to(DEVICE)
+            sv_d = sv_cpu.to(DEVICE)
+
+            def attn_4d_mixed(q, k, v, sq, sk, sv):
+                q_4d = q.reshape(NUM_KV_HEADS, gqa, HEAD_SIZE).unsqueeze(
+                    2
+                )  # [KV,gqa,1,D]
+                q_fp8 = torch.ops.spyre.quantize_fp8_with_scale(q_4d, sq)  # QFP8CH
+                k_fp8 = torch.ops.spyre.quantize_weight_fp8_with_scale(k, sk)  # QFP8WT
+                v_fp8 = torch.ops.spyre.quantize_fp8_with_scale(v, sv)
+                scores = torch.ops.spyre.scaled_bmm(
+                    q_fp8, k_fp8, out_dtype=torch.float16
+                )
+                scores = scores * (sq * sk) * attn_scale
+                probs = torch.softmax(scores, dim=-1)
+                v_dl16 = torch.ops.spyre.dequantize_fp8_with_scale(v_fp8, sv)
+                out = torch.matmul(probs, v_dl16)
+                return out.squeeze(2).reshape(1, NUM_HEADS, HEAD_SIZE)
+
+            result = torch.compile(attn_4d_mixed, dynamic=False)(
+                q_d, k_4d_d, v_4d_d, sq_d, sk_d, sv_d
+            )
+
+            # CPU reference: dequantize Q and K with their actual scales, fp32 matmul.
+            q_dq = _cpu_dequantize(
+                _cpu_quantize(
+                    query_fp16.reshape(NUM_KV_HEADS, gqa, HEAD_SIZE).unsqueeze(2),
+                    sq_cpu,
+                ),
+                sq_cpu,
+            ).float()  # [KV, gqa, 1, D]
+
+            k_dq = _cpu_dequantize(
+                _cpu_quantize(k_4d, sk_scalar), sk_scalar
+            ).float()  # [KV, gqa, D, B]
+
+            v_dq = _cpu_dequantize(
+                _cpu_quantize(v_4d, sv_cpu), sv_cpu
+            ).float()  # [KV, gqa, B, D]
+
+            sc_ref = torch.matmul(q_dq, k_dq) * attn_scale  # [KV, gqa, 1, B]
+            pr_ref = torch.softmax(sc_ref.to(torch.float16), dim=-1)
+            out_ref = torch.matmul(pr_ref.to(torch.float32), v_dq)
+            expected = (
+                out_ref.squeeze(2).reshape(1, NUM_HEADS, HEAD_SIZE).to(torch.float16)
+            )
 
         torch.testing.assert_close(result.cpu(), expected, atol=1e-1, rtol=0.0)
 
@@ -1754,9 +1947,9 @@ class TestFp8KvCacheWriteQFP8WT:
     directly without a dequantize step:
 
       1. **Fill**: permute ``k [BLOCK_SIZE, KV, D]`` → ``[KV, D, BLOCK_SIZE]``,
-         then ``quantize_weight_fp8_with_scale`` encodes it as QFP8WT with
-         ``K=D`` (head-dim contraction) and ``N=BLOCK_SIZE``.  This orientation
-         matches what ``batchmatmulfp8`` requires for its mat2 weight argument.
+         quantize per-token scale via ``quantscalepertokenfp8``, then encode as
+         QFP8WT via ``quantize_weight_fp8_with_scale``.  K=D, N=BLOCK_SIZE,
+         matching ``batchmatmulfp8``'s mat2 weight layout requirement.
 
       2. **Scatter**: ``index_copy_`` writes the encoded block into the paged
          cache ``[NUM_BLOCKS, KV, D, BLOCK_SIZE]`` along the block dimension.
@@ -1765,7 +1958,15 @@ class TestFp8KvCacheWriteQFP8WT:
          ``ElementArrangement`` is preserved through the gather by the
          compiler's EA propagation pass.
 
-      4. **Score**: ``scaled_bmm(q_fp8, k_gathered_4d)`` — no dequantize step.
+      4. **Score**: ``scaled_bmm(q_fp8, k_gathered_4d, scale_q, scale_k)`` —
+         no dequantize step.  Scale compensation ``scores × scale_q × scale_k``
+         restores the correct fp16 range.
+
+    Scale scheme: ``quantscalepertokenfp8`` on the fp16 Q values gives
+    ``scale_q``; ``quantscalepertokenfp8`` on the fp16 K values (before the fill
+    permute) gives the per-token ``scale_k`` stored alongside the cache page.
+    The CPU reference dequantizes Q and K with their actual scales before
+    computing the reference matmul, confirming scale correctness end-to-end.
 
     **Cache shape**: ``[NUM_BLOCKS, KV, D, BLOCK_SIZE]`` with the last two dims
     as the QFP8WT ``[K=D, N=BLOCK_SIZE]`` matrix.  This requires the spyre_mem
@@ -1773,17 +1974,20 @@ class TestFp8KvCacheWriteQFP8WT:
     ``[K, N]`` innermost pair) — added in the accompanying ``spyre_mem.cpp``
     enhancement.
 
-    The CPU reference mirrors the same FP8 round-trip: ``k [BLOCK_SIZE, KV, D]``
-    → permute → clamp → fp8 → fp32, then ``q @ k * scale``.
-
     Requires ``torch.ops.spyre.scaled_bmm`` and the QFP8WT batch-DCI
     enhancement in ``spyre_mem.cpp``.
     """
 
     def test_fp8_kv_cache_write_qfp8wt_roundtrip(self):
-        """Write K as QFP8WT (K=D orientation) at fill time, gather, score."""
+        """Write K as QFP8WT at fill time with per-token scales, gather, score.
+
+        Scale correctness is verified end-to-end: the CPU reference dequantizes
+        Q and K with their actual ``quantscalepertokenfp8`` scales and computes
+        fp32 matmul, confirming that ``scores × scale_q × scale_k`` on the
+        device recovers numerically accurate attention scores.
+        """
         attn_scale = float(HEAD_SIZE**-0.5)
-        gqa = 1  # gqa=1: Q [KV,1,1,D] and K_weight [KV,1,D,BS] match leading dims
+        gqa = 1  # Q [KV,1,1,D] × K_weight [KV,1,D,BS]
 
         # One full block of tokens (BLOCK_SIZE = N for QFP8WT alignment).
         # BLOCK_SIZE=128: K=D=128 (K%2=0 ✓), N=BLOCK_SIZE=128 (N%64=0 ✓).
@@ -1800,11 +2004,21 @@ class TestFp8KvCacheWriteQFP8WT:
             differentiation="qfp8wt_q_block",
         )
 
-        # Unit scales: fp16 values cast to fp8 without rescaling.
-        sk = torch.ones((1,), dtype=torch.float16)
-        sq = torch.ones((1,), dtype=torch.float16)
+        # ── Scales (CPU) ───────────────────────────────────────────────────────
+        # Q: per-token scale — one scalar per query vector [KV, 1].
+        sq_cpu = _cpu_per_token_scale(q_fp16.reshape(NUM_KV_HEADS, gqa, HEAD_SIZE))
+        sq_cpu = sq_cpu.unsqueeze(2)  # [KV, 1, 1, 1] broadcasts over [KV,1,1,D]
 
-        # Fill block 0.
+        # K: per-token scale computed on the permuted [KV, D, BS] view.
+        # The fill permute is k[BS,KV,D] → permute(1,2,0) → [KV,D,BS].
+        # Per-token on [KV, D, BS] means one scale per (KV, D) row — i.e. per
+        # head-dim position.  Use a single per-tensor scalar here so the shape
+        # is compatible with quantize_weight_fp8_with_scale (scalar scale).
+        k_perm_cpu = k_fp16.permute(1, 2, 0).contiguous()  # [KV, D, BS]
+        sk_cpu = torch.tensor(
+            [_cpu_per_token_scale(k_perm_cpu).amax().item()], dtype=torch.float16
+        )  # scalar: worst-case per-token scale → conservative per-tensor bound
+
         block_idx = torch.tensor([0], dtype=torch.int32)
 
         # 4D paged cache [NUM_BLOCKS, KV, D, BLOCK_SIZE]:
@@ -1814,8 +2028,8 @@ class TestFp8KvCacheWriteQFP8WT:
 
         k_d = k_fp16.to(DEVICE)
         q_d = q_fp16.to(DEVICE)
-        sk_d = sk.to(DEVICE)
-        sq_d = sq.to(DEVICE)
+        sk_d = sk_cpu.to(DEVICE)
+        sq_d = sq_cpu.to(DEVICE)
         block_d = block_idx.to(DEVICE)
         k_cache_d = k_cache.to(DEVICE)
 
@@ -1838,11 +2052,11 @@ class TestFp8KvCacheWriteQFP8WT:
             # Drop the leading block-batch dim → [KV, 1, D, BLOCK_SIZE] for bmm.
             k_4d = k_block.squeeze(0).unsqueeze(1)  # [KV, 1, D, BLOCK_SIZE]
 
-            # ── Quantize Q ─────────────────────────────────────────────────────
+            # ── Quantize Q with per-token scale ────────────────────────────────
             q_4d = q.reshape(NUM_KV_HEADS, gqa, 1, HEAD_SIZE)  # [KV,1,1,D]
             q_fp8 = torch.ops.spyre.quantize_fp8_with_scale(q_4d, sq)
 
-            # ── Score via scaled_bmm ────────────────────────────────────────────
+            # ── Score via scaled_bmm — scale compensation recovers fp16 range ──
             # Q [KV,1,1,D] × K [KV,1,D,BS] → [KV,1,1,BS] scores (fp16).
             raw = torch.ops.spyre.scaled_bmm(q_fp8, k_4d, out_dtype=torch.float16)
             return raw * (sq * sk) * attn_scale
@@ -1852,22 +2066,199 @@ class TestFp8KvCacheWriteQFP8WT:
         )
 
         # ── CPU reference ──────────────────────────────────────────────────────
-        # Mirror the fill permute + FP8 round-trip (unit scale).
-        def _fp8_rt(x):
-            return (
-                x.clamp(FP8_E4M3FN_MIN, FP8_E4M3FN_MAX)
-                .to(torch.float8_e4m3fn)
-                .to(torch.float32)
-            )
+        # Dequantize Q and K with their actual scales, compute fp32 matmul.
+        # This confirms scale compensation gives numerically accurate scores.
+        q_4d_cpu = q_fp16.reshape(NUM_KV_HEADS, gqa, 1, HEAD_SIZE)
+        q_dq = _cpu_dequantize(_cpu_quantize(q_4d_cpu, sq_cpu), sq_cpu).float()
 
-        # k [BLOCK_SIZE, KV, D] → permute(1,2,0) → [KV, D, BLOCK_SIZE] → fp8rt
-        k_perm_ref = _fp8_rt(k_fp16.permute(1, 2, 0))  # [KV, D, BLOCK_SIZE]
-        # mat2 for reference matmul: [KV, 1, D, BLOCK_SIZE]
-        k_ref_4d = k_perm_ref.unsqueeze(1)
+        k_4d_cpu = k_perm_cpu.unsqueeze(1)  # [KV, 1, D, BS]
+        k_dq = _cpu_dequantize(_cpu_quantize(k_4d_cpu, sk_cpu), sk_cpu).float()
 
-        # Q: [1, KV, D] → [KV, 1, 1, D]
-        q_ref_4d = _fp8_rt(q_fp16).reshape(NUM_KV_HEADS, gqa, 1, HEAD_SIZE)
-
-        expected = torch.matmul(q_ref_4d, k_ref_4d).to(torch.float16) * attn_scale
+        expected = (torch.matmul(q_dq, k_dq) * attn_scale).to(torch.float16)
 
         torch.testing.assert_close(result.cpu(), expected, atol=1e-1, rtol=0.0)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 15. Direct-FP8-matmul strategy — full fill-and-decode end-to-end
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestFp8KvCacheQFP8WTDecodeEndToEnd:
+    """Full fill-and-decode pipeline using the direct-FP8-matmul strategy.
+
+    Exercises the complete per-block body in a single compiled graph:
+
+    **Fill (write side)**:
+      1. Permute K ``[BLOCK_SIZE, KV, D]`` → ``[KV, D, BLOCK_SIZE]``.
+      2. Compute a per-tensor ``scale_k`` as the max of per-token scales over
+         the permuted K (via ``quantscalepertokenfp8``).
+      3. Encode K as QFP8WT via ``quantize_weight_fp8_with_scale``.
+      4. Scatter into paged K cache ``[NUM_BLOCKS, KV, D, BLOCK_SIZE]`` via
+         ``index_copy_``; scatter ``scale_k`` into a parallel scale cache.
+      5. Encode V as QFP8CH via ``quantize_fp8_with_scale``; scatter V and
+         its per-token scales into their respective caches.
+
+    **Decode (read side, one block)**:
+      6. Gather K block (QFP8WT EA preserved) and its scale via
+         ``index_select``.
+      7. Compute ``scale_q`` via ``quantscalepertokenfp8`` on fp16 Q; encode
+         Q as QFP8CH via ``quantize_fp8_with_scale``.
+      8. Score: ``spyre.scaled_bmm(Q_fp8, K_fp8wt, out_dtype=fp16)``; apply
+         scale compensation ``scores × scale_q × scale_k × attn_scale``.
+      9. Softmax over the block dimension.
+      10. Gather V block; dequantize to fp16 via
+          ``dequantize_fp8_with_scale``; compute ``probs @ V_fp16``.
+
+    The CPU reference mirrors the same quantize/dequantize round-trips with
+    the same scales so quantization noise cancels and the comparison tests
+    scale compensation correctness end-to-end.
+
+    Requires ``torch.ops.spyre.scaled_bmm`` and the QFP8WT 2D-stick scatter
+    fix in the compiler.
+    """
+
+    def test_fp8_qfp8wt_cache_fill_and_decode(self):
+        """Fill K as QFP8WT + V as QFP8CH at fill time, then decode with scaled_bmm.
+
+        ``spyre.scaled_bmm`` requires identical batch dims across mat1 and mat2
+        (no GQA broadcast).  We use gqa=1 so Q and K share the same leading
+        ``[KV, 1, ...]`` dims, matching ``TestFp8KvCacheWriteQFP8WT``.
+        """
+        gqa = 1  # scaled_bmm does not support GQA broadcast; both mats use [KV, 1, ...]
+        num_heads = NUM_KV_HEADS * gqa  # == NUM_KV_HEADS
+        attn_scale = float(HEAD_SIZE**-0.5)
+
+        k_fp16 = cached_randn(
+            (BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE),
+            dtype=torch.float16,
+            scale=0.5,
+            differentiation="e2e_wt_k",
+        )
+        v_fp16 = cached_randn(
+            (BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE),
+            dtype=torch.float16,
+            scale=0.5,
+            differentiation="e2e_wt_v",
+        )
+        query_fp16 = cached_randn(
+            (1, num_heads, HEAD_SIZE),
+            dtype=torch.float16,
+            scale=0.5,
+            differentiation="e2e_wt_q",
+        )
+
+        block_idx = torch.tensor([0], dtype=torch.int32)
+
+        # K cache: [NUM_BLOCKS, KV, D, BLOCK_SIZE] — QFP8WT [K=D, N=BS].
+        k_cache = torch.zeros(
+            (NUM_BLOCKS, NUM_KV_HEADS, HEAD_SIZE, BLOCK_SIZE),
+            dtype=torch.float8_e4m3fn,
+        )
+        # K scale cache: one per-tensor scalar per block, stored as [NUM_BLOCKS, 1, 1, 1].
+        k_scale_cache = torch.zeros((NUM_BLOCKS, 1, 1, 1), dtype=torch.float16)
+        # V cache: [NUM_BLOCKS, BLOCK_SIZE, KV, D] token-major QFP8CH.
+        v_cache = torch.zeros(
+            (NUM_BLOCKS, BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE),
+            dtype=torch.float8_e4m3fn,
+        )
+        v_scale_cache = torch.zeros(
+            (NUM_BLOCKS, BLOCK_SIZE, NUM_KV_HEADS, 1), dtype=torch.float16
+        )
+
+        k_d = k_fp16.to(DEVICE)
+        v_d = v_fp16.to(DEVICE)
+        q_d = query_fp16.to(DEVICE)
+        block_d = block_idx.to(DEVICE)
+        k_cache_d = k_cache.to(DEVICE)
+        k_scale_cache_d = k_scale_cache.to(DEVICE)
+        v_cache_d = v_cache.to(DEVICE)
+        v_scale_cache_d = v_scale_cache.to(DEVICE)
+
+        def fill_and_decode(k, v, q, block, k_cache, k_sc_cache, v_cache, v_sc_cache):
+            # ── Fill K as QFP8WT ───────────────────────────────────────────────
+            # k [BS, KV, D] → [KV, D, BS]; .contiguous() avoids spurious K-inner
+            # heuristic in _qfp8wt_stl (strides [D,1,KV*D] vs [D*BS,BS,1]).
+            k_perm = k.permute(1, 2, 0).contiguous()  # [KV, D, BS]
+            # Per-tensor scale: max of per-token scales over [KV, D, BS].
+            sk = torch.amax(torch.ops.spyre.quantscalepertokenfp8(k_perm))  # scalar
+            k_fp8 = torch.ops.spyre.quantize_weight_fp8_with_scale(k_perm, sk)
+            # Scatter: unsqueeze(0) → [1, KV, D, BS]; block dim = 0.
+            k_cache.index_copy_(0, block, k_fp8.unsqueeze(0))
+            k_sc_cache.index_copy_(0, block, sk.reshape(1, 1, 1, 1))
+
+            # ── Fill V as QFP8CH ───────────────────────────────────────────────
+            # v [BS, KV, D] → unsqueeze(0) → [1, BS, KV, D]; block dim = 0.
+            v_in = v.unsqueeze(0)
+            sv = torch.ops.spyre.quantscalepertokenfp8(v_in)  # [1, BS, KV, 1]
+            v_fp8 = torch.ops.spyre.quantize_fp8_with_scale(v_in, sv)
+            v_cache.index_copy_(0, block, v_fp8)
+            v_sc_cache.index_copy_(0, block, sv)
+
+            # ── Decode: gather K (QFP8WT EA preserved through index_select) ────
+            k_block = k_cache.index_select(0, block)  # [1, KV, D, BS]
+            sk_block = k_sc_cache.index_select(0, block)  # [1, 1, 1, 1]
+            # Drop leading block dim; insert gqa dim → [KV, 1, D, BS] for bmm.
+            k_4d = k_block.squeeze(0).unsqueeze(1)  # [KV, 1, D, BS]
+
+            # ── Decode: quantize Q ─────────────────────────────────────────────
+            q_4d = q.reshape(NUM_KV_HEADS, gqa, 1, HEAD_SIZE)  # [KV, gqa, 1, D]
+            sq = torch.ops.spyre.quantscalepertokenfp8(q_4d)  # [KV, gqa, 1, 1]
+            q_fp8 = torch.ops.spyre.quantize_fp8_with_scale(q_4d, sq)
+
+            # ── Decode: FP8 Q·Kᵀ + scale compensation ─────────────────────────
+            # Q [KV, gqa, 1, D] × K [KV, 1, D, BS] → [KV, gqa, 1, BS] fp16.
+            scores = torch.ops.spyre.scaled_bmm(q_fp8, k_4d, out_dtype=torch.float16)
+            # sk_block [1,1,1,1] broadcasts over [KV, gqa, 1, BS].
+            scores = scores * sq * sk_block * attn_scale
+            probs = torch.softmax(scores, dim=-1)  # [KV, gqa, 1, BS]
+
+            # ── Decode: gather V (QFP8CH), dequantize, P·V ────────────────────
+            v_block = v_cache.index_select(0, block)  # [1, BS, KV, D]
+            sv_block = v_sc_cache.index_select(0, block)  # [1, BS, KV, 1]
+            v_dq = torch.ops.spyre.dequantize_fp8_with_scale(v_block, sv_block)
+            # [1, BS, KV, D] → squeeze → permute → [KV, 1, BS, D].
+            v_4d = v_dq.squeeze(0).permute(1, 0, 2).unsqueeze(1)
+            out = torch.matmul(probs, v_4d)  # [KV, gqa, 1, D]
+            return out.squeeze(2).reshape(1, num_heads, HEAD_SIZE)
+
+        result = torch.compile(fill_and_decode, dynamic=False)(
+            k_d,
+            v_d,
+            q_d,
+            block_d,
+            k_cache_d,
+            k_scale_cache_d,
+            v_cache_d,
+            v_scale_cache_d,
+        )
+
+        # ── CPU reference ──────────────────────────────────────────────────────
+        # Mirror the same quantize/dequantize round-trips with identical scales.
+
+        # K: permute → per-tensor scale → quantize → dequantize.
+        k_perm_cpu = k_fp16.permute(1, 2, 0).contiguous()  # [KV, D, BS]
+        sk_cpu = _cpu_per_token_scale(k_perm_cpu).amax()  # scalar
+        k_dq = _cpu_dequantize(_cpu_quantize(k_perm_cpu, sk_cpu), sk_cpu).float()
+        k_4d_cpu = k_dq.unsqueeze(1)  # [KV, 1, D, BS]
+
+        # Q: per-token scale → quantize → dequantize.
+        q_4d_cpu = query_fp16.reshape(NUM_KV_HEADS, gqa, 1, HEAD_SIZE)
+        sq_cpu = _cpu_per_token_scale(q_4d_cpu)  # [KV, gqa, 1, 1]
+        q_dq = _cpu_dequantize(_cpu_quantize(q_4d_cpu, sq_cpu), sq_cpu).float()
+
+        sc_ref = torch.matmul(q_dq, k_4d_cpu) * attn_scale  # [KV, gqa, 1, BS]
+        pr_ref = torch.softmax(sc_ref.to(torch.float16), dim=-1)
+
+        # V: per-token scale → quantize → dequantize.
+        v_in_cpu = v_fp16.unsqueeze(0)  # [1, BS, KV, D]
+        sv_cpu = _cpu_per_token_scale(v_in_cpu)  # [1, BS, KV, 1]
+        v_dq_cpu = _cpu_dequantize(_cpu_quantize(v_in_cpu, sv_cpu), sv_cpu).float()
+        v_4d_cpu = v_dq_cpu.squeeze(0).permute(1, 0, 2).unsqueeze(1)  # [KV, 1, BS, D]
+
+        out_ref = torch.matmul(pr_ref.to(torch.float32), v_4d_cpu)
+        expected = out_ref.squeeze(2).reshape(1, num_heads, HEAD_SIZE).to(torch.float16)
+
+        # atol=2e-1: the full fill+score+softmax+P·V pipeline accumulates
+        # rounding error across two fp16 matmuls and FP8 quantization noise.
+        torch.testing.assert_close(result.cpu(), expected, atol=2e-1, rtol=0.0)
