@@ -514,9 +514,22 @@ def _get_padded_iteration_space(
         for dim in d_order:
             if dim not in stick_dim_order:
                 continue
-            effective_stick_size = (
-                stick_size[0] if len(stick_size) == 1 else stick_size[0] * stick_size[1]
-            )
+            if len(stick_size) == 1:
+                # 1D stick: round this dim up to the single stick granularity.
+                effective_stick_size = stick_size[0]
+            else:
+                # 2D stick (QFP8WT [2, 64]): each stick dimension carries its own
+                # independent granularity.  Round the outer stick dim up to
+                # stick_size[0] and the inner (last) stick dim up to stick_size[-1].
+                # Using the product (stick_size[0]*stick_size[1]=128) for both dims
+                # would over-pad the inner dim (N=1 → 128 instead of 64).
+                stick_idx = stick_dim_order.index(dim)
+                if stick_idx < len(stick_dim_order) - 1:
+                    # Outer stick dim: granularity = stick_size[outer]
+                    effective_stick_size = stick_size[stick_idx]
+                else:
+                    # Inner (innermost) stick dim: granularity = stick_size[inner]
+                    effective_stick_size = stick_size[-1]
             unaligned = sdsc_iteration_space[dim] % effective_stick_size
             if unaligned > 0:
                 sdsc_iteration_space[dim] += effective_stick_size - unaligned
@@ -1254,6 +1267,41 @@ def _create_sdsc_tensors(
     missing_dim = None
     sdsc_args: list[SDSCArgs] = []
     matmul_n_dim = injected_dims.get("matmul_n_dim")
+    # Labels of the two physical 2D-stick dims for QFP8WT tensors: the outer
+    # stick (K-dim fold, si=2) and the inner stick (N-dim, so=64).
+    #
+    # For batchmatmulfp8 ([..., N, K]): the last 2 iteration-space symbols are
+    # N and K, which are the correct 2D-stick pair.
+    #
+    # For qfp8wt ([..., K, N]) and batchmatmulfp8 KERNEL: the 2D-stick pair is
+    # {k_sym, n_sym} — K is the second-to-last host dim and N is the last.
+    # The last-2 iteration-space symbols (_orig_kn) are [K, N] for all ranks of
+    # standalone qfp8wt (outer batch dims appear earlier in the iteration space).
+    #
+    # When N=1 is injected by the matmul N=1 path (matmul_n_dim is set), the
+    # original iteration space has only K and batch dims; replace the outermost
+    # of the last-2 with the injected N so that kn_pair identifies [K, matmul_n_dim].
+    _orig_kn = [symbol_mapping.get(s, s) for s in list(op_spec.iteration_space)[-2:]]
+    if matmul_n_dim is not None and len(_orig_kn) == 2:
+        # _orig_kn[-1] is K (innermost, the reduction var); _orig_kn[-2] is the
+        # outermost non-N dim (batch or spurious).  Replace it with matmul_n_dim.
+        qfp8wt_kn_labels = {_orig_kn[-1], matmul_n_dim}
+    elif op_spec.op == "qfp8wt":
+        # For standalone qfp8wt on [..., K, N], the 2D-stick pair is always
+        # {k_sym, n_sym}: K is the second-to-last host dim and N is the last
+        # (stick) dim.  The last-2 iteration-space symbols (_orig_kn) are
+        # exactly [K, N] regardless of batch rank — the outer batch dims
+        # (KV, gqa, …) appear earlier in the iteration space.
+        #
+        # The previous device-coordinate backward scan was wrong for ranks ≥ 3:
+        # scanning _in_coords right-to-left on [k, n//64, kv, n%64] finds kv
+        # (the KV batch dim) as the companion before reaching k (the K dim),
+        # producing qfp8wt_kn_labels = {n, kv} instead of {k, n}.  That made
+        # the SDSC emit stickDimOrder_=[KV, N] instead of [K, N], so the hardware
+        # qfp8wt kernel read the wrong elements from the 2D-stick layout.
+        qfp8wt_kn_labels = set(_orig_kn)
+    else:
+        qfp8wt_kn_labels = set(_orig_kn)
 
     for i, arg in enumerate(op_spec.args):
         # Step 1: Determine dimension order and stick dimension.
@@ -1264,6 +1312,24 @@ def _create_sdsc_tensors(
             dim_order, stick_dim = _get_device_dim_order(
                 arg, symbol_mapping, op_spec, tensor_position=i
             )
+
+        # For qfp8wt, drop unit (size-1) iteration dims that are NOT part of
+        # the 2D-stick pair (K and N).  Such dims arise from trailing N=1 dims
+        # in 4D inputs [KV, gqa, K, N=1]: the Inductor IR keeps gqa=1 in the
+        # iteration space, but the hardware qfp8wt kernel only understands the
+        # [K, N] layout.  Having an extra size-1 loop in the SDSC tensor layout
+        # causes the hardware scheduler to reject the DSC with "Expect valid
+        # lower and upper bound parameters".
+        if op_spec.op == "qfp8wt":
+            _qfp8wt_keep = lambda d: (
+                d in qfp8wt_kn_labels or iteration_space.get(d, 1) != 1
+            )
+            dim_order = [d for d in dim_order if _qfp8wt_keep(d)]
+            # Also filter op_dim_order so that dropped unit dims are not re-added
+            # as reduced_dims (line ~1423).  op_dim_order is shared across all
+            # arg iterations; update it once on the first arg pass.
+            if i == 0:
+                op_dim_order = [d for d in op_dim_order if _qfp8wt_keep(d)]
 
         if is_matmul and i == 0 and len(op_spec.args) >= 3 and matmul_n_dim is None:
             matmul_x_reuse_dims = _matmul_reuse_dims(op_spec, symbol_mapping, dim_order)
@@ -1582,7 +1648,19 @@ def _create_sdsc_tensors(
                 # iteration extent. Emitting a backGap for a conv op double-counts
                 # that gap and corrupts the generated addressing.
                 #
-                if not _is_conv(op_spec.op) and dev_dim_size > it_dim_size:
+                # For qfp8wt, unit (size-1) non-stick iteration dims (e.g. N=1)
+                # that arise from trailing dims in [KV, gqa, K, N=1] shapes must
+                # NOT get a backGap.  The hardware scheduler rejects a backGap of
+                # (dev_dim_size - 1) on a size-1 loop, reporting "Expect valid
+                # lower and upper bound parameters" (L3DlOpsScheduler.cpp:1489).
+                # N=0 is always the only access, so no backGap compensation is
+                # needed.
+                is_qfp8wt_unit_non_stick = (
+                    op_spec.op == "qfp8wt"
+                    and it_dim_size == 1
+                    and dim not in qfp8wt_kn_labels
+                )
+                if not _is_conv(op_spec.op) and not is_qfp8wt_unit_non_stick and dev_dim_size > it_dim_size:
                     backGap[dim] = dev_dim_size - it_dim_size
                 # Overlapping views can iterate beyond an aligned physical
                 # axis (e.g. unfold's window is wider than its step). Core
@@ -1644,23 +1722,57 @@ def _create_sdsc_tensors(
             offsets[matmul_n_dim] = 0
             max_dim_sizes[matmul_n_dim] = -1
 
-        effective_stick = [op_stick_dim if stick_dim is None else stick_dim]
+        real_stick = op_stick_dim if stick_dim is None else stick_dim
+        effective_stick = [real_stick]
         layout_labels = _get_tensor_layout_labels(use_op_dims, op_spec.op)
 
         # Special handling for QFP8WT KERNEL tensors.
         # Both qfp8wt (weight quantization) and batchmatmulfp8 (the consumer) require
         # a 2D stick [2, stick_size/2]. fp8todl16 also carries a QFP8WT-arranged
         # tensor as input but uses a 1D flat FP8 input.
+        # Scatter ops (index_copy_) are lowered as IDENTITY_OP with indirect access;
+        # emit 2D-stick HBM layout for their output (scatter destination) when it
+        # carries QFP8WT EA.
         dtype_stick_size = arg.device_dtype.elems_per_stick()
         layout_stick_size = [dtype_stick_size]
-        if arg.element_arrangement == ElementArrangement.QFP8WT and op_spec.op in (
-            "batchmatmulfp8",
-            "qfp8wt",
+        # Scatter ops writing QFP8WT data: both the source (is_input=True) and
+        # destination (is_input=False) tensors must use 2D-stick HBM layout so
+        # that the read addressing of the source and the write addressing of the
+        # destination both treat pairs of K-elements as one 2-element outer stick
+        # dimension ([2, stick_size/2]).  Restricting to not arg.is_input would
+        # let the source be registered with a 1D-stick layout, which then wins
+        # the OUTPUT-label race in get_indirect_layout_label and prevents the
+        # destination from recording its correct 2D-stick size.
+        is_qfp8wt_scatter_dst = (
+            arg.element_arrangement == ElementArrangement.QFP8WT
+            and op_spec.op == IDENTITY_OP
+            and has_indirect_access
+        )
+        if (
+            arg.element_arrangement == ElementArrangement.QFP8WT
+            and op_spec.op
+            in (
+                "batchmatmulfp8",
+                "qfp8wt",
+            )
+            or is_qfp8wt_scatter_dst
         ):
             # FP8 KERNEL needs 2D stick: [2, stick_size/2]
             layout_stick_size = [2, dtype_stick_size // 2]
-            # Use the last two dimensions from dim_order for 2D stick
-            effective_stick = dim_order[-2:]
+            # The 2D stick packs 2 values of the weight's K dim against 64 of
+            # its N (stick) dim, so stickDimOrder_ is [K, N] with the real
+            # stick dim last. Slicing dim_order[-2:] only yields that for a
+            # rank-2 weight; once the weight has batch dims they land in
+            # dim_order too (e.g. [in, x, out], or [mb, out, y, x] for qfp8wt)
+            # and the slice names a batch dim instead of K or N.
+            kn_pair = [d for d in dim_order if d in qfp8wt_kn_labels]
+            if len(kn_pair) == 2 and real_stick in kn_pair:
+                companion = next(d for d in kn_pair if d != real_stick)
+                effective_stick = [companion, real_stick]
+            else:
+                # K/N not both present (e.g. a rank-1 weight): keep the
+                # positional behaviour.
+                effective_stick = dim_order[-2:]
 
         if has_indirect_access:
             label = get_indirect_layout_label(
@@ -1842,22 +1954,30 @@ def _extend_matmul_k_to_padded(
     y_arg = op_spec.args[1]
     out_arg = op_spec.args[-1]
 
-    # Collect non-stick symbols in y's device_coordinates (after symbol_mapping).
+    # Collect all symbols in y's device_coordinates (after symbol_mapping).
     y_dim_order, y_stick_dim = _get_device_dim_order(y_arg, symbol_mapping)
-    # y_stick_dim is the within-stick symbol; the remaining dims include K.
-    y_non_stick_syms: set = set(y_dim_order) - ({y_stick_dim} if y_stick_dim else set())
+
+    # For QFP8WT weights the inner stick IS the K (reduction) dimension: the 2D
+    # stick is [outer_fold, K_inner] and the device coordinate's free symbol on
+    # the stick position is K.  The standard non-stick exclusion would remove K
+    # from the candidate set, so we include the stick dim for QFP8WT.
+    if y_arg.element_arrangement == ElementArrangement.QFP8WT:
+        y_candidate_syms: set = set(y_dim_order)
+    else:
+        # Standard matmul: K is a non-stick outer dim; exclude the stick sym.
+        y_candidate_syms = set(y_dim_order) - ({y_stick_dim} if y_stick_dim else set())
 
     # Collect all symbols in the output's device_coordinates.
     out_dim_order, _ = _get_device_dim_order(out_arg, symbol_mapping)
     out_syms: set = set(out_dim_order)
 
     # K is in y but not in the output (it's reduced).
-    k_candidates = y_non_stick_syms - out_syms
+    k_candidates = y_candidate_syms - out_syms
     if not k_candidates:
         logger.warning(
             "_extend_matmul_k_to_padded: could not identify K symbol "
-            "(y_non_stick=%s, out_syms=%s), skipping",
-            y_non_stick_syms,
+            "(y_candidates=%s, out_syms=%s), skipping",
+            y_candidate_syms,
             out_syms,
         )
         return
@@ -2112,7 +2232,6 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         symbol_mapping[sym]: _resolve_sdsc_size(size, op_spec.symbolic_dim_bounds)
         for sym, (size, _) in op_spec.iteration_space.items()
     }
-
     # Build the SDSC dim name -> (pytorch_sym_name, granularity, max_val) map
     # for any iteration-space dims.
     # This drives symbolicDimInfo_ and dimToSymbolMapping_ in the generated JSON.
@@ -2155,10 +2274,50 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     ref_arg = _ref_arg(op_spec)
     op_dim_order, op_stick_dim = _get_device_dim_order(ref_arg, symbol_mapping)
 
-    # A dtype conversion that changes the elements per stick (DL16TOFP32,
-    # FP32TODL16, FP8TODL16, qfp8ch, qfp8wt) requires at least one outer spatial
-    # dim beyond the stick; inject a virtual mb=1 row when the op's tensor has
-    # only the stick dim.
+    # For qfp8wt, the output tensor may have a constant last device coordinate
+    # (op_stick_dim=None) when the trailing N=1 dim is appended after K (e.g.
+    # for a 4D input [KV, gqa, K, N=1]).  Two corrections are needed:
+    #
+    # 1. Set op_stick_dim from the INPUT arg's last (K-inner) coordinate so the
+    #    stick-injection block below does not add a spurious free dim, and
+    #    _create_sdsc_tensors can form the correct 2D-stick pair [KV, K].
+    #
+    # 2. Drop any unit (size-1) dims from sdsc_iteration_space / dim_splits /
+    #    work_slices that are NOT in the 2D-stick pair.  They appear in N_
+    #    (SDSC's iteration-space descriptor) but not in layoutDimOrder_, causing
+    #    the hardware scheduler to iterate over a phantom dimension and produce
+    #    wrong results.  _create_sdsc_tensors independently filters them from
+    #    each arg's dim_order (and from op_dim_order) so no KeyError can arise.
+    if op_spec.op == "qfp8wt" and op_stick_dim is None and len(op_spec.args) >= 1:
+        in_last = op_spec.args[0].device_coordinates[-1].subs(symbol_mapping)
+        in_free = sorted(in_last.free_symbols, key=str)
+        if in_free:
+            op_stick_dim = in_free[0]
+        # Identify the 2D-stick pair (K inner + KV companion) from input coords.
+        _in_coords_m = [
+            c.subs(symbol_mapping) for c in op_spec.args[0].device_coordinates
+        ]
+        _k_sym = op_stick_dim
+        _kv_sym = None
+        for _c in reversed(_in_coords_m[:-1]):
+            _cf = sorted(_c.free_symbols, key=str)
+            if len(_cf) == 1 and _cf[0] != _k_sym:
+                _kv_sym = _cf[0]
+                break
+        _qfp8wt_stick_pair = {v for v in (_k_sym, _kv_sym) if v is not None}
+        # Drop unit dims that are not in the stick pair.
+        for _dim in [
+            dim
+            for dim, sz in list(sdsc_iteration_space.items())
+            if sz == 1 and dim not in _qfp8wt_stick_pair
+        ]:
+            del sdsc_iteration_space[_dim]
+            dim_splits.pop(_dim, None)
+            work_slices.pop(_dim, None)
+
+    # On-device type-conversion ops (DL16TOFP32/FP32TODL16, not identity)
+    # require at least one outer spatial dim beyond the stick; inject a
+    # virtual mb=1 row when the op's tensor has only the stick dim.
     # op_dim_order is empty for a degenerate stick dim, which has no loop symbol.
     changes_stick_width = len(op_spec.args) == 2 and (
         op_spec.args[0].device_dtype.elems_per_stick()
@@ -2357,6 +2516,11 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
                 injected_dims["topk_missing_dim"] = topk_missing_dim
 
     # For matmul N=1: inject N dimension into iteration space so y and output have it.
+    # Detection: the output's stick coordinate is constant (0) because N collapsed
+    # to size 1 — no N loop variable appears in the output's device_coordinates.
+    # For QFP8WT weight inputs a restickify may have transformed y's sparse stick
+    # to a tiled form (y_stick_coord != 0), so checking y alone is unreliable.
+    # Checking the output is always safe: a sparse output stick reliably signals N=1.
     if is_matmul:
         y_arg = op_spec.args[1]
         out_arg = op_spec.args[-1]
@@ -2368,7 +2532,15 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             if len(out_arg.device_coordinates) > 0
             else None
         )
-        if y_stick_coord == 0 and out_stick_coord == 0:
+        # Inject N=1 when the output's stick coordinate is constant (0):
+        # N collapsed to size 1 so there is no N loop variable in the output's
+        # device_coordinates.  For STANDARD weights the original condition also
+        # required y_stick_coord == 0; for QFP8WT weights a restickify may have
+        # made y's stick non-zero even when N was never an iteration dimension,
+        # so we rely on the output signal alone when y carries QFP8WT EA.
+        y_is_qfp8wt = y_arg.element_arrangement == ElementArrangement.QFP8WT
+        n_is_one = out_stick_coord == 0 and (y_stick_coord == 0 or y_is_qfp8wt)
+        if n_is_one:
             idx = len(sdsc_iteration_space)
             if idx < len(INPUT_DIM_LABELS):
                 n_dim_label = INPUT_DIM_LABELS[idx]

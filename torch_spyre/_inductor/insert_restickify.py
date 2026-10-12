@@ -20,16 +20,7 @@ from dataclasses import dataclass
 from typing import cast
 
 import sympy
-
 import torch
-
-from .constants import ELIDED_COPY_BACK_ATTR
-from .errors import Unsupported
-from .ir import FixedTiledLayout, SpyreEmptyFallback
-from .loop_info import ReadCopyElisionRecord
-from .optimize_restickify import AnyInNode, EdgeCostMap
-from .logging_utils import get_inductor_logger
-from .pass_utils import patch_env
 from torch._inductor.dependencies import MemoryDep, index_vars_squeeze
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
@@ -46,12 +37,19 @@ from torch._inductor.ir import (
     StorageBox,
     TensorBox,
 )
-from torch_spyre._C import SpyreTensorLayout
-from torch._inductor.virtualized import V
 from torch._inductor.ops_handler import WrapperHandler
-
+from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 
+from torch_spyre._C import SpyreTensorLayout
+
+from .constants import ELIDED_COPY_BACK_ATTR
+from .errors import Unsupported
+from .ir import FixedTiledLayout, SpyreEmptyFallback
+from .logging_utils import get_inductor_logger
+from .loop_info import ReadCopyElisionRecord
+from .optimize_restickify import AnyInNode, EdgeCostMap
+from .pass_utils import patch_env
 
 logger = get_inductor_logger("insert_restickify")
 
@@ -755,6 +753,13 @@ def finalize_layouts(graph: GraphLowering) -> None:
             restick_target = _fixed_tiled(in_layout, restick_stl)
             occurrence = edge_occurrences.get(key, 0)
             edge_occurrences[key] = occurrence + 1
+            import sys
+
+            print(
+                f"[DBG_RESTICK] op={op.get_name()} input={edge.dep.name} in_stl EA={in_stl.element_arrangement} in_size={list(in_stl.device_size)} -> target EA={target_stl.element_arrangement} target_size={list(target_stl.device_size)} restick_size={list(restick_stl.device_size)}",
+                file=sys.stderr,
+                flush=True,
+            )
             logger.info(
                 f"Injecting restickify on {op.get_name()} input {edge.dep.name}: "
                 f"{list(in_stl.stride_map)} -> {list(target_stl.stride_map)}"
