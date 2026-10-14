@@ -842,13 +842,12 @@ def _qfp8wt_unsplittable_coords(td: "TensorDep") -> list[Expr]:
     The batch dims are returned too. Splitting one gives wrong results on
     device: with a [2, 12, 128, 128] weight written by qfp8wt in 12 head slices
     and read by batchmatmulfp8 in 4, only the first head of each read slice is
-    correct, while the same graph on one core is exact.
-    TODO: lift this once the per-core addressing of a batched QFP8WT tensor is
-    understood.
+    correct, while the same graph on one core is exact. Per-core addressing is
+    handled by adjusting the strides to reflect the 2D stick layout, so all
+    host coordinates (batch + K) must remain unsplit.
     """
     if len(td.layout.size) <= 2:
         return [td.device_coords[-2]]
-    # return host_coordinates(td.layout, td.dep, None)[:-1]
     return host_coordinates(td.layout, td.dep, None)
 
 

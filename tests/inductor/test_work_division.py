@@ -1891,9 +1891,7 @@ class TestQfp8wtConstraints(unittest.TestCase):
         )
         ctx = _make_context(op, output_td, it_space={b: 2, h: 12, k: 128, n: 128})
         result = qfp8wt_split_domains(ctx)
-        # K and both batch dims are pinned; N, the stick dim, stays splittable.
         self.assertEqual(
-            # result.allowed_splits, {v: frozenset({1}) for v in (b, h, k)}
             result.allowed_splits,
             {v: frozenset({1}) for v in (b, h, k, n)},
         )

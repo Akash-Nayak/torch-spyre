@@ -422,6 +422,8 @@ def lower_scaled_mm(
 def lower_scaled_bmm(
     mat1,
     mat2,
+    scale_a=None,
+    scale_b=None,
     out_dtype=None,
 ):
     # FP8 batched matmul: the FP8 dtype checks and BATCH_MATMUL_FP8_OP reduction
@@ -499,6 +501,13 @@ def lower_scaled_bmm(
             f"mat1_dtype={mat1_dtype}, mat2_dtype={mat2_dtype}, "
             f"out_dtype={output_dtype}"
         )
+
+    if scale_a is not None:
+        result = lowering.mul(result, scale_a)
+        result.realize()
+    if scale_b is not None:
+        result = lowering.mul(result, scale_b)
+        result.realize()
 
     return result
 
