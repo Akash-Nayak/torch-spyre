@@ -1237,11 +1237,6 @@ def _create_sdsc_tensors(
     missing_dim = None
     sdsc_args: list[SDSCArgs] = []
     matmul_n_dim = injected_dims.get("matmul_n_dim")
-    # Labels of the two innermost iteration dims: a QFP8WT weight's K and N,
-    # whether the op is qfp8wt ([..., K, N]) or batchmatmulfp8 ([..., N, K]).
-    qfp8wt_kn_labels = {
-        symbol_mapping.get(s, s) for s in list(op_spec.iteration_space)[-2:]
-    }
 
     for i, arg in enumerate(op_spec.args):
         # Step 1: Determine dimension order and stick dimension.
@@ -1590,16 +1585,17 @@ def _create_sdsc_tensors(
             layout_stick_size = [2, dtype_stick_size // 2]
             # The 2D stick packs 2 values of the weight's K dim against 64 of
             # its N (stick) dim, so stickDimOrder_ is [K, N] with the real
-            # stick dim last. Slicing dim_order[-2:] only yields that for a
-            # rank-2 weight; once the weight has batch dims they land in
-            # dim_order too (e.g. [in, x, out], or [mb, out, y, x] for qfp8wt)
-            # and the slice names a batch dim instead of K or N.
-            kn_pair = [d for d in dim_order if d in qfp8wt_kn_labels]
-            if len(kn_pair) == 2 and real_stick in kn_pair:
-                companion = next(d for d in kn_pair if d != real_stick)
+            # stick dim last. K comes from the host layout (arg.qfp8wt_k_dim),
+            # since neither dim_order nor the iteration space identifies it:
+            # a batch dim can sit where K would be, and a view can reorder the
+            # iteration space.
+            companion = None
+            if arg.qfp8wt_k_dim is not None:
+                companion = symbol_mapping.get(arg.qfp8wt_k_dim, arg.qfp8wt_k_dim)
+            if companion is not None and companion in dim_order:
                 effective_stick = [companion, real_stick]
             else:
-                # K/N not both present (e.g. a rank-1 weight): keep the
+                # K not identifiable (e.g. a rank-1 weight): keep the
                 # positional behaviour.
                 effective_stick = dim_order[-2:]
 
