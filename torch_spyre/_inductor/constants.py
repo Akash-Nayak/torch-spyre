@@ -21,6 +21,7 @@ IDENTITY_OP = "identity"
 RESTICKIFY_OP = "ReStickifyOpHBM"
 DEPTHWISE_CONV2D_OP = "depthwiseconv2dnative"
 BATCH_MATMUL_FP8_OP = "batchmatmulfp8"
+QFP8WT_OP = "qfp8wt"
 KEEP_BY_INDEX_OP = "keepbyindex"
 MATMUL_REDUCTION_OPS = frozenset({BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP})
 

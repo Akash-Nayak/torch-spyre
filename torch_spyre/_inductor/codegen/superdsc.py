@@ -1237,11 +1237,30 @@ def _create_sdsc_tensors(
     missing_dim = None
     sdsc_args: list[SDSCArgs] = []
     matmul_n_dim = injected_dims.get("matmul_n_dim")
-    # Labels of the two innermost iteration dims: a QFP8WT weight's K and N,
-    # whether the op is qfp8wt ([..., K, N]) or batchmatmulfp8 ([..., N, K]).
-    qfp8wt_kn_labels = {
-        symbol_mapping.get(s, s) for s in list(op_spec.iteration_space)[-2:]
-    }
+    # K and N labels for the QFP8WT weight (args[1] for both qfp8wt and
+    # batchmatmulfp8), used below to build effective_stick = [K, N].
+    #
+    # create_op_spec (spyre_kernel.py) stamps integer indices into op_info:
+    #   - batchmatmulfp8 (Reduction): K is the last key (reduction dim),
+    #     N is second-to-last (last output dim).
+    #   - qfp8wt (Pointwise on W[..., K, N]): K is second-to-last, N is last,
+    #     per the op's API contract that the weight's innermost dim is N.
+    # Indices (not sympy symbols) are stored so _serialize_value can emit them
+    # as plain ints without hitting the ShapeEnv for unbacked sizing symbols.
+    _it_keys = list(op_spec.iteration_space)
+    _k_idx = op_spec.op_info.get("qfp8wt_k_idx")
+    _n_idx = op_spec.op_info.get("qfp8wt_n_idx")
+    if _k_idx is not None and _n_idx is not None:
+        _k_sym = _it_keys[_k_idx]
+        _n_sym = _it_keys[_n_idx]
+        qfp8wt_kn_labels = {
+            symbol_mapping.get(_k_sym, _k_sym),
+            symbol_mapping.get(_n_sym, _n_sym),
+        }
+    else:
+        # op_info not stamped (op is neither qfp8wt nor batchmatmulfp8, or
+        # the weight has fewer than 2 dims — degenerate case).
+        qfp8wt_kn_labels = set()
 
     for i, arg in enumerate(op_spec.args):
         # Step 1: Determine dimension order and stick dimension.

@@ -40,11 +40,13 @@ from torch._inductor.virtualized import V
 from .constants import (
     SPYRE_FP32_OPS,
     SPYRE_INT32_OPS,
+    BATCH_MATMUL_FP8_OP,
     CONV_OPS,
     DEPTHWISE_CONV_REDUCTION_OPS,
     IDENTITY_OP,
     MATMUL_REDUCTION_OPS,
     POOL_OPS,
+    QFP8WT_OP,
     RESTICKIFY_OP,
     SEGMENT_OFFSETS,
     TWO_INPUT_REDUCTION_OPS,
@@ -1071,6 +1073,36 @@ class SpyreKernel(Kernel[CSEVariable]):
             raise RuntimeError("LX relayout marker has no matching registered plan")
         if relayout_plans:
             op_info = {**op_info, LX_RELAYOUT_INFO_KEY: True}
+
+        # Stamp K and N indices into op_info so that _create_sdsc_tensors can
+        # select the correct kn_pair when building stickDimOrder_ = [K, N] for
+        # QFP8WT KERNEL tensors.  Indices (plain ints into list(it_space)) are
+        # stored rather than sympy symbols so _serialize_value can emit them
+        # without hitting the ShapeEnv for unbacked sizing symbols.
+        #
+        # batchmatmulfp8 (Reduction): lower_scaled_bmm passes K via
+        #   reduction_ranges (not ranges), so Inductor always appends K last in
+        #   iteration_space after the output dims.  This is a structural invariant
+        #   of Reduction.create, not a positional coincidence.
+        #
+        # qfp8wt (Pointwise): the QFP8WT API contract requires the weight to be
+        #   [..., K, N], so N is always the last iteration-space key.
+        if op == BATCH_MATMUL_FP8_OP and len(it_space) >= 2:
+            n = len(it_space)
+            # Reduction: K is last (reduction dim), N is second-to-last.
+            op_info = {
+                **op_info,
+                "qfp8wt_k_idx": n - 1,
+                "qfp8wt_n_idx": n - 2,
+            }
+        elif op == QFP8WT_OP and len(it_space) >= 2:
+            n = len(it_space)
+            # Pointwise: N is last (API contract), K is second-to-last.
+            op_info = {
+                **op_info,
+                "qfp8wt_k_idx": n - 2,
+                "qfp8wt_n_idx": n - 1,
+            }
 
         op_spec = OpSpec(
             op,
