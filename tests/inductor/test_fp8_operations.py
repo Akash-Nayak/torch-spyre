@@ -755,6 +755,7 @@ class TestQFP8WTKNLabels:
         QFP8WT API contract that the weight is always [..., K, N].
         """
         from indirect_access_common import capture_op_specs, flatten_op_specs
+
         from torch_spyre._inductor.constants import QFP8WT_OP
 
         w = torch.randn(shape, dtype=torch.float16, device="spyre")
@@ -827,10 +828,14 @@ class TestQFP8WTKNLabels:
         captured_effective_sticks: list = []
         orig_get_layout_label = _superdsc._get_layout_label
 
-        def spy_get_layout_label(layouts, dim_order, stick_dim_order, stick_size, layout_labels):
+        def spy_get_layout_label(
+            layouts, dim_order, stick_dim_order, stick_size, layout_labels
+        ):
             if len(stick_size) == 2:  # QFP8WT 2D-stick call only
                 captured_effective_sticks.append(list(stick_dim_order))
-            return orig_get_layout_label(layouts, dim_order, stick_dim_order, stick_size, layout_labels)
+            return orig_get_layout_label(
+                layouts, dim_order, stick_dim_order, stick_size, layout_labels
+            )
 
         w = torch.randn(shape, dtype=torch.float16, device="spyre")
         scale = torch.tensor([1.0], dtype=torch.float16, device="spyre")
@@ -879,6 +884,7 @@ class TestQFP8WTKNLabels:
         ranges), and Inductor appends those after the output ranges.
         """
         from indirect_access_common import capture_op_specs, flatten_op_specs
+
         from torch_spyre._inductor.constants import BATCH_MATMUL_FP8_OP
 
         a = torch.randn(mat1_shape, dtype=torch.float16, device="spyre")
@@ -927,7 +933,6 @@ class TestQFP8WTKNLabels:
             f"N idx {n_idx} is not n_dims-2={n_dims - 2} "
             f"for shapes {mat1_shape}x{mat2_shape} (iteration_space length {n_dims})"
         )
-
 
 
 # Test utilities for FP8 operations
