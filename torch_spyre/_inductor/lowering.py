@@ -418,8 +418,8 @@ def lower_scaled_mm(
     return result
 
 
-@register_spyre_lowering(torch.ops.spyre.scaled_bmm.default)
-def lower_scaled_bmm(
+@register_spyre_lowering(torch.ops.spyre.bmm_fp8.default)
+def lower_bmm_fp8(
     mat1,
     mat2,
     out_dtype=None,
@@ -458,7 +458,7 @@ def lower_scaled_bmm(
         )
     ):
         raise Unsupported(
-            f"scaled_bmm with shapes {mat1_size} and {mat2_size} not supported"
+            f"bmm_fp8 with shapes {mat1_size} and {mat2_size} not supported"
         )
 
     output_dtype = out_dtype if out_dtype is not None else torch.float16
@@ -493,7 +493,7 @@ def lower_scaled_bmm(
     if logger.isEnabledFor(logging.DEBUG):
         result_buf = V.graph.get_buffer(result.get_name())
         logger.debug(
-            f"scaled_bmm: mat1{[int(s) for s in mat1_size]} @ "
+            f"bmm_fp8: mat1{[int(s) for s in mat1_size]} @ "
             f"mat2{[int(s) for s in mat2_size]} "
             f"-> {[int(s) for s in result_buf.get_size()]}, "
             f"mat1_dtype={mat1_dtype}, mat2_dtype={mat2_dtype}, "

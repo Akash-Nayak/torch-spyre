@@ -564,16 +564,35 @@ _SCALED_BMM_SHAPES = {
     "4d_granite_qk_1x32x512x128x512": ((1, 32, 512, 128), (1, 32, 128, 512)),
 }
 
-# Scales are applied outside the op (as for spyre.scaled_mm), so stay at 1.0.
-SCALED_BMM_TESTS = {
-    key: (
+# spyre.scaled_bmm applies the scales itself (scaled_bmm_decomp), so every
+# shape runs with unit scales and one representative shape additionally runs
+# the non-unit combinations -- without those, a decomposition that dropped the
+# scales entirely would still pass every case.
+_SCALED_BMM_SCALED_SHAPE = "4d_2x12x128x128x128"
+_SCALED_BMM_SCALES = [(2.0, 1.0), (1.0, 3.0), (2.0, 3.0)]
+
+
+def _scaled_bmm_case(mat1_shape, mat2_shape, scale_a=1.0, scale_b=1.0):
+    return (
         torch.rand(mat1_shape, dtype=torch.float16),
         torch.rand(mat2_shape, dtype=torch.float16),
-        torch.tensor(1.0, dtype=torch.float16),
-        torch.tensor(1.0, dtype=torch.float16),
+        torch.tensor(scale_a, dtype=torch.float16),
+        torch.tensor(scale_b, dtype=torch.float16),
     )
+
+
+SCALED_BMM_TESTS = {
+    key: _scaled_bmm_case(mat1_shape, mat2_shape)
     for key, (mat1_shape, mat2_shape) in _SCALED_BMM_SHAPES.items()
 }
+SCALED_BMM_TESTS.update(
+    {
+        f"{_SCALED_BMM_SCALED_SHAPE}_{sa}_{sb}": _scaled_bmm_case(
+            *_SCALED_BMM_SHAPES[_SCALED_BMM_SCALED_SHAPE], sa, sb
+        )
+        for sa, sb in _SCALED_BMM_SCALES
+    }
+)
 FP32_EPS = torch.finfo(torch.float32).eps  # 1.1920928955078125e-07
 FP16_EPS = torch.finfo(torch.float16).eps  # 0.0009765625
 
@@ -9879,8 +9898,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         def spyre_fn(a, b, scale_a, scale_b):
             q_a = torch.ops.spyre.quantize_fp8_with_scale(a, scale_a)
             q_b = torch.ops.spyre.quantize_weight_fp8_with_scale(b, scale_b)
-            out = torch.ops.spyre.scaled_bmm(q_a, q_b, out_dtype=torch.float16)
-            return out * (scale_a * scale_b)
+            return torch.ops.spyre.scaled_bmm(
+                q_a,
+                q_b,
+                scale_a=scale_a,
+                scale_b=scale_b,
+                out_dtype=torch.float16,
+            )
 
         def pytorch_fn(a, b, scale_a, scale_b):
             q_a = (

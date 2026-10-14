@@ -832,23 +832,18 @@ def has_staggered_ea_tensor(tds: "list[TensorDep]") -> bool:
 
 
 def _qfp8wt_unsplittable_coords(td: "TensorDep") -> list[Expr]:
-    """Coordinates of a QFP8WT tensor whose iteration vars must stay unsplit.
-
-    For a rank-2 weight [K, N] this is device coordinate -2: K, the second dim
-    of the 2D stick. Once the weight has batch dims ([..., K, N]) the generic
-    stick layout puts a batch dim at that position instead, so K is read off
-    the host coordinates.
-
-    The batch dims are returned too. Splitting one gives wrong results on
+    """The batch dims are returned too. Splitting one gives wrong results on
     device: with a [2, 12, 128, 128] weight written by qfp8wt in 12 head slices
     and read by batchmatmulfp8 in 4, only the first head of each read slice is
     correct, while the same graph on one core is exact.
-    TODO: lift this once the per-core addressing of a batched QFP8WT tensor is
-    understood.
+
+    TODO: this pin is a workaround. The fix is to adjust the strides to reflect
+    the 2D stick layout, which is not currently represented in the tensor's
+    device_size; that would make the per-core addressing correct and let the
+    pin be dropped.
     """
     if len(td.layout.size) <= 2:
         return [td.device_coords[-2]]
-    # return host_coordinates(td.layout, td.dep, None)[:-1]
     return host_coordinates(td.layout, td.dep, None)
 
 
