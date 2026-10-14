@@ -714,6 +714,222 @@ class TestFP8Operations:
             compare_with_pytorch(spyre_fn, pytorch_fn, x, atol=1e-3, rtol=2e-3)
 
 
+class TestQFP8WTKNLabels:
+    """Integration tests for the qfp8wt K/N op_info stamping.
+
+    The QFP8WT weight uses a 2D stick [2, 64]: 2 values of the K (contraction)
+    dimension packed against 64 of the N (output-channel/stick) dimension.
+    superdsc._create_sdsc_tensors must produce stickDimOrder_ = [K, N] for the
+    KERNEL tensor.  For a rank-2 weight this is trivially the last two dims, but
+    for a rank-3+ weight (batched MHA) batch dims appear in dim_order too, so
+    the old ``dim_order[-2:]`` slice picked a batch dim instead of K or N.
+
+    The fix (create_op_spec in spyre_kernel.py) stamps integer indices
+    ``qfp8wt_k_idx`` / ``qfp8wt_n_idx`` into op_info so _create_sdsc_tensors
+    can resolve K and N via the kn_pair filter rather than the positional fallback.
+
+    For batchmatmulfp8 (Reduction): K is structurally the last iteration_space key
+    because ``Reduction.create`` always appends reduction vars after output vars —
+    this is an Inductor invariant, not a positional coincidence.
+
+    For qfp8wt (Pointwise): K and N are last-two by the QFP8WT API contract
+    (weight must be [..., K, N]).  The kn_pair branch in _create_sdsc_tensors
+    then selects the correct pair from dim_order regardless of how many batch
+    dims precede them.
+    """
+
+    @pytest.mark.parametrize(
+        "shape, label",
+        [
+            ((128, 128), "2d_k128_n128"),
+            ((2, 256, 128), "3d_b2_k256_n128"),
+            ((2, 8, 128, 128), "4d_b2_h8_k128_n128"),
+            ((1, 12, 384, 128), "4d_b1_h12_k384_n128"),
+        ],
+    )
+    def test_qfp8wt_op_info_stamps_k_and_n(self, shape, label):
+        """create_op_spec stamps qfp8wt_k_idx / qfp8wt_n_idx for qfp8wt.
+
+        Verifies that the indices are present and point to the second-to-last
+        (K) and last (N) positions in iteration_space, consistent with the
+        QFP8WT API contract that the weight is always [..., K, N].
+        """
+        from indirect_access_common import capture_op_specs, flatten_op_specs
+        from torch_spyre._inductor.constants import QFP8WT_OP
+
+        w = torch.randn(shape, dtype=torch.float16, device="spyre")
+        scale = torch.tensor([1.0], dtype=torch.float16, device="spyre")
+
+        def fn(w):
+            return torch.ops.spyre.quantize_weight_fp8_with_scale(w, scale)
+
+        with capture_op_specs() as captured:
+            torch.compile(fn, dynamic=False)(w)
+
+        op_specs = flatten_op_specs(captured)
+        qfp8wt_specs = [s for s in op_specs if s.op == QFP8WT_OP]
+        assert qfp8wt_specs, f"No qfp8wt OpSpec captured for shape {shape}"
+
+        spec = qfp8wt_specs[0]
+        k_idx = spec.op_info.get("qfp8wt_k_idx")
+        n_idx = spec.op_info.get("qfp8wt_n_idx")
+
+        assert k_idx is not None, "qfp8wt_k_idx not stamped in op_info"
+        assert n_idx is not None, "qfp8wt_n_idx not stamped in op_info"
+
+        it_keys = list(spec.iteration_space)
+        n_dims = len(it_keys)
+
+        assert 0 <= k_idx < n_dims, (
+            f"qfp8wt_k_idx {k_idx} out of range for iteration_space of length {n_dims}"
+        )
+        assert 0 <= n_idx < n_dims, (
+            f"qfp8wt_n_idx {n_idx} out of range for iteration_space of length {n_dims}"
+        )
+
+        # QFP8WT API contract: weight is always [..., K, N] so K index is
+        # second-to-last and N index is last.
+        assert k_idx == n_dims - 2, (
+            f"K idx {k_idx} is not n_dims-2={n_dims - 2} "
+            f"for weight shape {shape} (iteration_space length {n_dims})"
+        )
+        assert n_idx == n_dims - 1, (
+            f"N idx {n_idx} is not n_dims-1={n_dims - 1} "
+            f"for weight shape {shape} (iteration_space length {n_dims})"
+        )
+
+    @pytest.mark.parametrize(
+        "shape, label",
+        [
+            ((2, 256, 128), "3d_b2_k256_n128"),
+            ((2, 8, 128, 128), "4d_b2_h8_k128_n128"),
+            ((1, 12, 384, 128), "4d_b1_h12_k384_n128"),
+        ],
+    )
+    def test_qfp8wt_effective_stick_uses_kn_labels(self, shape, label):
+        """For batched (rank>=3) weights the kn_pair branch produces stickDimOrder_=[K,N].
+
+        Patches _get_layout_label to capture the effective_stick argument passed
+        for the QFP8WT KERNEL tensor.  Asserts:
+          (a) effective_stick has 2 elements (2D stick assembled via kn_pair), and
+          (b) N_role is ``Symbol("out")`` -- the innermost stick label for qfp8wt, and
+          (c) K_role is not ``Symbol("mb")`` -- batch dim excluded by kn_pair filter.
+
+        Without the fix the old dim_order[-2:] fallback would select [mb, x] for
+        a rank-3 weight ([batch, K, N]), making K_role == "mb" (a batch dim).
+        """
+        from unittest.mock import patch
+
+        from sympy import Symbol
+
+        from torch_spyre._inductor.codegen import superdsc as _superdsc
+
+        captured_effective_sticks: list = []
+        orig_get_layout_label = _superdsc._get_layout_label
+
+        def spy_get_layout_label(layouts, dim_order, stick_dim_order, stick_size, layout_labels):
+            if len(stick_size) == 2:  # QFP8WT 2D-stick call only
+                captured_effective_sticks.append(list(stick_dim_order))
+            return orig_get_layout_label(layouts, dim_order, stick_dim_order, stick_size, layout_labels)
+
+        w = torch.randn(shape, dtype=torch.float16, device="spyre")
+        scale = torch.tensor([1.0], dtype=torch.float16, device="spyre")
+
+        def fn(w):
+            return torch.ops.spyre.quantize_weight_fp8_with_scale(w, scale)
+
+        with patch.object(_superdsc, "_get_layout_label", spy_get_layout_label):
+            torch.compile(fn, dynamic=False)(w)
+
+        assert captured_effective_sticks, f"No 2D-stick call captured for {shape}"
+        effective_stick = captured_effective_sticks[0]
+
+        # (a) 2D stick: [K_role, N_role]
+        assert len(effective_stick) == 2, (
+            f"expected 2-element effective_stick, got {effective_stick} for {shape}"
+        )
+        k_role, n_role = effective_stick
+
+        # (b) N is always "out" (last INPUT_DIM_LABELS entry for qfp8wt)
+        assert n_role == Symbol("out"), (
+            f"N role {n_role!r} != Symbol('out') for {shape}"
+        )
+
+        # (c) K must not be the batch label; kn_pair filter excludes "mb"
+        assert k_role != Symbol("mb"), (
+            f"K role is 'mb' (batch dim) for {shape} -- positional fallback used"
+        )
+
+    @pytest.mark.parametrize(
+        "mat1_shape, mat2_shape, label",
+        [
+            ((4, 128, 128), (4, 128, 128), "3d_b4_m128_k128_n128"),
+            ((2, 8, 64, 128), (2, 8, 128, 64), "4d_b2_h8_m64_k128_n64"),
+            ((1, 12, 384, 128), (1, 12, 128, 384), "4d_b1_h12_m384_k128_n384"),
+        ],
+    )
+    def test_batchmatmulfp8_op_info_stamps_k_and_n(self, mat1_shape, mat2_shape, label):
+        """create_op_spec stamps qfp8wt_k_idx / qfp8wt_n_idx for batchmatmulfp8.
+
+        For a Reduction, ``Reduction.create`` always appends reduction vars after
+        output vars in iteration_space (pass_utils.iteration_space).  K is
+        therefore structurally the last key and N is second-to-last regardless of
+        batch depth.  This is an Inductor invariant, not a positional convention:
+        it holds because lower_scaled_bmm passes K via reduction_ranges (not
+        ranges), and Inductor appends those after the output ranges.
+        """
+        from indirect_access_common import capture_op_specs, flatten_op_specs
+        from torch_spyre._inductor.constants import BATCH_MATMUL_FP8_OP
+
+        a = torch.randn(mat1_shape, dtype=torch.float16, device="spyre")
+        b = torch.randn(mat2_shape, dtype=torch.float16, device="spyre")
+        scale = torch.tensor([1.0], dtype=torch.float16, device="spyre")
+
+        def fn(a, b, scale):
+            qa = torch.ops.spyre.quantize_fp8_with_scale(a, scale)
+            qb = torch.ops.spyre.quantize_weight_fp8_with_scale(b, scale)
+            return torch.ops.spyre.scaled_bmm(qa, qb, out_dtype=torch.float16)
+
+        with capture_op_specs() as captured:
+            torch.compile(fn, dynamic=False)(a, b, scale)
+
+        op_specs = flatten_op_specs(captured)
+        bmm_specs = [s for s in op_specs if s.op == BATCH_MATMUL_FP8_OP]
+        assert bmm_specs, (
+            f"No batchmatmulfp8 OpSpec captured for shapes {mat1_shape}x{mat2_shape}"
+        )
+
+        spec = bmm_specs[0]
+        k_idx = spec.op_info.get("qfp8wt_k_idx")
+        n_idx = spec.op_info.get("qfp8wt_n_idx")
+
+        assert k_idx is not None, "qfp8wt_k_idx not stamped in op_info"
+        assert n_idx is not None, "qfp8wt_n_idx not stamped in op_info"
+
+        it_keys = list(spec.iteration_space)
+        n_dims = len(it_keys)
+
+        assert 0 <= k_idx < n_dims, (
+            f"qfp8wt_k_idx {k_idx} out of range for iteration_space of length {n_dims}"
+        )
+        assert 0 <= n_idx < n_dims, (
+            f"qfp8wt_n_idx {n_idx} out of range for iteration_space of length {n_dims}"
+        )
+
+        # Reduction structural invariant: K is always last (reduction dim
+        # appended by pass_utils.iteration_space after output dims), N is
+        # second-to-last (the last output dim = mat2's column dim).
+        assert k_idx == n_dims - 1, (
+            f"K idx {k_idx} is not n_dims-1={n_dims - 1} "
+            f"for shapes {mat1_shape}x{mat2_shape} (iteration_space length {n_dims})"
+        )
+        assert n_idx == n_dims - 2, (
+            f"N idx {n_idx} is not n_dims-2={n_dims - 2} "
+            f"for shapes {mat1_shape}x{mat2_shape} (iteration_space length {n_dims})"
+        )
+
+
+
 # Test utilities for FP8 operations
 def verify_fp8_dtype(tensor):
     """Verify tensor has FP8 E4M3 dtype."""
