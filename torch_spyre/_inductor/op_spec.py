@@ -275,6 +275,17 @@ class TensorArg:
             layout is still available; SDSC codegen sees only device_size and
             device_coordinates, in which K is indistinguishable from a batch
             dim. None for every other element arrangement.
+        replicated_scalar: True when EVERY element of this buffer's device
+            allocation holds the same value, so a reader may take any element
+            and get the scalar. Only a producer knows this, which is why it
+            travels here rather than being inferred: a degenerate buffer's
+            shape does not say it -- a full reduction to a 0-dim tensor has the
+            same one-stick, all-constant-coordinate description and holds the
+            answer at lane 0 only, with partial sums in the other lanes.
+            Set for ``spyre.constant`` buffers, whose whole stick is covered by
+            one MEMORY_FILL (``spyre_constant_tensor`` -> ``spyre_fill_tensor``),
+            and False everywhere else. The KTIR emitter reads it to widen a
+            scalar operand's read to its whole stick; see ``_reads_every_lane``.
     """
 
     is_input: bool
@@ -291,6 +302,7 @@ class TensorArg:
     work_division: TensorWorkDivision | None = None
     kernel_local: bool = False
     qfp8wt_k_dim: Symbol | None = None
+    replicated_scalar: bool = False
 
 
 def is_lx_relayout_identity(
