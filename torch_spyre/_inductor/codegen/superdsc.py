@@ -1642,7 +1642,11 @@ def _create_sdsc_tensors(
                     and it_dim_size == 1
                     and dim not in qfp8wt_kn_labels
                 )
-                if not _is_conv(op_spec.op) and not is_qfp8wt_unit_non_stick and dev_dim_size > it_dim_size:
+                if (
+                    not _is_conv(op_spec.op)
+                    and not is_qfp8wt_unit_non_stick
+                    and dev_dim_size > it_dim_size
+                ):
                     backGap[dim] = dev_dim_size - it_dim_size
                 # Overlapping views can iterate beyond an aligned physical
                 # axis (e.g. unfold's window is wider than its step). Core

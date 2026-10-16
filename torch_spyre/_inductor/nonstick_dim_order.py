@@ -62,9 +62,9 @@ pinned_dims: dict[str, set[int]]  (local to reorder_nonstick_dims, never on grap
 """
 
 import math
-import sympy
 from typing import Literal, NamedTuple
 
+import sympy
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
@@ -79,29 +79,11 @@ from torch._inductor.ir import (
     TensorBox,
 )
 from torch._inductor.virtualized import V
+
 from torch_spyre._C import DataFormats, ElementArrangement, SpyreTensorLayout
 
-from .constants import MATMUL_REDUCTION_OPS
-from .errors import Unsupported
-from .insert_restickify import (
-    _create_restickify_node,
-    _fixed_tiled,
-    RestickifyArgInfo,
-)
-from .ir import FixedTiledLayout
 from . import config
-from .logging_utils import get_inductor_logger
-from .op_spec import IndirectAccess
-from .pass_utils import (
-    concretize_expr,
-    device_coordinates,
-    find_reduction_var,
-    get_matmul_m_size,
-    get_matmul_n_size,
-    indirect_info_from_op,
-    try_device_coordinates,
-)
-from .propagate_layouts import PropArg
+from .constants import MATMUL_REDUCTION_OPS
 
 # Helpers shared with enforce_indirect_access_layout.
 # enforce_indirect_access_layout does NOT import nonstick_dim_order, so this
@@ -122,10 +104,15 @@ from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
 from .op_spec import IndirectAccess
 from .pass_utils import (
+    concretize_expr,
     device_coordinates,
+    find_reduction_var,
+    get_matmul_m_size,
+    get_matmul_n_size,
     indirect_info_from_op,
     try_device_coordinates,
 )
+from .propagate_layouts import PropArg
 
 logger = get_inductor_logger("nonstick_dim_order")
 

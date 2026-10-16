@@ -14,13 +14,13 @@
 
 # Helper methods to handle views
 
-from dataclasses import dataclass, astuple
 import math
-import sympy
+from dataclasses import astuple, dataclass
 from typing import Callable, Dict, Optional, Sequence, Tuple, cast
-from torch.utils._sympy.functions import ModularIndexing, FloorDiv
 
+import sympy
 from torch._inductor.virtualized import V
+from torch.utils._sympy.functions import FloorDiv, ModularIndexing
 
 from .errors import Unsupported
 
