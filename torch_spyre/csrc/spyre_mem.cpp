@@ -809,7 +809,8 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
     const int64_t host_batch_stride = K * N;
     const int64_t device_batch_stride = si * so * dim2 * dim3;  // = K * N
 
-    // Compute total batch count from cpu_sizes[2..] (outer dims beyond K and N).
+    // Compute total batch count from cpu_sizes[2..] (outer dims beyond K and
+    // N).
     int64_t batch = 1;
     for (size_t i = 2; i < cpu_sizes.size(); ++i) batch *= cpu_sizes[i];
 
@@ -823,16 +824,16 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
       dcsi.size_ = {si, so, dim2, dim3};
       dcsi.stride_src_ = host2device ? host_strides : device_strides;
       dcsi.stride_dst_ = host2device ? device_strides : host_strides;
-      dcsi.offset_src_ =
-          (host2device ? cpu_offset : 0) + b * host_batch_stride;
+      dcsi.offset_src_ = (host2device ? cpu_offset : 0) + b * host_batch_stride;
       dcsi.offset_dst_ =
           (host2device ? 0 : cpu_offset) + b * device_batch_stride;
       dci.dcsi_.push_back(dcsi);
     }
 
     // For H2D, output (device) shape is the expanded form including batch dims.
-    // For D2H, output (host) shape is the original cpu_sizes (all dims reversed).
-    // The batch dims are prepended in reversed order (innermost-first convention).
+    // For D2H, output (host) shape is the original cpu_sizes (all dims
+    // reversed). The batch dims are prepended in reversed order
+    // (innermost-first convention).
     std::vector<int64_t> expanded_dev_shape = {si, so, dim2, dim3};
     for (size_t i = 2; i < cpu_sizes.size(); ++i)
       expanded_dev_shape.push_back(cpu_sizes[i]);

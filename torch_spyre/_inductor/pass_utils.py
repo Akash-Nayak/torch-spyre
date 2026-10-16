@@ -2025,7 +2025,10 @@ def splits_by_index_coeff(
     Only non-unity splits are stored; 1 is the default on the apply side.
     Dimensions absent from both indexes are intentionally omitted.
     """
-    skip = lambda v: v <= 1
+
+    def skip(v):
+        return v <= 1
+
     output_splits = _coeff_splits_from_index(splits, write_index, skip=skip)
     # Reduction splits: symbols with coeff==0 in write_index but coeff!=0 in read_index
     reduction_only = {

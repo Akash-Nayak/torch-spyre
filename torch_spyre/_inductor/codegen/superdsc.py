@@ -1304,9 +1304,10 @@ def _create_sdsc_tensors(
         # causes the hardware scheduler to reject the DSC with "Expect valid
         # lower and upper bound parameters".
         if op_spec.op == "qfp8wt":
-            _qfp8wt_keep = lambda d: (
-                d in qfp8wt_kn_labels or iteration_space.get(d, 1) != 1
-            )
+
+            def _qfp8wt_keep(d):
+                return d in qfp8wt_kn_labels or iteration_space.get(d, 1) != 1
+
             dim_order = [d for d in dim_order if _qfp8wt_keep(d)]
             # Also filter op_dim_order so that dropped unit dims are not re-added
             # as reduced_dims (line ~1423).  op_dim_order is shared across all
