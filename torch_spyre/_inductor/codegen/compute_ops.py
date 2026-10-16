@@ -309,12 +309,13 @@ def _layout_info_for_tensor(sdsc_spec, tensor, tensor_idx: int) -> dict:
         and tensor.data_format == DataFormats.SEN143_FP8
         and layout_info["stick_size"] == _FP8_FLAT_STICK_SIZE
     ):
-        # After device-size flattening a rank-4+ tensor produces a 3-element
-        # dim_order (one collapsed leading dim + the two trailing stick dims).
-        # The [-2:] slice always selects the two stick dims regardless of how
-        # many leading dims were collapsed, because flattening only touches
-        # leading dims and the trailing stick dims are preserved as-is by
-        # _flatten_device_size (keep_trailing_dims=2). Ranks above 3 are safe.
+        # stickDimOrder_ must contain exactly the two QFP8WT stick dims (K and
+        # N), never the outer batch dim(s).  For a rank-3 KERNEL (no batch dims)
+        # dim_order is already ["in", "mb"] so [-2:] is a no-op.  For a rank-4+
+        # KERNEL (one or more batch dims collapsed into the leading positions by
+        # _flatten_device_size) dim_order is e.g. ["out","in","mb"] or
+        # ["x","in","mb"]; taking [-2:] strips the batch prefix and leaves only
+        # the 2D-stick pair, which is what deeptools ddl_conversion expects.
         dim_order = layout_info["dim_order"]
         if len(dim_order) < 2:
             raise ValueError(
@@ -323,7 +324,7 @@ def _layout_info_for_tensor(sdsc_spec, tensor, tensor_idx: int) -> dict:
             )
         return {
             **layout_info,
-            "stick_dim_order": list(dim_order),
+            "stick_dim_order": list(dim_order[-2:]),
             "stick_size": [2, 64],
         }
     return layout_info
@@ -1202,8 +1203,22 @@ def generate_sdsc(
             # span only for forward conv2d (opfunc=="conv2d") and otherwise
             # falls back to dim_size // nsplits -- identical to #3510's path for
             # depthwise and every other op.
-            dim_size = _coord_size(dim_str, sdsc_spec.iteration_space[dim], is_input)
-            size = _coord_per_core_size(dim, is_input, nsplits) if is_tiled else 1
+            #
+            # GQA broadcast: per_tensor_iter_sizes[dim] overrides the global
+            # iteration_space[dim] for KERNEL tensors whose device coordinate is
+            # FloorDiv(loop_sym, kv_repeat).  The loop runs over H Q-heads but
+            # the tensor has only n_kv=H/kv_repeat KV-head entries; using n_kv
+            # here gives deeptools the correct per-dim tensor extent in
+            # coordinates_ (alpha_ = n_kv/nsplits instead of H/nsplits).
+            effective_iter_size = tensor.per_tensor_iter_sizes.get(
+                dim, sdsc_spec.iteration_space[dim]
+            )
+            dim_size = _coord_size(dim_str, effective_iter_size, is_input)
+            size = (
+                _coord_per_core_size(dim, is_input, nsplits)
+                if is_tiled and dim not in tensor.per_tensor_iter_sizes
+                else (effective_iter_size // nsplits if is_tiled else 1)
+            )
             conv_params = (
                 get_conv_params(
                     tensor_idx,

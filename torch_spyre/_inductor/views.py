@@ -413,6 +413,37 @@ def compute_coordinates(
                 f"expressions {mods_with_var} and cannot be mapped to coordinates."
             )
 
+        # GQA broadcast: detect FloorDiv(var, divisor) * coeff terms.
+        # These arise when a matmul KERNEL (mat2) batch dim is smaller than the
+        # INPUT (mat1) batch dim by kv_repeat.  The inner_fn emits:
+        #   mat2_loader([FloorDiv(h, kv_repeat), k, n])
+        # which makes the mat2 flat index contain FloorDiv(h, kv_repeat)*stride_batch.
+        # Substituting var=1 yields step=FloorDiv(1,kv_repeat)=0, so add_term
+        # drops the term and the batch coordinate stays constant (z0), causing
+        # dbo-opt to reject the SDSC.
+        #
+        # When term == coeff * FloorDiv(var, divisor) (no Mod, exactly one FloorDiv),
+        # find the device dimension whose stride equals coeff and directly assign
+        # coordinates[dim] += FloorDiv(var, divisor).  This is valid because the
+        # FloorDiv expression is exactly the coordinate value for that axis.
+        floor_divs_with_var = [f for f in term.atoms(FloorDiv) if f.has(var)]
+        if (
+            len(floor_divs_with_var) == 1
+            and len(mods_with_var) == 0
+            and floor_divs_with_var[0].args[0] == var
+        ):
+            fd = floor_divs_with_var[0]
+            coeff_of_fd = sympy.simplify(term / fd)
+            if coeff_of_fd.is_Integer or coeff_of_fd.is_number:
+                coeff_int = int(coeff_of_fd)
+                matched_dim = next(
+                    (dim for dim, st in enumerate(stride) if st == coeff_int),
+                    None,
+                )
+                if matched_dim is not None:
+                    coordinates[matched_dim] += fd
+                    continue
+
         # compute index({var=1}) and index({var=var_ranges[var]})
         step = term.xreplace({var: 1})
         limit = term.xreplace({var: range_val})

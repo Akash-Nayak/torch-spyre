@@ -21,6 +21,7 @@ from typing import Any
 
 from sympy import Expr, Integer, Symbol
 from torch._inductor.virtualized import V
+from torch.utils._sympy.functions import FloorDiv as _FloorDiv
 
 from torch_spyre._C import DataFormats, ElementArrangement
 from torch_spyre._inductor import config as _spyre_config
@@ -90,6 +91,12 @@ class SDSCArgs:
     is_index_tensor: bool = False
     related_value_tensor_idx: int = -1
     device_tile_advance_expr: Expr | None = None
+    # GQA broadcast: maps dim_sym → n_kv (device extent) for dims whose
+    # device coordinate is FloorDiv(loop_sym, kv_repeat).  The loop runs
+    # over H Q-heads while the tensor only has n_kv KV-heads; coordinates_
+    # must use n_kv not H as the per-core size so deeptools sees the correct
+    # tensor extent.  Empty for all other ops.
+    per_tensor_iter_sizes: dict = dataclasses.field(default_factory=dict)
 
     def __str__(self) -> str:
         scales = ", ".join(f"{k}={v}" for k, v in self.scales.items())
@@ -1331,6 +1338,9 @@ def _create_sdsc_tensors(
         backGap: dict[Symbol, int] = {}
         max_dim_sizes: dict = {}
         reduced_dims: list = []
+        # GQA broadcast: populated below when device_coordinates[axis] is
+        # FloorDiv(loop_sym, kv_repeat).  Maps dim_sym → device extent (n_kv).
+        per_tensor_iter_sizes: dict = {}
 
         # Step 2: Handle reduced dimensions — skip for index tensors.
         if (
@@ -1426,6 +1436,21 @@ def _create_sdsc_tensors(
                     math.prod(arg.device_size[physical_axis:]) * physical_gap_factor
                 )
                 dim_device_stride = math.prod(arg.device_size[physical_axis + 1 :])
+                # GQA broadcast: if device_coordinates[physical_axis] is
+                # FloorDiv(dim_sym, kv_repeat), the loop runs over H Q-heads but
+                # this tensor only has n_kv=H/kv_repeat KV-head entries.  Record
+                # the true tensor extent so _build_coord_info uses n_kv (not H)
+                # as the per-dim iteration size, giving deeptools the correct
+                # tensor extent in coordinates_ (alpha_ = n_kv/nsplits not H/nsplits).
+                phys_coord = arg.device_coordinates[physical_axis].subs(symbol_mapping)
+                if (
+                    isinstance(phys_coord, _FloorDiv)
+                    and phys_coord.args[0] == dim
+                    and dim not in reduced_dims
+                ):
+                    per_tensor_iter_sizes[dim] = (
+                        int(arg.device_size[physical_axis]) * physical_gap_factor
+                    )
             # Injected stick dims don't exist in device_size; use stride=1.
             elif (
                 has_indirect_access
@@ -1679,6 +1704,7 @@ def _create_sdsc_tensors(
             is_index_tensor=is_idx_tensor,
             related_value_tensor_idx=related_val_idx,
             device_tile_advance_expr=arg.device_tile_advance_expr,
+            per_tensor_iter_sizes=per_tensor_iter_sizes,
         )
         if arg.work_division is not None:
             sdsc_arg.work_division = arg.work_division.remap_symbols(symbol_mapping)

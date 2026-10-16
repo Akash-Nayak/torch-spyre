@@ -439,6 +439,14 @@ def lower_bmm_fp8(
 ):
     # FP8 batched matmul: the FP8 dtype checks and BATCH_MATMUL_FP8_OP reduction
     # of lower_scaled_mm, with the per-batch-dim indexing of lower_bmm.
+    #
+    # GQA broadcast: mat2 batch dims may be smaller than mat1 batch dims by an
+    # integer factor (kv_repeat = num_q_heads / num_kv_heads).  The mat2 loader
+    # uses FloorDiv(batch_idx, kv_repeat) for those dims so the SDSC emits a
+    # zero mb-stride for the KERNEL tensor — the hardware natively broadcasts
+    # the same K block across all Q heads in each group.
+    from torch.utils._sympy.functions import FloorDiv
+
     mat1.realize()
     mat2.realize()
     mat1_loader = mat1.make_loader()
@@ -457,26 +465,39 @@ def lower_bmm_fp8(
     if mat2_dtype not in [torch.float8_e4m3fn]:
         raise ValueError(f"Expected FP8 input for mat2, got {mat2_dtype}")
 
-    # [B, M, K] × [B, K, N] → [B, M, N]  and
-    # [B, H, M, K] × [B, H, K, N] → [B, H, M, N], with identical batch dims and
-    # a matching contraction dim. Batch broadcasting is not supported.
-    if (
-        mat1_ndim != mat2_ndim
-        or mat1_ndim not in (3, 4)
-        or any(
-            sympy.simplify(d1 - d2) != 0
-            for d1, d2 in zip(
-                [*mat1_size[:-2], mat1_size[-1]], [*mat2_size[:-2], mat2_size[-2]]
-            )
-        )
-    ):
+    # Validate ndim and contraction dim.
+    if mat1_ndim != mat2_ndim or mat1_ndim not in (3, 4):
         raise Unsupported(
             f"bmm_fp8 with shapes {mat1_size} and {mat2_size} not supported"
         )
+    if sympy.simplify(mat1_size[-1] - mat2_size[-2]) != 0:
+        raise Unsupported(
+            f"bmm_fp8: contraction dim mismatch {mat1_size} and {mat2_size}"
+        )
+
+    # Validate batch dims and compute per-dim GQA repeat factors.
+    # Each batch dim pair (d1, d2) must satisfy one of:
+    #   d1 == d2           → no broadcast, use batch_idx directly for mat2
+    #   d1 == d2 * repeat  → GQA broadcast, use FloorDiv(batch_idx, repeat) for mat2
+    mat1_batch = list(mat1_size[:-2])
+    mat2_batch = list(mat2_size[:-2])
+    mat2_repeats = []  # per batch dim: 1 = no broadcast, >1 = GQA repeat
+    for d1, d2 in zip(mat1_batch, mat2_batch):
+        diff = sympy.simplify(d1 - d2)
+        if diff == 0:
+            mat2_repeats.append(sympy.Integer(1))
+        else:
+            ratio = sympy.simplify(d1 / d2)
+            if ratio.is_integer and sympy.simplify(ratio - 1) != 0:
+                mat2_repeats.append(ratio)
+            else:
+                raise Unsupported(
+                    f"bmm_fp8: incompatible batch dims {mat1_size} and {mat2_size}"
+                )
 
     output_dtype = out_dtype if out_dtype is not None else torch.float16
     reduction_numel = mat1_size[-1]  # K
-    ranges = [*mat1_size[:-2], mat1_size[-2], mat2_size[-1]]
+    ranges = [*mat1_batch, mat1_size[-2], mat2_size[-1]]
 
     def inner_fn(index, reduction_index):
         # Each batch dim keeps its own iteration symbol in both loaders.
@@ -485,9 +506,15 @@ def lower_bmm_fp8(
         # superdsc._get_device_dim_order.
         *batch_index, row, column = index
         (contraction,) = reduction_index
+        mat2_batch_index = [
+            FloorDiv(batch_index[dim], repeat)
+            if sympy.simplify(repeat - 1) != 0
+            else batch_index[dim]
+            for dim, repeat in enumerate(mat2_repeats)
+        ]
         return (
             mat1_loader([*batch_index, row, contraction]),
-            mat2_loader([*batch_index, contraction, column]),
+            mat2_loader([*mat2_batch_index, contraction, column]),
         )
 
     result = Reduction.create(
