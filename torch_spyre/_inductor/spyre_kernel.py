@@ -1243,19 +1243,30 @@ class SpyreKernel(Kernel[CSEVariable]):
         elif isinstance(value, TensorAccess):
             # Reshapes, transposes, and other dataops.
             # Compute which indirect variables THIS operation actually uses:
-            # - For gather: check source index for indirect symbols
-            # - For scatter: check destination index for indirect symbols
-            # Use the same filtering logic as PointwiseOp to avoid duplication.
-            indirect_syms_used = (
-                _indirect_syms_used(
-                    value,
-                    self.indirect_vars,
-                    src_index=value.index,
-                    dst_index=dst.index,
+            # - For gather: only check source index (value.index carries the
+            #   block-row indirect sym; dst is a fresh linear output buffer and
+            #   must not be tagged as a value_tensor even if the same sym appears
+            #   in its store index due to a prior scatter in the same fused kernel)
+            # - For scatter: only check destination index (dst.index carries the
+            #   indirect sym; source is the data being written)
+            # Checking both simultaneously causes the gather output to inherit
+            # IndirectAccess from a co-fused scatter, flipping value_tensor and
+            # no_indirection roles in the SDSC and producing an all-zeros gather.
+            if self.indirect_vars:
+                src_syms = _indirect_syms_used(
+                    value, self.indirect_vars, src_index=value.index
                 )
-                if self.indirect_vars
-                else set()
-            )
+                if src_syms:
+                    # Gather: indirect sym is in the source read index.
+                    # Never propagate to dst — the output is written directly.
+                    indirect_syms_used = src_syms
+                else:
+                    # Scatter (or plain copy): check the destination write index.
+                    indirect_syms_used = _indirect_syms_used(
+                        value, self.indirect_vars, dst_index=dst.index
+                    )
+            else:
+                indirect_syms_used = set()
 
             if indirect_syms_used:
                 # Gather/scatter: coordinates are built with raw indirect symbols here;

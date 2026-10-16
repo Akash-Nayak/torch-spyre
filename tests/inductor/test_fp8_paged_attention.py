@@ -121,6 +121,14 @@ from utils_inductor import DEVICE, cached_randn, compare_with_pytorch
 from torch_spyre._C import SpyreTensorLayout, get_device_dtype, get_elem_in_stick
 from torch_spyre._inductor.constants import FP8_E4M3FN_MAX, FP8_E4M3FN_MIN
 
+# spyre.scaled_bmm is registered by PR #5158 (spyre::scaled_bmm custom op).
+# Skip all tests that depend on it until that PR merges to upstream/main.
+_SCALED_BMM_AVAILABLE = hasattr(torch.ops.spyre, "scaled_bmm")
+_skip_no_scaled_bmm = pytest.mark.skipif(
+    not _SCALED_BMM_AVAILABLE,
+    reason="spyre.scaled_bmm not available — requires PR #5158",
+)
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Shared geometry constants matching standard paged-cache shapes.
 # block_size=128, head_size=128: both are multiples of 128 (fp8 elems/stick).
@@ -1699,6 +1707,7 @@ class TestFp8IndexSelectRobustness:
         )
 
 
+@_skip_no_scaled_bmm
 class TestFp8ScaledBmmQKT:
     """FP8 Q·Kᵀ via ``spyre.scaled_bmm`` with three scale schemes.
 
@@ -1940,6 +1949,7 @@ class TestFp8ScaledBmmQKT:
         torch.testing.assert_close(result.cpu(), expected, atol=1e-1, rtol=0.0)
 
 
+@_skip_no_scaled_bmm
 class TestFp8KvCacheWriteQFP8WT:
     """KV cache write+read round-trip with K stored in QFP8WT (2D-stick) layout.
 
@@ -2084,6 +2094,7 @@ class TestFp8KvCacheWriteQFP8WT:
 # ──────────────────────────────────────────────────────────────────────────────
 
 
+@_skip_no_scaled_bmm
 class TestFp8KvCacheQFP8WTDecodeEndToEnd:
     """Full fill-and-decode pipeline using the direct-FP8-matmul strategy.
 
@@ -2162,8 +2173,11 @@ class TestFp8KvCacheQFP8WTDecodeEndToEnd:
             (NUM_BLOCKS, BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE),
             dtype=torch.float8_e4m3fn,
         )
+        # V scale cache: [NUM_BLOCKS, BLOCK_SIZE, KV, 64] — trailing dim padded to
+        # 64 (one FP16 stick) so index_copy_ issues stick-aligned writes.
+        # Only the first element per slot carries the real scale; the rest are zero.
         v_scale_cache = torch.zeros(
-            (NUM_BLOCKS, BLOCK_SIZE, NUM_KV_HEADS, 1), dtype=torch.float16
+            (NUM_BLOCKS, BLOCK_SIZE, NUM_KV_HEADS, 64), dtype=torch.float16
         )
 
         k_d = k_fp16.to(DEVICE)
@@ -2193,7 +2207,9 @@ class TestFp8KvCacheQFP8WTDecodeEndToEnd:
             sv = torch.ops.spyre.quantscalepertokenfp8(v_in)  # [1, BS, KV, 1]
             v_fp8 = torch.ops.spyre.quantize_fp8_with_scale(v_in, sv)
             v_cache.index_copy_(0, block, v_fp8)
-            v_sc_cache.index_copy_(0, block, sv)
+            # Pad sv [1, BS, KV, 1] → [1, BS, KV, 64] for stick-aligned scatter.
+            sv_padded = torch.nn.functional.pad(sv, (0, 63))  # [1, BS, KV, 64]
+            v_sc_cache.index_copy_(0, block, sv_padded)
 
             # ── Decode: gather K (QFP8WT EA preserved through index_select) ────
             k_block = k_cache.index_select(0, block)  # [1, KV, D, BS]
@@ -2215,7 +2231,9 @@ class TestFp8KvCacheQFP8WTDecodeEndToEnd:
 
             # ── Decode: gather V (QFP8CH), dequantize, P·V ────────────────────
             v_block = v_cache.index_select(0, block)  # [1, BS, KV, D]
-            sv_block = v_sc_cache.index_select(0, block)  # [1, BS, KV, 1]
+            sv_block = v_sc_cache.index_select(0, block)  # [1, BS, KV, 64]
+            # Slice back to [1, BS, KV, 1] — only first element carries the scale.
+            sv_block = sv_block[:, :, :, :1]
             v_dq = torch.ops.spyre.dequantize_fp8_with_scale(v_block, sv_block)
             # [1, BS, KV, D] → squeeze → permute → [KV, 1, BS, D].
             v_4d = v_dq.squeeze(0).permute(1, 0, 2).unsqueeze(1)
@@ -2231,6 +2249,15 @@ class TestFp8KvCacheQFP8WTDecodeEndToEnd:
             k_scale_cache_d,
             v_cache_d,
             v_scale_cache_d,
+        )
+
+        # Guard: V scale cache block-0 must be non-zero after scatter — verifies
+        # that the stick-padded index_copy_ wrote a real scale and index_select
+        # reads it back correctly (regression check for sub-stick scatter bug).
+        sv_elem0 = v_scale_cache_d.index_select(0, block_d).cpu()[0, :, :, 0]
+        assert sv_elem0.abs().max().item() > 0.0, (
+            f"V scale cache block-0 read back all-zeros after scatter! "
+            f"sub-stick scatter hardware error — sv_elem0 max={sv_elem0.abs().max().item()}"
         )
 
         # ── CPU reference ──────────────────────────────────────────────────────
