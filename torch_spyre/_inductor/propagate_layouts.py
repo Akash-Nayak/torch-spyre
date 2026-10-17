@@ -3278,7 +3278,7 @@ def propagate_spyre_tensor_layouts(
             # (MultiOutputLayout / NoneLayout both raise from get_layout()).
             # The trailing MultiOutputs are handled in their own branch below.
             pass
-        elif isinstance(op, MultiOutput) or isinstance(op, SpyreConstantFallback):
+        elif isinstance(op, (MultiOutput, SpyreConstantFallback)):
             op.layouts = [generic_layout(op)]
             op.restick_cost_fn = AnyInNode.from_args()
         elif isinstance(op, SpyreEmptyFallback):

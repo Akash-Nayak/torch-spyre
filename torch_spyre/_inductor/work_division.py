@@ -2649,8 +2649,9 @@ def _cost_model_matmul_planner(
     # output is FP16 (64 elems/stick) while N/K count FP8 sticks (128), so
     # source elems_per_stick from the QFP8WT weight input instead (issue #4466).
     if op.data.reduction_type == BATCH_MATMUL_FP8_OP:
-        # Look for the QFP8WT weight tensor (K cache after index_select + squeeze/unsqueeze).
-        # Fallback 1: any SEN143/SEN152 FP8 dtype input (QFP8CH activation).
+        # Prefer the QFP8WT input (2D-stick weight) for elems_per_stick; its
+        # 128 elems/stick matches the hardware counting for N and K.
+        # Fallback 1: any SEN143/SEN152 FP8 dtype input (e.g. QFP8CH activation).
         # Fallback 2: output td (FP16, 64 elems/stick — conservative undercount, never crashes).
         fp8_weight_td = next(
             (

@@ -1307,16 +1307,20 @@ def _create_sdsc_tensors(
         # causes the hardware scheduler to reject the DSC with "Expect valid
         # lower and upper bound parameters".
         if op_spec.op == "qfp8wt":
-
-            def _qfp8wt_keep(d):
-                return d in qfp8wt_kn_labels or iteration_space.get(d, 1) != 1
-
-            dim_order = [d for d in dim_order if _qfp8wt_keep(d)]
+            dim_order = [
+                d
+                for d in dim_order
+                if d in qfp8wt_kn_labels or iteration_space.get(d, 1) != 1
+            ]
             # Also filter op_dim_order so that dropped unit dims are not re-added
             # as reduced_dims (line ~1423).  op_dim_order is shared across all
             # arg iterations; update it once on the first arg pass.
             if i == 0:
-                op_dim_order = [d for d in op_dim_order if _qfp8wt_keep(d)]
+                op_dim_order = [
+                    d
+                    for d in op_dim_order
+                    if d in qfp8wt_kn_labels or iteration_space.get(d, 1) != 1
+                ]
 
         if is_matmul and i == 0 and len(op_spec.args) >= 3 and matmul_n_dim is None:
             matmul_x_reuse_dims = _matmul_reuse_dims(op_spec, symbol_mapping, dim_order)
@@ -1404,45 +1408,38 @@ def _create_sdsc_tensors(
             and not _is_topk(op_spec.op)
             and not _is_keep_by_index(op_spec.op)
         ):
-            # Sub-stick indirect SCATTER: the KERNEL_IDX (slot_mapping) is broadcast
-            # over the middle dimensions (e.g. KV_heads) that are not present in the
-            # index tensor's own coordinates but ARE in op_dim_order.  These must be
-            # added as reduced (scale=-1, broadcast) dims so the SDSC knows the index
-            # tensor repeats for each KV head.
+            # Whether this arg is the KERNEL_IDX of a sub-stick indirect scatter.
+            # For sub-stick scatter (op_stick_dim is None), the KERNEL_IDX broadcasts
+            # over middle dims (e.g. KV_heads) that are in op_dim_order but not in
+            # the index tensor's own coordinates.  Those must be added as reduced
+            # (scale=-1, broadcast) dims so the SDSC knows the index repeats for
+            # each head.
             #
-            # This must NOT fire for GATHER (index_select): the index there is also
-            # sub-stick (the read-source has last dim < stick), but the KERNEL_IDX
-            # only selects which page/row to read — it does NOT broadcast over the
-            # inner B×KV dimensions.  Adding extra dims to KERNEL_IDX for gather
-            # causes wrong address computations and hardware errors.
-            #
-            # Distinction: scatter writes to the LAST arg (which has IndirectAccess);
-            # gather reads from an intermediate arg (IndirectAccess on args[:-1]) and
-            # writes to a fresh output (args[-1] has no IndirectAccess).
-            is_substick_indirect_scatter_index = (
+            # This must NOT fire for GATHER (index_select): adding extra dims to
+            # KERNEL_IDX for gather causes wrong address computations.
+            # Distinction: scatter writes to the LAST arg (IndirectAccess on args[-1]);
+            # gather writes to a fresh output (args[-1] has no IndirectAccess).
+            is_substick_scatter_index = (
                 has_indirect_access
                 and i in index_tensor_indices
                 and op_stick_dim is None
                 and is_indirect_value_tensor(op_spec.args[-1])
             )
-            if not (has_indirect_access and i in index_tensor_indices):
+            if (
+                not (has_indirect_access and i in index_tensor_indices)
+                or is_substick_scatter_index
+            ):
                 reduced_dims = [
                     d for d in op_dim_order if d not in dim_order and d is not mb_sym
                 ]
                 dim_order = dim_order + reduced_dims
-            elif is_substick_indirect_scatter_index:
-                # Sub-stick indirect scatter: add missing op_dim_order dims as
-                # reduced (broadcast) dims on the KERNEL_IDX tensor.
-                reduced_dims = [
-                    d for d in op_dim_order if d not in dim_order and d is not mb_sym
-                ]
-                dim_order = dim_order + reduced_dims
-                logger.debug(
-                    "_create_sdsc_tensors: added broadcast dims %s to KERNEL_IDX "
-                    "arg %d for sub-stick indirect scatter",
-                    reduced_dims,
-                    i,
-                )
+                if is_substick_scatter_index:
+                    logger.debug(
+                        "_create_sdsc_tensors: added broadcast dims %s to KERNEL_IDX "
+                        "arg %d for sub-stick indirect scatter",
+                        reduced_dims,
+                        i,
+                    )
 
         if is_matmul and i == 0 and matmul_x_reuse_dims:
             # Two cases for reuse dims on x:
@@ -1725,15 +1722,14 @@ def _create_sdsc_tensors(
         # carries QFP8WT EA.
         dtype_stick_size = arg.device_dtype.elems_per_stick()
         layout_stick_size = [dtype_stick_size]
-        # Scatter ops writing QFP8WT data: both the source (is_input=True) and
-        # destination (is_input=False) tensors must use 2D-stick HBM layout so
-        # that the read addressing of the source and the write addressing of the
-        # destination both treat pairs of K-elements as one 2-element outer stick
-        # dimension ([2, stick_size/2]).  Restricting to not arg.is_input would
-        # let the source be registered with a 1D-stick layout, which then wins
-        # the OUTPUT-label race in get_indirect_layout_label and prevents the
-        # destination from recording its correct 2D-stick size.
-        is_qfp8wt_scatter_dst = (
+        # QFP8WT indirect-access (scatter): both the scatter source (is_input=True)
+        # and destination (is_input=False) tensors must use the 2D-stick HBM layout
+        # so that both sides treat pairs of K-elements as one 2-element outer stick
+        # ([2, stick_size/2]).  Restricting to not arg.is_input would register the
+        # source with a 1D-stick layout, which wins the OUTPUT-label race in
+        # get_indirect_layout_label and prevents the destination from recording the
+        # correct 2D-stick size.
+        is_qfp8wt_indirect = (
             arg.element_arrangement == ElementArrangement.QFP8WT
             and op_spec.op == IDENTITY_OP
             and has_indirect_access
@@ -1741,22 +1737,23 @@ def _create_sdsc_tensors(
         if (
             arg.element_arrangement == ElementArrangement.QFP8WT
             and op_spec.op in ("batchmatmulfp8", "qfp8wt")
-        ) or is_qfp8wt_scatter_dst:
+        ) or is_qfp8wt_indirect:
             # FP8 KERNEL needs 2D stick: [2, stick_size/2]
             layout_stick_size = [2, dtype_stick_size // 2]
             # The 2D stick packs 2 values of the weight's K dim against 64 of
             # its N (stick) dim, so stickDimOrder_ is [K, N] with the real
-            # stick dim last. Slicing dim_order[-2:] only yields that for a
-            # rank-2 weight; once the weight has batch dims they land in
-            # dim_order too (e.g. [in, x, out], or [mb, out, y, x] for qfp8wt)
-            # and the slice names a batch dim instead of K or N.
+            # stick dim last.
+            # For standalone qfp8wt/batchmatmulfp8, qfp8wt_kn_labels matches
+            # the K/N symbols in dim_order, so kn_pair picks the right pair.
+            # For scatter ops (IDENTITY_OP), qfp8wt_kn_labels contains the
+            # scatter iteration symbols (not K/N), so kn_pair is empty and we
+            # fall back to dim_order[-2:] — which is [K, N] for a QFP8WT
+            # destination whose dim_order is ordered [..., K, N].
             kn_pair = [d for d in dim_order if d in qfp8wt_kn_labels]
             if len(kn_pair) == 2 and real_stick in kn_pair:
                 companion = next(d for d in kn_pair if d != real_stick)
                 effective_stick = [companion, real_stick]
             else:
-                # K/N not both present (e.g. a rank-1 weight): keep the
-                # positional behaviour.
                 effective_stick = dim_order[-2:]
 
         if has_indirect_access:
@@ -2226,6 +2223,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         symbol_mapping[sym]: _resolve_sdsc_size(size, op_spec.symbolic_dim_bounds)
         for sym, (size, _) in op_spec.iteration_space.items()
     }
+
     # Build the SDSC dim name -> (pytorch_sym_name, granularity, max_val) map
     # for any iteration-space dims.
     # This drives symbolicDimInfo_ and dimToSymbolMapping_ in the generated JSON.
@@ -2268,20 +2266,23 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     ref_arg = _ref_arg(op_spec)
     op_dim_order, op_stick_dim = _get_device_dim_order(ref_arg, symbol_mapping)
 
-    # For qfp8wt, the output tensor may have a constant last device coordinate
-    # (op_stick_dim=None) when the trailing N=1 dim is appended after K (e.g.
-    # for a 4D input [KV, gqa, K, N=1]).  Two corrections are needed:
+    # For qfp8wt, op_stick_dim may be None when the ref arg's last device
+    # coordinate is constant.  Two corrections apply:
     #
-    # 1. Set op_stick_dim from the INPUT arg's last (K-inner) coordinate so the
-    #    stick-injection block below does not add a spurious free dim, and
-    #    _create_sdsc_tensors can form the correct 2D-stick pair [KV, K].
+    # 1. When the OUTPUT's last coord is constant but the INPUT's last coord has
+    #    a free symbol (e.g. K is the input stick but the output has N=1 baked
+    #    as a constant), recover op_stick_dim from the input so the stick-injection
+    #    block below does not add a spurious synthetic dim.
+    #    For the pure N=1 case ([KV, gqa, K, N=1]) both input and output have a
+    #    constant last coord; op_stick_dim stays None and the injection block adds
+    #    a synthetic stick dim of size 1 (later padded to stick width).
     #
-    # 2. Drop any unit (size-1) dims from sdsc_iteration_space / dim_splits /
-    #    work_slices that are NOT in the 2D-stick pair.  They appear in N_
-    #    (SDSC's iteration-space descriptor) but not in layoutDimOrder_, causing
-    #    the hardware scheduler to iterate over a phantom dimension and produce
-    #    wrong results.  _create_sdsc_tensors independently filters them from
-    #    each arg's dim_order (and from op_dim_order) so no KeyError can arise.
+    # 2. Drop unit (size-1) iteration dims that are NOT in the 2D-stick pair
+    #    from sdsc_iteration_space / dim_splits / work_slices.  Such dims appear
+    #    in N_ (SDSC's iteration-space descriptor) but not in layoutDimOrder_,
+    #    causing the hardware scheduler to iterate over a phantom dimension.
+    #    _create_sdsc_tensors independently filters them from each arg's dim_order
+    #    (and from op_dim_order) so no KeyError can arise.
     if op_spec.op == "qfp8wt" and op_stick_dim is None and len(op_spec.args) >= 1:
         in_last = op_spec.args[0].device_coordinates[-1].subs(symbol_mapping)
         in_free = sorted(in_last.free_symbols, key=str)
