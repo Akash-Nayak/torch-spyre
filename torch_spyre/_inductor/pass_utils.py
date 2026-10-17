@@ -45,6 +45,7 @@ from torch._inductor.ir import (
     Operation,
     Pointwise,
     Reduction,
+    Scatter,
     StorageBox,
     TensorBox,
 )
@@ -1879,21 +1880,23 @@ def iter_var_id(stick_expr) -> int:
 def iteration_space(n: SchedulerNode) -> dict[sympy.Symbol, sympy.Expr]:
     if isinstance(n.node.data, Pointwise):
         # The iteration space of a Pointwise is that of its output.
+        result = next(iter(n.read_writes.writes)).ranges.copy()
         # For a Scatter (subclass of Pointwise) whose destination has one or more
         # size-1 dims, Inductor's index_vars_squeeze drops those dims from the write
-        # dep's ranges.  When B=1 collapses a batch dim too, the write ranges can be
-        # *partial* (fewer symbols than _body.iter_vars expects), not just empty.
-        # The empty-only guard "if not result" missed this partial case and let
-        # ranges_from_index_vars fire "expected sum of sizes to equal sum of
-        # index_vars".  Fix: unconditionally supplement from read deps, matching the
-        # same pattern already used for Reduction below.
-        result = next(iter(n.read_writes.writes)).ranges.copy()
-        for dep in n.read_writes.reads:
-            if not isinstance(dep, MemoryDep):
-                continue
-            for sym, size in dep.ranges.items():
-                if sym not in result:
-                    result[sym] = size
+        # dep's ranges — including when the squeezed dim becomes constant-0 in the
+        # index expression (so the symbol is absent from write_dep.index.free_symbols
+        # too).  When B=1 also collapses a batch dim the ranges become partially
+        # empty, causing ranges_from_index_vars to crash with
+        # "expected sum of sizes to equal sum of index_vars".
+        # Only supplement for Scatter (not plain Pointwise, which has no squeezed
+        # scatter dims and must not absorb reduction vars from reads).
+        if isinstance(n.node.data, Scatter):
+            for dep in n.read_writes.reads:
+                if not isinstance(dep, MemoryDep):
+                    continue
+                for sym, size in dep.ranges.items():
+                    if sym not in result:
+                        result[sym] = size
         return result
     elif isinstance(n.node.data, Reduction):
         # Output dims from the write dep; reduction dims appended from read deps.
@@ -1919,7 +1922,15 @@ def iteration_space_from_op(op: ComputedBuffer) -> dict[sympy.Symbol, sympy.Expr
     of SchedulerNode.read_writes."""
     rw = op_read_writes(op)
     if isinstance(op.data, Pointwise):
-        return next(iter(rw.writes)).ranges.copy()
+        result = next(iter(rw.writes)).ranges.copy()
+        if isinstance(op.data, Scatter):
+            for dep in rw.reads:
+                if not isinstance(dep, MemoryDep):
+                    continue
+                for sym, size in dep.ranges.items():
+                    if sym not in result:
+                        result[sym] = size
+        return result
     elif isinstance(op.data, Reduction):
         # Output dims from write dep; reduction dims appended from read deps.
         # Inductor shares sympy symbols across all tensor accesses in a Reduction's
