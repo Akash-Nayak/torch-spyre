@@ -1735,16 +1735,8 @@ def _multi_arg_pointwise_layouts(
                 f"either. Its stick maps to host dim {mapped} of size {mapped_size}"
             )
     else:
-        # Case 1: all STANDARD (or non-staggered) EAs.
-        # Exception: if every input carries the same non-STANDARD EA (e.g. QFP8WT)
-        # and that EA is *not* staggered, propagate it to the output.  This handles
-        # gather ops (index_select) on QFP8WT caches: the gathered pages must carry
-        # QFP8WT so downstream batchmatmulfp8 sees the correct 2D-stick arrangement.
-        non_std = input_eas - {ElementArrangement.STANDARD}
-        if len(non_std) == 1 and not (non_std & STAGGERED_EAS):
-            output_ea = next(iter(non_std))
-        else:
-            output_ea = ElementArrangement.STANDARD
+        # Case 1: all STANDARD (or non-staggered) EAs - use STANDARD.
+        output_ea = ElementArrangement.STANDARD
 
     in_coords = [
         host_coordinates(arg.layout, arg.dep, ind_sizes, op=op) for arg in args
