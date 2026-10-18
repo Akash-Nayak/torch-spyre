@@ -434,7 +434,7 @@ def compute_coordinates(
         ):
             fd = floor_divs_with_var[0]
             coeff_of_fd = sympy.simplify(term / fd)
-            if coeff_of_fd.is_Integer or coeff_of_fd.is_number:
+            if coeff_of_fd.is_Integer:
                 coeff_int = int(coeff_of_fd)
                 matched_dim = next(
                     (dim for dim, st in enumerate(stride) if st == coeff_int),

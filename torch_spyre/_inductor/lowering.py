@@ -27,6 +27,7 @@ import torch._inductor.lowering as lowering
 from torch._inductor.ir import Pointwise, Reduction, StorageBox
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
+from torch.utils._sympy.functions import FloorDiv
 
 import torch_spyre._inductor.customops  # noqa: F401
 from torch_spyre._C import get_elem_in_stick
@@ -445,8 +446,6 @@ def lower_bmm_fp8(
     # uses FloorDiv(batch_idx, kv_repeat) for those dims so the SDSC emits a
     # zero mb-stride for the KERNEL tensor — the hardware natively broadcasts
     # the same K block across all Q heads in each group.
-    from torch.utils._sympy.functions import FloorDiv
-
     mat1.realize()
     mat2.realize()
     mat1_loader = mat1.make_loader()
@@ -488,7 +487,7 @@ def lower_bmm_fp8(
             mat2_repeats.append(sympy.Integer(1))
         else:
             ratio = sympy.simplify(d1 / d2)
-            if ratio.is_integer and sympy.simplify(ratio - 1) != 0:
+            if isinstance(ratio, sympy.Integer) and ratio != 1:
                 mat2_repeats.append(ratio)
             else:
                 raise Unsupported(
@@ -508,7 +507,7 @@ def lower_bmm_fp8(
         (contraction,) = reduction_index
         mat2_batch_index = [
             FloorDiv(batch_index[dim], repeat)
-            if sympy.simplify(repeat - 1) != 0
+            if repeat != 1
             else batch_index[dim]
             for dim, repeat in enumerate(mat2_repeats)
         ]
