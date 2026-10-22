@@ -508,11 +508,11 @@ def _get_padded_iteration_space(
     """
     padding: dict = {}
     unpadded_extent = dict(sdsc_iteration_space)
-    for sdsc_arg, op_spec_arg, d_order in zip(sdsc_args, op_spec_args, dim_order):
+    for sdsc_arg, op_spec_arg, dim_order in zip(sdsc_args, op_spec_args, dim_order):
         layout = layouts[sdsc_arg.layout]
         stick_dim_order = layout["stick_dim_order"]
         stick_size = layout["stick_size"]
-        for dim in d_order:
+        for dim in dim_order:
             if dim not in stick_dim_order:
                 continue
             if len(stick_size) == 1:
